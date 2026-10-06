@@ -811,7 +811,7 @@ describe('gate, migrate, help', () => {
 });
 
 // =====================================================================================================
-// Wave-1 repair: adversarial coverage (docs/design/security.md §6 names)
+// Wave-1 repair: adversarial coverage (docs/security.md §6 names)
 // =====================================================================================================
 
 const CANARY = 'TECERA_CANARY_e2e_4b1d9c2a';

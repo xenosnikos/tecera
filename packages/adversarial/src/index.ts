@@ -1,5 +1,5 @@
 /**
- * @tecera/adversarial: the Phase 1 adversarial suite (docs/PLAN.md P1.6, docs/design/security.md §6–§7).
+ * @tecera/adversarial: the Phase 1 adversarial suite (docs/architecture.md P1.6, docs/security.md §6–§7).
  *
  * Every row of security.md §6 is a named vitest case (`it('<id>', …)` or `it('<id> [variant]', …)`) in
  * src/<section>.test.ts, exercising the REAL components (ChildProcessRepl, Broker/invoke with the mandatory

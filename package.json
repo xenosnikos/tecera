@@ -2,8 +2,8 @@
   "name": "tecera-monorepo",
   "private": true,
   "version": "0.1.0",
-  "description": "Tecera: BDI + event-driven multi-agent runtime with harness-enforced guardrails, one-command onboarding, and multiplayer sessions",
-  "license": "PROPRIETARY",
+  "description": "Tecera: an execution node for rule-bound work. Goals with environmental checks, generated plans, sandboxed workers, foreign review, PR-level approval, and a tamper-evident ledger",
+  "license": "Apache-2.0",
   "type": "module",
   "packageManager": "yarn@4.12.0",
   "workspaces": [

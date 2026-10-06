@@ -1,7 +1,7 @@
 import type { AbortCode, CapabilitySet, Effect, Json, Limits, Stage, SuspendRequest } from '@tecera/contracts';
 
 /**
- * Effect composition (docs/design/kernel.md §3). All hooks see one frozen event; their effects are
+ * Effect composition (docs/architecture.md §3). All hooks see one frozen event; their effects are
  * collected, then composed with explicit, order-independent rules:
  *   Abort dominates everything; Suspend beats Replace/Patch/Reserve; disjoint patches merge, identical
  *   values dedupe, a same-path conflict refuses the whole set; one distinct ReplaceOutput; restrictions

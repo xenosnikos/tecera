@@ -1,7 +1,7 @@
 import { event, type AppendResult, type Ledger, type Principal, type TeceraEvent } from '@tecera/contracts';
 
 /**
- * Plan staging in the documented order (docs/PLAN.md, "first job trace"): a generated plan becomes a
+ * Plan staging in the documented order (docs/architecture.md, "first job trace"): a generated plan becomes a
  * library candidate only AFTER its goal was achieved — `… → host commits → goal.achieved{evidence} → the plan
  * is staged (plan.staged) as a candidate`. A plan whose run failed, was rejected, or is still held is never a
  * candidate for graduation.

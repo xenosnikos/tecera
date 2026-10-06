@@ -3,7 +3,7 @@ import { canonicalJson, sha256, stringLeaves, type Json } from './json.js';
 
 /**
  * tecera.json v1. Unknown fields are rejected everywhere (`.strict()`), secrets are references only,
- * and a manifest missing any mandatory hook does not parse. See docs/design/dx.md §2.
+ * and a manifest missing any mandatory hook does not parse. See README.md §2.
  */
 
 export const MANDATORY_HOOKS = [

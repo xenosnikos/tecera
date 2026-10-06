@@ -312,7 +312,7 @@ interface RunScan {
  * verifiedAt} built from the final verify.passed evidence; without it the goal stays open.
  *
  * Recovery: restore() rebuilds the run from the ledger and decides, per unfinished step, per
- * docs/design/security.md §4 (S2–S9): re-hold, re-dispatch, restart with attempt + 1, reconcile a commit,
+ * docs/security.md §4 (S2–S9): re-hold, re-dispatch, restart with attempt + 1, reconcile a commit,
  * or fail terminally for a human. Nothing found running is ever silently forgotten.
  */
 export class Loop {
@@ -596,7 +596,7 @@ export class Loop {
   /**
    * Rebuild this run from the ledger in a fresh process (goals, intentions with their step statuses, held
    * steps, candidate fingerprints, the run deadline) and recover every unfinished step
-   * (docs/design/security.md §4):
+   * (docs/security.md §4):
    *
    * - held / approval requested (S7): pending or granted → held again (durable: a missing step.held or
    *   intention.held is re-emitted), so resume(requestId, grant) works; expired → approval.expired and the

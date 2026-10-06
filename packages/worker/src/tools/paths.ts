@@ -5,7 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { requireWriteGuard, sha256, type WriteGuard, type WriteIntent } from '@tecera/contracts';
 
 /**
- * Worktree confinement (docs/design/security.md, tamper.symlink_hardlink).
+ * Worktree confinement (docs/security.md, tamper.symlink_hardlink).
  *
  * Reads: the path is resolved against the worktree's realpath; `..`, NUL, backslashes, absolute paths
  * outside the worktree and anything that resolves (through a symlink at any level) outside it are refused.

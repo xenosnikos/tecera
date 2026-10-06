@@ -3,7 +3,7 @@ import type { Provenance } from './bdi.js';
 import type { ExecResult, SerializedError } from './worker.js';
 
 /**
- * Child ↔ supervisor frames. See docs/design/security.md §3. This is the ONE supported dialect:
+ * Child ↔ supervisor frames. See docs/security.md §3. This is the ONE supported dialect:
  *
  * - Transport: newline-delimited JSON (NDJSON) on the child's stdio, one frame per line, never Node IPC.
  *   Every frame is bounded by RPC_LIMITS BEFORE it is parsed (maxFrameBytes per line) and validated after

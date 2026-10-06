@@ -2,7 +2,7 @@
   "name": "@tecera/adversarial",
   "version": "0.1.0",
   "private": true,
-  "description": "Phase 1 adversarial suite: the named cases from docs/design/security.md section 6, crash-at-each-step recovery, and secret canary scans across every boundary",
+  "description": "Phase 1 adversarial suite: the named cases from docs/security.md section 6, crash-at-each-step recovery, and secret canary scans across every boundary",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {

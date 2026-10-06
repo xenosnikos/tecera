@@ -5,7 +5,7 @@ import { assertEnvAllowlist, scrubEnv } from './env.js';
 import { IsolationUnavailable } from './errors.js';
 
 /**
- * The restricted child-process profile (docs/design/security.md §2). Node flags close code generation,
+ * The restricted child-process profile (docs/security.md §2). Node flags close code generation,
  * prototype mutation, addons, require and websockets and confine fs reads to the entry directory; the
  * env is `manifest allowlist ∩ SANDBOX_SAFE_ENV` with PATH empty and NODE_OPTIONS absent; cwd is an empty
  * scratch dir under os.tmpdir() (never a worktree, never /mnt/*).

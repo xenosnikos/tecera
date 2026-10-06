@@ -1,0 +1,15 @@
+Tecera
+Copyright 2026 The Tecera Authors
+
+This product includes software developed by the Tecera project
+(https://github.com/xenosnikos/tecera).
+
+Portions of this software are derived from, or are TypeScript ports of ideas and code in, the following
+projects, each licensed under the Apache License, Version 2.0:
+
+  JAZ (https://github.com/jaz-lang/jaz)
+    The invoke loop, hook spans and effect model in packages/worker.
+
+  agentic-stack (https://github.com/codejunkie99/agentic-stack)
+    The memory tiers, salience scoring and staged graduation lifecycle in packages/brain, and the layout of
+    the business-case folder.

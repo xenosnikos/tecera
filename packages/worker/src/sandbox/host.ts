@@ -37,7 +37,7 @@ import { quarantineWorktree, worktreeQuarantine } from './quarantine.js';
 import { assertSandboxSettings, assertScratchDir, buildChildProfile, resolveIsolation, type IsolationControl, type IsolationProbe, type ResolvedIsolation, type SandboxSettings } from './profile.js';
 
 /**
- * ChildProcessRepl: one fresh restricted Node child per exec (docs/design/security.md §2–3). The host
+ * ChildProcessRepl: one fresh restricted Node child per exec (docs/security.md §2–3). The host
  * is the only party that holds authority: it mints HMAC handles into an exec-scoped table, validates
  * every frame before parsing it, routes tool calls to the ToolBridge, sub-invokes to onInvoke (after
  * refusing any widening), and turns every violation, limit, timeout, cancel or crash into an

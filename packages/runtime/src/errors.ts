@@ -1,5 +1,5 @@
 /**
- * Exit codes and error types of the CLI (docs/design/dx.md §4). Exit codes are stable public API:
+ * Exit codes and error types of the CLI (README.md §4). Exit codes are stable public API:
  * every command maps its outcome onto this table and nothing else. `NotWired` marks a seam whose
  * implementation lands in a later wave; it is never caught and turned into success.
  */

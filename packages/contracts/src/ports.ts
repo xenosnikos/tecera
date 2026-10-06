@@ -657,7 +657,7 @@ export interface ExecRequest {
 
 export type ToolBridge = (req: ToolRequest) => Promise<ToolResult>;
 
-/** One disposable restricted child per exec. See docs/design/security.md §2–3. */
+/** One disposable restricted child per exec. See docs/security.md §2–3. */
 export interface Repl {
   exec(req: ExecRequest, bridge: ToolBridge, signal?: AbortSignal): Promise<ExecResult & { printed: string }>;
   dispose(): Promise<void>;

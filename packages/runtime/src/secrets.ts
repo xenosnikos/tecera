@@ -4,7 +4,7 @@ import { providerSetup } from './providerSetup.js';
 import type { Env } from './util/proc.js';
 
 /**
- * The runtime's secret boundary (docs/design/security.md §7). At startup the supervisor:
+ * The runtime's secret boundary (docs/security.md §7). At startup the supervisor:
  *
  * 1. resolves every `providers.<name>.auth` reference through @tecera/providers' SecretStore, which deletes
  *    each resolved `env:` variable from the environment it was given (process.env in the real CLI);

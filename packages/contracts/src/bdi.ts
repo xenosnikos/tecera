@@ -3,7 +3,7 @@ import type { Json, JsonObject } from './json.js';
 /**
  * BDI vocabulary. Beliefs are plain facts projected from the log. Goals carry an environmental check.
  * Plans are trigger + context + steps + allowed models + permissions + budget. Intentions are committed
- * plan instances with a commitment policy. See docs/PLAN.md "Plans, gates and the first job".
+ * plan instances with a commitment policy. See docs/architecture.md "Plans, gates and the first job".
  */
 
 export type Commitment = 'blind' | 'single-minded' | 'open-minded';

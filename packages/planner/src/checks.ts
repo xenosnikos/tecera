@@ -5,7 +5,7 @@ import { deepSecretKind, inertDepth, MAX_PLAN_DEPTH, patternRedactor, UNSCANNABL
 import { safeLine } from './render.js';
 
 /**
- * Authority rules that shape and policy validation do not cover (docs/PLAN.md P1.2, security.md §5).
+ * Authority rules that shape and policy validation do not cover (docs/architecture.md P1.2, security.md §5).
  *
  * Delivery chain (owner decision D6). A plan that can change code (a commit or PR step, any write glob, or
  * a worker whose effective tools include anything outside the contracts READ_ONLY_TOOLS) must end in ONE
@@ -25,7 +25,7 @@ import { safeLine } from './render.js';
  * validatePlanShape too). The old `inputs.tools` convention is rejected so nothing relies on it.
  */
 
-/** Tools the broker offers in Phase 1 (see docs/design/security.md §3). */
+/** Tools the broker offers in Phase 1 (see docs/security.md §3). */
 export const DEFAULT_TOOL_CATALOG: readonly string[] = ['read', 'listFiles', 'edit', 'runVerify'];
 /** Tools that cannot change the worktree: the contracts set (runVerify is NOT in it: a test run can write). */
 export { READ_ONLY_TOOLS };

@@ -3,38 +3,38 @@
 The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds every port of one run;
 `commands/run.ts` drives the Loop over them.
 
-## Owner decisions (2026-10-05) as the runtime implements them
+## Behaviour
 
-- **D1 no auth package.** `@tecera/auth` is gone from this package and the JWT ingress is deleted. Approvals and
+- **no auth package.** `@tecera/auth` is gone from this package and the JWT ingress is deleted. Approvals and
   learning decisions are made by the local human principal (`--as <id>`, default `$USER`; src/principal.ts),
   recorded in the audited `approval.granted` event and its `approval.identity` evidence. Separation of duty is
   the ledger's: the requester (the loop) can never approve, a principal never approves its own request (exit 8).
   Agents cannot reach `tecera approve` (the pre-tool hook refuses it from a mediated shell).
-- **D2 reflexes on.** Seams are `rule` / `model` / `frontier` (the manifest refuses `off`); the planner seat is
+- **reflexes on.** Seams are `rule` / `model` / `frontier` (the manifest refuses `off`); the planner seat is
   the frontier, wired into the reflex router and as `LoopPorts.frontier` (metered by its own SeatMeter).
-- **D3 budgets off by default.** `openRunPools` opens usd / tokens / calls / wallMs with `budgets.enforce`
+- **budgets off by default.** `openRunPools` opens usd / tokens / calls / wallMs with `budgets.enforce`
   (default false): usage is reserved, settled and reported (`budget.exhausted` once per pool), never a stop.
   The durable deadline and the reviewer / frontier seat meters follow the same switch. Loop-safety limits
   (depth, iterations, attempts, exec timeouts) always hold. Every run ends with a cost line; `tecera evidence`
   writes the cost per step, per model and per seat into summary.md (src/cost.ts: one `cost.call` event per
   model call, plus the pools' usage).
-- **D4 proof of achievement.** `tecera hook stop` (Claude Code's Stop hook, src/stopHook.ts) exits 2 with
+- **proof of achievement.** `tecera hook stop` (Claude Code's Stop hook, src/stopHook.ts) exits 2 with
   `goal not achieved: …` while a run of this business case is active (running, held at the PR, interrupted)
   without a `goal.achieved` proof whose verify evidence is in the ledger; exit 0 otherwise. It never considers
   budget. Every decision is recorded (`stop.blocked` / `stop.allowed`).
-- **D5 review plugged in.** `review.foreign` must be true; the reviewer seat runs live on its own key and the
+- **review plugged in.** `review.foreign` must be true; the reviewer seat runs live on its own key and the
   review gate checks provider AND key fingerprint against every writer. `--allow-same-vendor-review` is gone.
-- **D6 PR-level gating.** Writes inside `repo.allowedChanges` on the leased work branch proceed under any
+- **PR-level gating.** Writes inside `repo.allowedChanges` on the leased work branch proceed under any
   isolation (fenced, protected paths and tamper rules apply); the commit lands on `tecera/<goal>` without
   approval; `gate.pr` is the only approval point (exit 4 while it waits). After `tecera approve` the resume
   pushes the branch to `origin` and opens the PR with `gh pr create` when gh is on PATH and authenticated, or
   records `pr.requested` with a patch bundle under `.tecera/runs/<run>/pr/`. Tecera never merges (`merge` is in
   `never`; the host settings deny `git push`, `gh pr create`, `git merge` and `gh pr merge`).
-- **D7 live keys.** Providers come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`. The shipped
+- **live keys.** Providers come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`. The shipped
   template and sample seat the planner (`anthropic/claude-sonnet-4.5`) and the worker (`anthropic/claude-haiku-4.5`)
   on OpenRouter and the reviewer (`gpt-5.6-terra`) on OpenAI. `tecera doctor` probes every seat live (under a
   $0.05 cap). `src/live.test.ts` runs only with the keys in the test process (source
-  `/root/.config/tecera/live.env`): the doctor probes and the sample end to end through real models.
+  an env file that exports them): the doctor probes and the sample end to end through real models.
 
 ## A run, as the end-to-end test produces it
 

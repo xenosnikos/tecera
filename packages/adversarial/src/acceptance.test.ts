@@ -7,7 +7,7 @@ import { checkCommands, cli, dump, Flow, git, NPM_RE, stopHook } from './harness
 import { cleanupTemps, SAMPLE, tmp } from './harness/tmp.js';
 
 /**
- * Phase 1 acceptance (docs/PLAN.md "Verification", `yarn test:adversarial`): strict by default.
+ * Phase 1 acceptance (docs/architecture.md "Verification", `yarn test:adversarial`): strict by default.
  *
  * - acceptance.no_gaps: no §6 case, no acceptance item and no owner-decision case may be a 'gap'. The only escape is
  *   TECERA_PHASE1_OPEN=1, which CI sets while Phase 1 is open and stops setting when it closes; with no env

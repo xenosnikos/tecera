@@ -1,9 +1,11 @@
-# Design lens: adversarial security and verification (2026-10-02)
+# Security design
 
-Produced by a Plan agent. Stands unchanged under the loop-centered plan: the worker, gates, ledger and
-approvals are the same components; "the first job" steps are now plan steps dispatched by `@tecera/loop`.
-Environment facts: Node v22.14.0 (stable `--permission`), Yarn 4, repo on DrvFs (`/mnt/c`),
-`packages/core/src/middleware/approval.ts` is the spoofable in-memory grant map to delete.
+The threat model, sandbox profile, RPC protocol, ledger and approval semantics, gate rules, the named
+adversarial cases (section 6, implemented in `packages/adversarial`) and secret handling.
+
+Note on approvals: this document was written when the human approval sat at the commit step. The
+authority model has since moved the single approval to the pull-request gate (`gate.pr`); writes to the
+work branch and the commit itself need none. The approval rules in section 4 apply unchanged to that gate.
 
 ## 1. Threat model
 

@@ -24,8 +24,8 @@ describe('CASE_INDEX', () => {
     for (const id of SECTION6_IDS) expect(ids, id).toContain(id);
   });
 
-  it('SECTION6_IDS is exactly the §6 table of docs/design/security.md', () => {
-    const doc = readFileSync(join(REPO, 'docs/design/security.md'), 'utf8');
+  it('SECTION6_IDS is exactly the §6 table of docs/security.md', () => {
+    const doc = readFileSync(join(REPO, 'docs/security.md'), 'utf8');
     const section = doc.slice(doc.indexOf('## 6.'), doc.indexOf('## 7.'));
     const rows = [...section.matchAll(/^\| `([a-z_]+\.[a-z_*]+)` \|/gm)].map((m) => m[1]);
     expect(rows).toEqual([...SECTION6_IDS]);

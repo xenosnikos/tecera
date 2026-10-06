@@ -2,7 +2,7 @@ import { sha256, type Json } from './json.js';
 import { SECRET_PATTERNS } from './manifest.js';
 
 /**
- * The one shared redaction implementation (docs/design/security.md §7). Pure: no I/O, no globals.
+ * The one shared redaction implementation (docs/security.md §7). Pure: no I/O, no globals.
  *
  * - Known secrets are replaced in their exact form and in every encoding a prompt, log or ledger row is
  *   likely to carry them in: JSON-escaped (once and twice), base64 and base64url (padded, unpadded, and the
