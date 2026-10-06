@@ -1,0 +1,21 @@
+{
+  "name": "tecera",
+  "version": "0.1.0",
+  "description": "Tecera CLI: init, validate, doctor, preflight, run, approve, status, evidence, why, gate, plans, memory, adapters, hook",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": "./bin/tecera.js",
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "echo ok",
+    "typecheck": "echo ok",
+    "clean": "echo ok",
+    "test": "echo ok"
+  },
+  "dependencies": {
+    "@tecera/runtime": "workspace:*"
+  }
+}

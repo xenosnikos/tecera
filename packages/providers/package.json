@@ -1,0 +1,31 @@
+{
+  "name": "@tecera/providers",
+  "version": "0.1.0",
+  "description": "Model providers (Anthropic, OpenAI, OpenRouter) behind the LLM port with usage and cost; SecretStore; recorded fixtures and scripted fakes",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tecera/contracts": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "typescript": "^5.5.3",
+    "vitest": "^4.0.14"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  }
+}

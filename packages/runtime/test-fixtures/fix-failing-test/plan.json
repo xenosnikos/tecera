@@ -1,0 +1,155 @@
+{
+  "id": "p_a529e0b9",
+  "trigger": {
+    "kind": "goal.adopted"
+  },
+  "context": [],
+  "steps": [
+    {
+      "id": "analyze",
+      "kind": "worker",
+      "dependsOn": [],
+      "inputs": {},
+      "tools": [
+        "read",
+        "listFiles",
+        "runVerify"
+      ],
+      "instruction": "Run verify and read the failing assertion, then read the implementation under test. Do not edit anything. Return {\"facts\":[{\"key\":\"rootCause\",\"value\":\"<one sentence>\"},{\"key\":\"targetFiles\",\"value\":[\"src/...\"]}]}.",
+      "output": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "value"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "value": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "edit",
+      "kind": "worker",
+      "dependsOn": [
+        "analyze"
+      ],
+      "inputs": {},
+      "tools": [
+        "read",
+        "listFiles",
+        "edit",
+        "runVerify"
+      ],
+      "instruction": "Fix the root cause with the smallest diff under src/**. Never edit tests, configs or lockfiles. Run verify before returning. Return {\"facts\":[{\"key\":\"changedFiles\",\"value\":[\"src/...\"]}]}.",
+      "output": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "value"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "verify",
+      "kind": "gate.verify",
+      "dependsOn": [
+        "edit"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "review",
+      "kind": "gate.review",
+      "dependsOn": [
+        "verify"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "verify2",
+      "kind": "gate.verify",
+      "dependsOn": [
+        "review"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "commit",
+      "kind": "gate.commit",
+      "dependsOn": [
+        "verify2"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "pr",
+      "kind": "gate.pr",
+      "dependsOn": [
+        "commit"
+      ],
+      "inputs": {}
+    }
+  ],
+  "allowedModels": {
+    "analyze": [
+      "worker"
+    ],
+    "edit": [
+      "worker"
+    ]
+  },
+  "permissions": {
+    "tools": [
+      "read",
+      "listFiles",
+      "edit",
+      "runVerify"
+    ],
+    "write": [
+      "src/**"
+    ],
+    "approvals": [
+      "open_pr"
+    ]
+  },
+  "budget": {
+    "usd": 1.5,
+    "tokens": 150000,
+    "wallClockSec": 1200,
+    "maxDepth": 2,
+    "maxIterations": 20,
+    "maxAttempts": 2,
+    "maxChangedFiles": 3
+  },
+  "goalKinds": [
+    "fix-failing-test"
+  ],
+  "origin": "generated",
+  "status": "candidate",
+  "rationale": "Read before writing; one worker edits src/** only; verify, foreign review, verify again, commit to the work branch, then the PR (the one human approval)."
+}

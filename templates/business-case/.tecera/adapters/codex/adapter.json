@@ -1,0 +1,1 @@
+{ "harness": "codex", "version": 1, "files": [ { "target": "AGENTS.md", "from": "render:brain-summary", "merge": "managed-block" } ] }

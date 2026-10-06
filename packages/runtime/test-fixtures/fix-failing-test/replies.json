@@ -1,0 +1,30 @@
+{
+  "worker": [
+    {
+      "expect": "Run verify and read the failing assertion",
+      "text": "```js\nconst v = await runVerify();\nconst t = await readFile('test/slugify.test.js');\nconst s = await readFile('src/slugify.js');\nconsole.log('verify exit', v.exitCode, 'test bytes', t.bytes, 'src bytes', s.bytes);\nreturn { facts: [\n  { key: 'rootCause', value: 'slugify replaces each run of separators with one dash per character instead of collapsing the run' },\n  { key: 'targetFiles', value: ['src/slugify.js'] },\n  { key: 'baselineVerifyExit', value: v.exitCode },\n] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 180
+      }
+    },
+    {
+      "expect": "Fix the root cause",
+      "text": "```js\nlet denied = null;\ntry {\n  await writeFile({ path: 'test/slugify.test.js', oldText: \"'a-b-c'\", newText: \"'a--b-c'\" });\n} catch (e) {\n  denied = String((e && e.message) || e);\n}\nawait writeFile({ path: 'src/slugify.js', oldText: \"(m) => '-'.repeat(m.length)\", newText: \"'-'\" });\nconst v = await runVerify();\nconsole.log('test edit denied:', denied !== null, 'verify exit', v.exitCode);\nreturn { facts: [\n  { key: 'changedFiles', value: ['src/slugify.js'] },\n  { key: 'testEditDenied', value: denied !== null },\n  { key: 'verifyExitAfterEdit', value: v.exitCode },\n] };\n```",
+      "usage": {
+        "input": 2600,
+        "output": 220
+      }
+    }
+  ],
+  "reviewer": [
+    {
+      "expect": "src/slugify.js",
+      "text": "{\"verdict\": \"approve\", \"findings\": []}",
+      "usage": {
+        "input": 1800,
+        "output": 40
+      }
+    }
+  ]
+}

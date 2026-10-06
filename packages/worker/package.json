@@ -1,0 +1,31 @@
+{
+  "name": "@tecera/worker",
+  "version": "0.1.0",
+  "description": "JAZ-style invoke: hooks and effects, redacting serializer, never-raising parser, broker, restricted child-process REPL, verify runner",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tecera/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@tecera/ledger": "workspace:*",
+    "@types/node": "^22.15.21",
+    "typescript": "^5.5.3",
+    "vitest": "^4.0.14"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  }
+}

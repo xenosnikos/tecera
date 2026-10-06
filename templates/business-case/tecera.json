@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "bc_template01",
+  "name": "my-business-case",
+  "owner": "owner@example.com",
+  "runtime": { "tecera": ">=0.1.0 <0.2.0" },
+  "repo": { "base": "main", "branchPrefix": "tecera/", "allowedChanges": ["src/**"] },
+  "providers": { "openrouter": { "auth": "env:OPENROUTER_API_KEY" }, "openai": { "auth": "env:OPENAI_API_KEY" } },
+  "seats": {
+    "planner": { "provider": "openrouter", "model": "anthropic/claude-sonnet-4.5", "effort": "high" },
+    "workers": [{ "id": "worker", "provider": "openrouter", "model": "anthropic/claude-haiku-4.5", "effort": "medium" }],
+    "reviewer": { "provider": "openai", "model": "gpt-5.6-terra", "effort": "high" },
+    "reflex": { "provider": "rules" }
+  },
+  "reflexes": { "triage": "rule", "choosePlan": "rule", "route": "rule", "gate": "rule", "reconsider": "rule", "closeOut": "rule", "threshold": 0.6 },
+  "commitment": "single-minded",
+  "concurrency": { "perAgent": 2 },
+  "budgets": { "usd": 2, "tokens": 200000, "wallClockSec": 1200, "maxDepth": 3, "maxIterations": 20, "maxAttempts": 2, "maxChangedFiles": 5, "enforce": false },
+  "sandbox": { "profile": "process", "isolation": "node", "network": false, "memoryMb": 256, "execTimeoutSec": 60, "envAllowlist": ["PATH", "HOME", "CI"] },
+  "policy": {
+    "protectedPaths": ["tecera.json", ".tecera/**", "CLAUDE.md", "AGENTS.md", ".claude/**", ".github/**", "**/package.json", "**/*.lock", "**/tsconfig*.json", "**/*.test.*", "**/*.spec.*", "**/tests/**", "**/__tests__/**", "**/test/**"],
+    "approvals": { "required": ["open_pr"], "ttlSec": 900, "quorum": 1, "separationOfDuty": true },
+    "failure": { "onVerifyFail": "retry-once", "onReviewFail": "retry-once", "onLedgerError": "stop" }
+  },
+  "verify": { "command": "node --test", "timeoutSec": 300 },
+  "review": { "foreign": true, "maxAttempts": 1 },
+  "board": { "driver": "ledger" },
+  "ledger": { "driver": "sqlite", "path": ".tecera/ledger.sqlite", "retentionDays": 90 },
+  "memory": { "contextBudgetTokens": 40000 },
+  "hooks": { "mandatory": ["budgetPool", "recursionLimit", "iterationLimit", "toolAllowlist", "protectedPaths", "diffBoundary", "approvalGate", "foreignReview", "verifyGate", "tamperCheck", "progressCheck", "secretCanary", "evidenceRecorder", "returnSchema"] },
+  "adapters": { "claude-code": { "enabled": true }, "codex": { "enabled": true } }
+}

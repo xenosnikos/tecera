@@ -1,0 +1,5 @@
+{
+  "always": ["read", "listFiles", "runVerify", "commit"],
+  "requiresApproval": ["open_pr", "git_push", "write_outside_allowed", "network"],
+  "never": ["delete_tests", "edit_protected_paths", "merge", "modify_tecera_config", "disable_hooks"]
+}

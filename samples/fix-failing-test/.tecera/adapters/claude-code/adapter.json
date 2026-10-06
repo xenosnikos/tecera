@@ -1,0 +1,3 @@
+{ "harness": "claude-code", "version": 1, "files": [
+  { "target": "CLAUDE.md", "from": "render:brain-summary", "merge": "managed-block" },
+  { "target": ".claude/settings.json", "from": "render:permissions", "merge": "json-merge" } ] }

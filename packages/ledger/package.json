@@ -1,0 +1,32 @@
+{
+  "name": "@tecera/ledger",
+  "version": "0.1.0",
+  "description": "Append-only hash-chained event log, projections, evidence, reservations, leases, approvals, checkpoints",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tecera/contracts": "workspace:*",
+    "better-sqlite3": "^11.7.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.15.21",
+    "typescript": "^5.5.3",
+    "vitest": "^4.0.14"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  }
+}

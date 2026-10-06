@@ -1,0 +1,41 @@
+{
+  "name": "@tecera/runtime",
+  "version": "0.1.0",
+  "description": "Composition root: providers, secret store, tools, gate steps, bin/tecera",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "assets",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/copy-assets.mjs",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist assets",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tecera/brain": "workspace:*",
+    "@tecera/contracts": "workspace:*",
+    "@tecera/gates": "workspace:*",
+    "@tecera/ledger": "workspace:*",
+    "@tecera/loop": "workspace:*",
+    "@tecera/planner": "workspace:*",
+    "@tecera/policy": "workspace:*",
+    "@tecera/providers": "workspace:*",
+    "@tecera/reflex": "workspace:*",
+    "@tecera/worker": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "typescript": "^5.5.3",
+    "vitest": "^4.0.14"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  }
+}

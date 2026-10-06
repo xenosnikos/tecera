@@ -1,0 +1,33 @@
+{
+  "name": "@tecera/adversarial",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Phase 1 adversarial suite: the named cases from docs/design/security.md section 6, crash-at-each-step recovery, and secret canary scans across every boundary",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tecera/brain": "workspace:*",
+    "@tecera/contracts": "workspace:*",
+    "@tecera/gates": "workspace:*",
+    "@tecera/ledger": "workspace:*",
+    "@tecera/loop": "workspace:*",
+    "@tecera/planner": "workspace:*",
+    "@tecera/policy": "workspace:*",
+    "@tecera/providers": "workspace:*",
+    "@tecera/reflex": "workspace:*",
+    "@tecera/runtime": "workspace:*",
+    "@tecera/worker": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "typescript": "^5.5.3",
+    "vitest": "^4.0.14"
+  }
+}
