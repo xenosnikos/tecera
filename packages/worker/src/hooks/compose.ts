@@ -7,7 +7,10 @@ import type { AbortCode, CapabilitySet, Effect, Json, Limits, Stage, SuspendRequ
  *   values dedupe, a same-path conflict refuses the whole set; one distinct ReplaceOutput; restrictions
  *   intersect; reservations sum per pool; evidence keys must be unique per body; CAS conflicts refuse.
  * A refusal is itself an Abort with code 'conflict'. Effects at a stage that does not accept them are
- * hook bugs and refuse with code 'hookError'. Exit honours only AppendEvidence and BlackboardCAS.
+ * hook bugs and refuse with code 'hookError'. Exit honours AppendEvidence, BlackboardCAS and Abort; the
+ * rest is recorded in `ignored` (the operation is over: there is nothing left to patch, hold or reserve).
+ * An Abort at Exit cannot undo the work, but it is never dropped: it carries a hook's refusal and the
+ * dispatcher's synthetic Abort for a hook that threw or timed out, and the caller ends the step `aborted`.
  */
 
 export interface Composed {
@@ -27,7 +30,7 @@ const ALLOWED: Record<Effect['type'], ReadonlySet<Stage>> = {
   PatchInput: new Set(['Enter']),
   ReplaceOutput: new Set(['Send']),
   PatchOutput: new Set(['Complete']),
-  Abort: new Set(['Enter', 'Send', 'Complete', 'Retry']),
+  Abort: new Set(['Enter', 'Send', 'Complete', 'Exit', 'Retry']),
   Suspend: new Set(['Send']),
   RestrictCapabilities: new Set(['Enter']),
   ReserveBudget: new Set(['Send']),
@@ -50,7 +53,7 @@ export function composeEffects(stage: Stage, effects: Array<[hookId: string, Eff
   const casKeys = new Map<string, string>();
 
   for (const [hookId, ef] of effects) {
-    if (stage === 'Exit' && ef.type !== 'AppendEvidence' && ef.type !== 'BlackboardCAS') {
+    if (stage === 'Exit' && !ALLOWED[ef.type].has(stage)) {
       out.ignored.push({ hookId, effect: ef });
       continue;
     }

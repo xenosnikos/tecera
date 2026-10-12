@@ -4,6 +4,7 @@ import { nameUses, renderCall, renderDeclared, resolveFrom, type ArgKind } from 
 import type { TestedCall, TestedModule } from './repoFacts.js';
 import { safeSegment } from './schema.js';
 import { namedPaths } from './scope.js';
+import { base, readShell } from './shell.js';
 
 /**
  * Drafted-contract quality (the model's draft only; scripted contracts and goal files are the requestor's).
@@ -12,8 +13,12 @@ import { namedPaths } from './scope.js';
  * the drafts that prove nothing about the request before they reach sign-off:
  * - a command criterion that only searches the repository text or checks a file exists (grep, rg, ls,
  *   test -f, …): it passes on a keyword, not on the behaviour;
- * - a command criterion that runs nothing able to fail on the behaviour (echo, true, an inline script that
- *   neither imports nor runs the repository's code, or one that never asserts, throws or exits non-zero);
+ * - a command criterion that runs nothing able to fail on the behaviour (echo, true, `node --version`, an
+ *   inline script that neither imports nor runs the repository's code, or one that never asserts, throws or
+ *   exits non-zero), read through the prefixes the host knows (`timeout 5 true` is `true`);
+ * - a command criterion that runs a program the host does not know as a check or as shell plumbing: only an
+ *   inline script, a test runner, an interpreter handed a script file, a package script, a make target or a
+ *   repository file counts as running the behaviour, and what follows an unknown word is screened by nothing;
  * - a command criterion that runs a file the repository does not hold yet, when the host can say (a worker
  *   may never write a file a criterion runs), including a file an inline script spawns;
  * - an inline script that imports a repository module the repository does not hold and the request does not
@@ -23,7 +28,9 @@ import { namedPaths } from './scope.js';
  *   that starts a server, reaches the network (fetch, http.request, curl, wget, a loopback address, a port),
  *   runs a command in the background (`&`), waits and kills (sleep, kill, wait, a timer of a second or more)
  *   or detaches a process, also inside a nested shell (`bash -lc '…'`, `eval`). The sandbox has no network,
- *   and `check & sleep 1 && kill %1` exits as kill does: the code is called in-process instead;
+ *   and `check & sleep 1 && kill %1` exits as kill does: the code is called in-process instead. The same for
+ *   a check whose status is dropped or replaced by the line around it (`check | tail`, `check || echo`,
+ *   `check; echo done`, `! check`, `exit`, `trap`, control flow): see commandStatusProblems;
  * - a script handed to an interpreter on standard input (a pipe or a here-document): the host reads only
  *   `-e` scripts, so nothing below could be checked on it;
  * - an inline script that calls a function the repository's tests already use with another call shape (fewer
@@ -131,103 +138,58 @@ function familyOf(kind: string): string {
 
 // ---------- commands ----------
 
-/** Split a command line into its simple commands' word lists (quotes kept together). */
-function simpleCommands(line: string): string[][] {
-  const out: string[][] = [];
-  let words: string[] = [];
-  let word = '';
-  let quote: string | null = null;
-  const endWord = () => {
-    if (word) words.push(word);
-    word = '';
-  };
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i]!;
-    if (quote) {
-      if (c === quote) quote = null;
-      else word += c;
-      continue;
-    }
-    if (c === "'" || c === '"') quote = c;
-    else if (/\s/.test(c)) endWord();
-    else if (c === '|' || c === '&' || c === ';' || c === '(' || c === ')') {
-      endWord();
-      if (words.length) out.push(words);
-      words = [];
-    } else word += c;
-  }
-  endWord();
-  if (words.length) out.push(words);
-  return out;
-}
-
-/** Programs that only read the repository's text or its file list: they cannot run the behaviour. */
-const INSPECT = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'findstr', 'ls', 'test', '[', '[[', 'cat', 'head', 'tail', 'wc', 'find', 'stat', 'file', '!', 'diff', 'cmp']);
+/** Programs that only read the repository's text, its file list or its history: they cannot run the behaviour. */
+const INSPECT = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'findstr', 'ls', 'test', '[', '[[', 'cat', 'head', 'tail', 'wc', 'find', 'stat', 'file', '!', 'diff', 'cmp', 'git']);
 /** Programs that exit the same way whatever the repository holds, or only move around: no check rests on them. */
-const NOOP = new Set(['true', ':', 'false', 'echo', 'printf', 'exit', 'sleep', 'cd', 'pwd', 'export', 'set', 'unset', 'which', 'type']);
-/** Wrappers whose arguments are the command (`sh -c '…'`, `env X=1 …`). */
-const WRAP = new Set(['env', 'time', 'nice', 'command', 'exec']);
-const SHELLS = new Set(['sh', 'bash', 'dash', 'zsh']);
+const NOOP = new Set(['true', ':', 'false', 'echo', 'printf', 'exit', 'sleep', 'cd', 'pwd', 'export', 'set', 'unset', 'which', 'type', 'env', 'printenv', 'trap', 'read', 'local', 'declare', 'readonly', 'shift', 'umask', 'date', 'hostname', 'whoami', 'id', 'uname', 'nproc', 'seq', 'yes', 'hash', 'return']);
+/** File and text plumbing: it prepares or passes data along and proves nothing about the behaviour. */
+const PLUMBING = new Set(['mkdir', 'rmdir', 'rm', 'cp', 'mv', 'touch', 'ln', 'chmod', 'mktemp', 'dirname', 'basename', 'realpath', 'readlink', 'tee', 'tr', 'cut', 'sed', 'awk', 'sort', 'uniq', 'nl', 'jq', 'tac', 'rev', 'paste', 'column', 'base64', 'sha256sum', 'md5sum', 'du']);
 /** Interpreters and the flags whose argument is an inline script. */
-const INLINE: Readonly<Record<string, readonly string[]>> = { node: ['-e', '--eval', '-p', '--print'], bun: ['-e', '--eval', '-p', '--print'], deno: ['eval'], python: ['-c'], python3: ['-c'] };
+const INLINE: Readonly<Record<string, readonly string[]>> = { node: ['-e', '--eval', '-p', '--print'], bun: ['-e', '--eval', '-p', '--print'], deno: ['eval'], python: ['-c'], python3: ['-c'], ruby: ['-e'], perl: ['-e', '-E'], php: ['-r'] };
 /** Interpreters whose first operand is a script file they run. */
-const SCRIPT_RUNNERS = new Set(['node', 'python', 'python3', 'sh', 'bash', 'tsx', 'ts-node', 'bun', 'deno']);
+const SCRIPT_RUNNERS = new Set(['node', 'python', 'python3', 'sh', 'bash', 'tsx', 'ts-node', 'bun', 'deno', 'ruby', 'perl', 'php']);
 /** Runner flags that take a separate value (skipped when looking for operands). */
 const VALUE_FLAGS = new Set(['--reporter', '--test-reporter', '--test-reporter-destination', '--config', '-c', '--maxWorkers', '-j', '--jobs', '-n', '--timeout', '--workspace', '-w', '-p', '--package', '--features', '--test-concurrency', '--import', '--require', '-r', '--loader', '--input-type', '--cwd', '--prefix', '-C']);
 /** Runner flags that select tests by name: a run with one is focused. */
-const FILTER_FLAGS = new Set(['-t', '-k', '-g', '-m', '--grep', '--testNamePattern', '--test-name-pattern', '-run', '--run', '--filter', '--spec', '--testPathPattern', '--test-only']);
+const FILTER_FLAGS = new Set(['-t', '-k', '-g', '-m', '--grep', '--testNamePattern', '--test-name-pattern', '-run', '--run', '--filter', '--spec', '--testPathPattern', '--test-only', '--tests']);
 /** Test runner invocations that run the whole suite when nothing after them names a file or a test. */
 const RUNNER_HEADS: readonly (readonly string[])[] = [
   ['npm', 'run', 'test'], ['npm', 'test'], ['npm', 't'], ['pnpm', 'run', 'test'], ['pnpm', 'test'], ['yarn', 'run', 'test'], ['yarn', 'test'], ['bun', 'run', 'test'], ['bun', 'test'],
   ['npx', 'vitest', 'run'], ['npx', 'vitest'], ['npx', 'jest'], ['npx', 'mocha'], ['vitest', 'run'], ['vitest'], ['jest'], ['mocha'], ['make', 'test'], ['make', 'check'],
   ['python3', '-m', 'pytest'], ['python', '-m', 'pytest'], ['python3', '-m', 'unittest'], ['python', '-m', 'unittest'], ['pytest'], ['go', 'test'], ['cargo', 'test'],
+  ['playwright', 'test'], ['deno', 'test'], ['dotnet', 'test'], ['gradle', 'test'], ['rspec'], ['bundle', 'exec', 'rspec'], ['phpunit'], ['mix', 'test'], ['swift', 'test'],
 ];
 /** Operands that still mean "everything". */
 const WHOLE_TREE = new Set(['.', './', './...', '...']);
+/** Options that make a runner or an interpreter answer a question, list or skip instead of running: nothing is checked. */
+const ASKS = new Set(['--version', '--help', '-h', '--listTests', '--list-tests', '--list', '--collect-only', '--co', '--dry-run', '--no-run', '--if-present', '--passWithNoTests', '--pass-with-no-tests']);
+/** The same for make, plus the options that ignore a failing recipe. */
+const MAKE_ASKS = new Set(['-n', '--dry-run', '--just-print', '--recon', '-q', '--question', '-p', '--print-data-base', '-i', '--ignore-errors', '--version', '-v', '-h', '--help']);
+/** Package-manager options (before the subcommand) that take a separate value. */
+const PM_VALUE_FLAGS = new Set(['-w', '--workspace', '--prefix', '--cwd', '-C', '--dir', '--filter', '-F']);
+
+/** A package manager's words with the options before its subcommand removed (`npm --prefix api test` → `npm test`). */
+function normalised(w: readonly string[]): readonly string[] {
+  const prog = base(w[0]!);
+  if (!/^(npm|pnpm|yarn|bun)$/.test(prog)) return w;
+  let i = 1;
+  while (i < w.length && w[i]!.startsWith('-')) i += !w[i]!.includes('=') && PM_VALUE_FLAGS.has(w[i]!) ? 2 : 1;
+  // `yarn workspace api test` runs `test` in one workspace.
+  if (prog === 'yarn' && w[i] === 'workspace') i += 2;
+  return i === 1 ? w : [w[0]!, ...w.slice(i)];
+}
 
 /**
- * The script a segment hands a nested shell, or null: `sh -c '…'` with any flag cluster that carries `c`
- * (`bash -lc`, `sh -ec`), and `eval '…'`.
+ * Every simple command of `cmd` as the words of the program it really runs: assignments and known prefixes
+ * (`timeout 5`, `env -u X`, `nice -n 5`, `npx`, …) stripped, nested shell scripts and command substitutions
+ * expanded (shell.ts).
  */
-function nestedScript(w: readonly string[]): string | null {
-  const prog = base(w[0]!);
-  if (prog === 'eval') return w.length > 1 ? w.slice(1).join(' ') : null;
-  if (!SHELLS.has(prog)) return null;
-  for (let i = 1; i < w.length; i++) {
-    const a = w[i]!;
-    if (/^-[A-Za-z]*c[A-Za-z]*$/.test(a)) return w[i + 1] ?? null;
-    if (a === '-o' || a === '+o' || a === '--rcfile' || a === '--init-file') i++;
-    else if (!a.startsWith('-') && !a.startsWith('+')) return null;
-  }
-  return null;
+function segments(cmd: string): string[][] {
+  return readShell(cmd).segments.map((s) => s.words);
 }
 
-/** Every simple command's words, wrappers and assignments stripped, nested shell scripts expanded. */
-function segments(cmd: string, depth = 0): string[][] {
-  const out: string[][] = [];
-  for (const words of simpleCommands(cmd)) {
-    let w = words;
-    while (w.length && (WRAP.has(w[0]!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]!))) w = w.slice(1);
-    if (!w.length) continue;
-    const nested = depth < 3 ? nestedScript(w) : null;
-    if (nested !== null) {
-      out.push(...segments(nested, depth + 1));
-      continue;
-    }
-    out.push(w);
-  }
-  return out;
-}
-
-const base = (w: string): string => w.replace(/^.*\//, '');
 /** A repository path for a diagnostic: echoed only when it is a plain relative path. */
 const safePath = (p: string): string => (/^[A-Za-z0-9_.@/-]{1,120}$/.test(p) ? p : '<path>');
-
-/** The program a segment runs; `git grep` and the other read-only git views count as a text search. */
-function programOf(w: readonly string[]): string {
-  const prog = base(w[0]!);
-  return prog === 'git' && (w[1] === 'grep' || w[1] === 'ls-files' || w[1] === 'diff' || w[1] === 'log' || w[1] === 'show') ? 'grep' : prog;
-}
 
 /** The inline script a segment hands its interpreter (`node -e '…'`), or null. */
 function inlineScript(w: readonly string[]): string | null {
@@ -243,48 +205,143 @@ function inlineScript(w: readonly string[]): string | null {
   return null;
 }
 
-/** The script reaches the repository: a relative import or require, or a repository file it spawns or reads. */
+/** A repository file a script names as a string literal. */
 const REACHES_REPO = /["'`]\.{1,2}\/[^"'`\s]+["'`]|["'`](?:[\w@.-]+\/)+[\w.-]+\.(?:m?[jt]sx?|cjs|py|sh|json)["'`]/;
 /** A Python import of something other than the standard modules a check uses to drive the code. */
 const PY_REPO_IMPORT = /\b(?:from\s+(?!(?:sys|os|json|re|subprocess|pathlib|tempfile|unittest|time)\b)[A-Za-z_][\w.]*\s+import|import\s+(?!(?:sys|os|json|re|subprocess|pathlib|tempfile|unittest|time)\b)[A-Za-z_][\w.]*)/;
+/** The script starts another process (which may then run a repository file it names). */
+const SPAWNS = /\bchild_process\b|\b(?:spawn|exec|execFile|fork)(?:Sync)?\s*\(|\bsubprocess\b|\bos\s*\.\s*(?:system|popen)\s*\(|\bBun\s*\.\s*spawn|\bDeno\s*\.\s*(?:Command|run)\b/;
 /** The script can fail: an assertion, a throw, or an exit with anything but 0. */
 const CAN_FAIL = /\bassert\w*\b|\bthrow\b|\braise\b|\bexit\(\s*(?!0?\s*\))|\bexitCode\s*=\s*(?!0\b)/;
 
-type SegmentKind = 'inspect' | 'noop' | 'generic' | 'inert' | 'behaviour';
+type SegmentKind = 'inspect' | 'noop' | 'generic' | 'inert' | 'behaviour' | 'unknown';
 
-/** True when the segment is a test runner with no operand or option that narrows it to particular tests. */
-function bareRunner(w: readonly string[]): boolean {
-  let rest: readonly string[] | null = null;
-  if (base(w[0]!) === 'node' && w.includes('--test')) rest = w.slice(1).filter((x) => x !== '--test');
-  else {
-    const head = RUNNER_HEADS.find((h) => h.length <= w.length && h.every((x, i) => (i === 0 ? base(w[0]!) === x : w[i] === x)));
-    if (head) rest = w.slice(head.length);
-  }
-  if (!rest) return false;
+/** What follows a test runner invocation (`node --test`, a RUNNER_HEADS entry), or null when `w` is not one. */
+function runnerArgs(w: readonly string[]): readonly string[] | null {
+  if (base(w[0]!) === 'node' && w.includes('--test')) return w.slice(1).filter((x) => x !== '--test');
+  const head = RUNNER_HEADS.find((h) => h.length <= w.length && h.every((x, i) => (i === 0 ? base(w[0]!) === x : w[i] === x)));
+  return head ? w.slice(head.length) : null;
+}
+
+/** A runner's positional operands (files, packages, name filters): its options and their values left out. */
+function runnerOperands(rest: readonly string[]): string[] {
+  const out: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]!;
     if (a === '--') continue;
     if (a.startsWith('-')) {
-      const flag = a.includes('=') ? a.slice(0, a.indexOf('=')) : a;
-      if (FILTER_FLAGS.has(flag)) return false;
-      if (!a.includes('=') && VALUE_FLAGS.has(flag)) i++;
+      if (!a.includes('=') && (VALUE_FLAGS.has(a) || FILTER_FLAGS.has(a))) i++;
       continue;
     }
-    if (!WHOLE_TREE.has(a)) return false;
+    out.push(a);
   }
-  return true;
+  return out;
 }
 
-function segmentKind(w: readonly string[]): SegmentKind {
-  const prog = programOf(w);
-  if (INSPECT.has(prog)) return 'inspect';
-  if (NOOP.has(prog)) return 'noop';
-  const script = inlineScript(w);
-  if (script !== null) {
-    const reaches = REACHES_REPO.test(script) || (prog.startsWith('python') && PY_REPO_IMPORT.test(script));
-    return reaches && CAN_FAIL.test(script) ? 'behaviour' : 'inert';
+/** True when the segment is a test runner with no operand or option that narrows it to particular tests. */
+function bareRunner(w: readonly string[]): boolean {
+  const rest = runnerArgs(w);
+  if (!rest) return false;
+  if (rest.some((a) => a.startsWith('-') && FILTER_FLAGS.has(a.includes('=') ? a.slice(0, a.indexOf('=')) : a))) return false;
+  return runnerOperands(rest).every((a) => WHOLE_TREE.has(a));
+}
+
+/** The files a script runner is handed to run: its first operand, or every operand of `node --test`. */
+function scriptOperands(w: readonly string[]): string[] {
+  const prog = base(w[0]!);
+  if (!SCRIPT_RUNNERS.has(prog) || (prog.startsWith('python') && w.includes('-m'))) return [];
+  const all = prog === 'node' && w.includes('--test');
+  const out: string[] = [];
+  const args = w.slice(1);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '--test' || a === '--') continue;
+    if (a.startsWith('-')) {
+      if (!a.includes('=') && VALUE_FLAGS.has(a)) i++;
+      continue;
+    }
+    if ((prog === 'deno' || prog === 'bun') && (a === 'run' || a === 'test')) continue;
+    out.push(a);
+    if (!all) break;
   }
-  return bareRunner(w) ? 'generic' : 'behaviour';
+  return out;
+}
+
+/** True when an interpreter is only asked for its version or help: an option of its own, before any script. */
+function interpreterAsks(w: readonly string[]): boolean {
+  const inline = INLINE[base(w[0]!)] ?? [];
+  for (let i = 1; i < w.length; i++) {
+    const a = w[i]!;
+    if (a === '--version' || a === '-v' || a === '-V' || a === '--help' || a === '-h') return true;
+    if (!a.startsWith('-') || inline.includes(a)) return false;
+    if (!a.includes('=') && VALUE_FLAGS.has(a)) i++;
+  }
+  return false;
+}
+
+/**
+ * Whether an inline script reaches the repository's code: it imports or requires a relative module, or starts
+ * a process and names a repository file. A path it only reads (`readFileSync("./src/app.js")`) is a text
+ * search, not a run.
+ */
+function scriptReaches(prog: string, script: string): boolean {
+  if (/^(node|bun|deno)$/.test(prog)) return specifiersOf(script).some((x) => x.startsWith('./') || x.startsWith('../')) || (SPAWNS.test(script) && REACHES_REPO.test(script));
+  if (prog.startsWith('python')) return PY_REPO_IMPORT.test(script) || (SPAWNS.test(script) && REACHES_REPO.test(script));
+  return REACHES_REPO.test(script);
+}
+
+/** True when an operand points outside the repository or is not known until the shell runs (`/dev/null`, `~/x`, `../x`, `$F`). */
+const foreign = (p: string): boolean => /^(?:\/|~|\.\.(?:\/|$))/.test(p) || /[$`]/.test(p);
+/** True when the program word is a file of the repository (`./check.sh`, `bin/report.js`), not a program on the path or an installed package's. */
+const repositoryFile = (p: string): boolean => p.includes('/') && !foreign(p) && !/[*?]/.test(p) && !/(?:^|\/)node_modules\//.test(p);
+
+/**
+ * What one simple command is to a check. Only what the host recognises counts as running the behaviour: an
+ * inline script that reaches the repository and can fail, a test runner, an interpreter handed a script file,
+ * a package script (`npm run <name>`), a make target, or a file of the repository run directly. A program the
+ * host does not know is 'unknown', never 'behaviour': `foo --flag` is no evidence that anything was checked.
+ */
+function segmentKind(words: readonly string[]): SegmentKind {
+  const w = normalised(words);
+  const prog = base(w[0]!);
+  // `find … -exec prog` runs a program the screens below never see.
+  if (prog === 'find' && w.some((a) => /^-(?:exec|execdir|ok|okdir)$/.test(a))) return 'unknown';
+  if (INSPECT.has(prog)) return 'inspect';
+  if (NOOP.has(prog) || PLUMBING.has(prog) || JOB_CONTROL.has(prog) || NETWORK_PROGRAMS.has(prog)) return 'noop';
+  if ((INLINE[prog] || SCRIPT_RUNNERS.has(prog)) && interpreterAsks(w)) return 'noop';
+  const script = inlineScript(w);
+  if (script !== null) return scriptReaches(prog, script) && CAN_FAIL.test(script) ? 'behaviour' : 'inert';
+  const pm = /^(npm|pnpm|yarn|bun)$/.test(prog);
+  // `npm --version test`, `npm -v`: an option before the subcommand that answers instead of running.
+  if (pm && words.slice(1, words.length - w.length + 1).some((a) => a === '-v' || ASKS.has(a))) return 'noop';
+  if (prog === 'make') {
+    if (w.some((a) => MAKE_ASKS.has(a))) return 'noop';
+    // A makefile given on the command line is not the repository's.
+    if (w.some((a) => /^(?:-f|--file|--makefile|--eval)/.test(a))) return 'unknown';
+  }
+  const runner = runnerArgs(w);
+  if (runner) {
+    if (words.some((a) => ASKS.has(a))) return 'noop';
+    if (runnerOperands(runner).some(foreign)) return 'unknown';
+    return bareRunner(w) ? 'generic' : 'behaviour';
+  }
+  if (SCRIPT_RUNNERS.has(prog)) {
+    // `node --check file` only parses it.
+    if (prog === 'node' && (w.includes('--check') || w.includes('-c'))) return 'inspect';
+    const files = scriptOperands(w);
+    if (files.length) return files.some(foreign) ? 'unknown' : 'behaviour';
+    return prog.startsWith('python') && w.includes('-m') ? 'unknown' : 'noop';
+  }
+  if (pm && (w[1] === 'run' || w[1] === 'run-script')) return w[2] && !w[2].startsWith('-') && !words.some((a) => ASKS.has(a)) ? 'behaviour' : 'noop';
+  if (prog === 'make') return w.slice(1).some((a) => !a.startsWith('-') && !a.includes('=')) ? 'behaviour' : 'unknown';
+  return repositoryFile(words[0]!) ? 'behaviour' : 'unknown';
+}
+
+/** The kinds of the simple commands that make up the line itself (a command substitution only feeds a word). */
+function kindsOf(cmd: string): SegmentKind[] {
+  return readShell(cmd)
+    .segments.filter((x) => !x.substituted)
+    .map((x) => segmentKind(x.words));
 }
 
 /**
@@ -294,9 +351,11 @@ function segmentKind(w: readonly string[]): SegmentKind {
  *   `git grep`, through shell wrappers and pipes);
  * - 'generic': it runs the repository's whole test command (`verify`) or a test runner nothing narrows to
  *   particular tests (no file, no test-name filter; options like `--runInBand` or `-q` do not narrow);
- * - 'inert': nothing in it can fail on the behaviour (echo, true, an inline script that does not import or
- *   run the repository's code, or one with no assertion, throw or non-zero exit);
+ * - 'inert': nothing in it can fail on the behaviour (echo, true, `node --version`, an inline script that does
+ *   not import or run the repository's code, or one with no assertion, throw or non-zero exit), or nothing in
+ *   it is a program the host recognises as a check (commandUnknownPrograms);
  * - 'focused': some part of it runs the repository's code in a way that can fail.
+ * Known prefixes and nested shells are read through first (`timeout 5 true` is `true`).
  */
 export type CommandFocus = 'inspect' | 'generic' | 'inert' | 'focused';
 
@@ -305,7 +364,7 @@ export function commandFocus(cmd: string, verify?: string): CommandFocus {
     const c = String(cmd).trim().replace(/\s+/g, ' ');
     const v = verify?.trim().replace(/\s+/g, ' ');
     if (v && (c === v || (c.startsWith(`${v} `) && c.slice(v.length + 1).split(' ').every((a) => a.startsWith('-'))))) return 'generic';
-    const kinds = segments(c).map(segmentKind);
+    const kinds = kindsOf(c);
     if (!kinds.length) return 'inert';
     if (kinds.includes('behaviour')) return 'focused';
     if (kinds.every((k) => k === 'inspect')) return 'inspect';
@@ -319,11 +378,62 @@ export function commandFocus(cmd: string, verify?: string): CommandFocus {
 /** True when `cmd` only searches the repository text or checks that files exist (see commandFocus). */
 export function commandOnlyInspectsText(cmd: string): boolean {
   try {
-    const kinds = segments(String(cmd)).map(segmentKind);
+    const kinds = kindsOf(String(cmd));
     return kinds.length > 0 && kinds.every((k) => k === 'inspect');
   } catch {
     return false;
   }
+}
+
+/**
+ * Programs `cmd` runs that the host knows neither as a way to run a check nor as shell plumbing (in order,
+ * unique): a prefix it cannot read through (`sudo …`, `chronic …`), a tool it has no rule for, a program named
+ * by a variable. Whatever follows such a word is screened by nothing, so a drafted criterion may not carry one.
+ */
+export function commandUnknownPrograms(cmd: string): string[] {
+  try {
+    const out = new Set<string>();
+    for (const x of readShell(String(cmd)).segments) if (segmentKind(x.words) === 'unknown') out.add(base(x.words[0]!));
+    return [...out];
+  } catch {
+    return ['<unreadable>'];
+  }
+}
+
+/**
+ * Why the exit status of `cmd` is not the check's own (empty when it is). The verify gate runs the line in a
+ * plain shell (no errexit, no pipefail) and takes its exit status, so the status is the check's only when
+ * every command that can fail reaches it: one command, or commands joined with `&&`. Reported:
+ * - a `||` fallback (`check || echo failed`, `check && echo PASS || echo FAIL`, `check || true`);
+ * - a command that is not shell plumbing in a place whose status is dropped: before a `|` (`check | tail`,
+ *   `check | tee log`, `check | grep -q pass`), before a `;` or a newline (`check; echo done`), or inside a
+ *   command substitution (`echo $(check)`). Plumbing there is fine (`cd pkg; check`, `cat in.json | check`);
+ * - a `!` negation, `exit`, `trap`, `set +e`;
+ * - control flow (`if`, `for`, `while`) and syntax the host cannot read (a function, `case`, an unclosed
+ *   quote): whose status the line ends with cannot be told.
+ * All of it is read through known prefixes, subshells, brace groups and nested shells (`sh -c '…'`). A
+ * background job (`&`) is reported by commandSandboxProblems. Never throws.
+ */
+export function commandStatusProblems(cmd: string): string[] {
+  const out = new Set<string>();
+  try {
+    const read = readShell(String(cmd));
+    if (read.marks.has('unreadable')) out.add('has shell syntax the host cannot read');
+    if (read.marks.has('control')) out.add('uses shell control flow');
+    if (read.marks.has('or')) out.add('falls back with ||');
+    if (read.marks.has('negation')) out.add('negates with !');
+    for (const x of read.segments) {
+      const prog = base(x.words[0]!);
+      const kind = segmentKind(x.words);
+      if (x.dropped && !x.background && kind !== 'inspect' && kind !== 'noop') out.add(`drops the exit status of ${safeSegment(prog)} (${x.substituted ? 'inside $(…)' : 'before | or ;'})`);
+      if (prog === 'exit') out.add('calls exit');
+      if (prog === 'trap') out.add('sets a trap');
+      if (prog === 'set' && x.words.some((a, i) => i > 0 && (/^\+[A-Za-z]*e/.test(a) || (a === '+o' && x.words[i + 1] === 'errexit')))) out.add('turns errexit off');
+    }
+  } catch {
+    out.add('cannot be read');
+  }
+  return [...out];
 }
 
 /** True when `cmd` runs only the repository's whole test command (`verify`) or a bare test runner. */
@@ -406,27 +516,12 @@ export function commandRunsFiles(cmd: string): string[] {
   try {
     for (const w of segments(String(cmd))) {
       if (w[0]!.includes('/')) add(w[0]!);
-      const prog = base(w[0]!);
       const script = inlineScript(w);
       if (script !== null) {
         for (const f of spawnedFiles(script)) add(f);
         continue;
       }
-      if (!SCRIPT_RUNNERS.has(prog)) continue;
-      if (prog.startsWith('python') && w.includes('-m')) continue;
-      const all = prog === 'node' && w.includes('--test');
-      const args = w.slice(1);
-      for (let i = 0; i < args.length; i++) {
-        const a = args[i]!;
-        if (a === '--test' || a === '--') continue;
-        if (a.startsWith('-')) {
-          if (!a.includes('=') && VALUE_FLAGS.has(a)) i++;
-          continue;
-        }
-        if ((prog === 'deno' || prog === 'bun') && (a === 'run' || a === 'test')) continue;
-        add(a);
-        if (!all) break;
-      }
+      for (const f of scriptOperands(w)) add(f);
     }
   } catch {
     // A command that cannot be read names no file.
@@ -435,19 +530,6 @@ export function commandRunsFiles(cmd: string): string[] {
 }
 
 // ---------- what the verify sandbox cannot run ----------
-
-/** The command line and every nested shell script inside it (operators intact). */
-function shellTexts(cmd: string, depth = 0): string[] {
-  const out = [cmd];
-  if (depth >= 3) return out;
-  for (const words of simpleCommands(cmd)) {
-    let w = words;
-    while (w.length && (WRAP.has(w[0]!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]!))) w = w.slice(1);
-    const nested = w.length ? nestedScript(w) : null;
-    if (nested !== null) out.push(...shellTexts(nested, depth + 1));
-  }
-  return out;
-}
 
 /** True when a shell line puts a command in the background: a lone `&` outside quotes (not `&&`, `>&`, `&>`, `|&`). */
 function runsInBackground(line: string): boolean {
@@ -486,15 +568,38 @@ const NETWORK_LOCAL: ReadonlyArray<readonly [RegExp, string]> = [
   [/(?:^|\s)PORT=|--port\b|\bport\s*[:=]\s*\d/i, 'names a port'],
 ];
 /** Waiting inside a script: a timer of a second or more, a spawned sleep, a process left running. */
-const TIMER = /\bset(?:Timeout|Interval)\b[^;]*?,\s*(\d[\d_]*)\s*\)|\bsetTimeout\s*\(\s*(\d[\d_]*)\s*[,)]/g;
+const TIMER_CALL = /\bset(?:Timeout|Interval)\b([^;]*)/g;
+/** A delay as a timer's last argument: a number, a named constant, or their product or sum (`61 * 1000`, `WINDOW_MS`). */
+const DELAY_LAST = /,\s*([\w.$ \t*+]+?)\s*\)/g;
+/** Another name for the promise timer (`import { setTimeout as sleep } from "node:timers/promises"`, `{ setTimeout: sleep }`). */
+const TIMER_ALIAS = /\bset(?:Timeout|Interval)\s*(?:\bas\b|:)\s*([A-Za-z_$][\w$]*)/g;
 const SCRIPT_WAITS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\bdetached\s*:\s*true\b/, 'detaches a process'],
   [/["'`]\s*sleep(?:\s+[\d.]|["'`])|\bAtomics\s*\.\s*wait\s*\(/, 'uses sleep'],
 ];
 
-/** True when `text` waits on a timer of a second or more (`setTimeout(r, 61000)`). */
+/**
+ * The milliseconds a delay expression names, NaN when the host cannot tell: numeric literals (`61000`,
+ * `61_000`, `61e3`), constants the script sets to one (`const WINDOW = 61 * 1000`), and their products and sums.
+ */
+function delayMs(expr: string, text: string, depth = 0): number {
+  const factor = (f: string): number => {
+    const x = f.trim();
+    const n = x.replace(/_/g, '');
+    if (/^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(n)) return Number(n);
+    if (depth > 2 || !/^[A-Za-z_$][\w$]*$/.test(x)) return NaN;
+    const set = new RegExp(`\\b(?:const|let|var)\\s+${esc(x)}\\s*=\\s*([\\w.$ \\t*+]+?)\\s*(?:[;,\\n]|$)`).exec(text);
+    return set ? delayMs(set[1]!, text, depth + 1) : NaN;
+  };
+  return expr.split('+').reduce((sum, term) => sum + term.split('*').reduce((product, f) => product * factor(f), 1), 0);
+}
+
+/** True when `text` waits on a timer of a second or more (`setTimeout(r, 61000)`, `setTimeout(r, 61 * 1000)`, `await sleep(WINDOW)`). */
 function waitsOnTimer(text: string): boolean {
-  for (const m of text.matchAll(TIMER)) if (Number((m[1] ?? m[2])!.replace(/_/g, '')) >= 1000) return true;
+  for (const m of text.matchAll(TIMER_CALL)) for (const d of m[1]!.matchAll(DELAY_LAST)) if (delayMs(d[1]!, text) >= 1000) return true;
+  // The promise form takes the delay first: setTimeout(1000), or the same under another name.
+  const names = ['setTimeout', 'scheduler\\s*\\.\\s*wait', ...[...text.matchAll(TIMER_ALIAS)].map((m) => esc(m[1]!))];
+  for (const m of text.matchAll(new RegExp(`(?<![\\w$.])(?:${names.join('|')})\\s*\\(\\s*([\\w.$ \\t*+]+?)\\s*[,)]`, 'g'))) if (delayMs(m[1]!, text) >= 1000) return true;
   return false;
 }
 
@@ -511,9 +616,10 @@ export function commandSandboxProblems(cmd: string, reachesHttp = false): string
   const out = new Set<string>();
   try {
     const line = String(cmd);
-    if (shellTexts(line).some(runsInBackground)) out.add('backgrounds a command (&)');
-    for (const w of segments(line)) {
-      const prog = base(w[0]!);
+    const read = readShell(line);
+    if (read.marks.has('background') || read.texts.some(runsInBackground)) out.add('backgrounds a command (&)');
+    // A prefix the reader strips is a program too (`nohup node …`, `timeout 70 sleep 61`).
+    for (const prog of [...read.segments.map((x) => base(x.words[0]!)), ...read.wrappers]) {
       if (JOB_CONTROL.has(prog)) out.add(`uses ${prog}`);
       if (NETWORK_PROGRAMS.has(prog)) out.add(`runs ${prog}`);
     }
@@ -550,8 +656,9 @@ export function commandReadsScriptFromStdin(cmd: string): boolean {
       }
       return false;
     };
-    if (shellTexts(String(cmd)).some(hereDoc)) return true;
-    for (const w of segments(String(cmd))) {
+    const read = readShell(String(cmd));
+    if (read.texts.some(hereDoc)) return true;
+    for (const { words: w } of read.segments) {
       if (!INLINE[base(w[0]!)] || inlineScript(w) !== null || w.some((a) => NO_SCRIPT.has(a))) continue;
       let operand: string | null = null;
       for (let i = 1; i < w.length && operand === null; i++) {
@@ -767,6 +874,12 @@ export function contractQualityIssues(draft: ContractDraft, c: QualityContext): 
         const cannot = commandSandboxProblems(k.check.command, (k.requires ?? []).some((id) => httpKind(id) && reads(id)));
         if (cannot.length) issues.push(`criterion ${safeSegment(k.id)} ${cannot.slice(0, 6).join(', ')}: the verify sandbox has no network and no background jobs; import the code and call it in-process, as the existing tests do (fake the time instead of waiting)`);
       }
+      if (own) {
+        const masked = commandStatusProblems(k.check.command);
+        if (masked.length) issues.push(`criterion ${safeSegment(k.id)} ${masked.slice(0, 3).join(', ')}: its exit status must be the check's own. Write one check (an inline node assertion, or node --test <file>), setup joined with && only: no |, ||, ;, !, exit or trap`);
+      }
+      const unknown = own ? commandUnknownPrograms(k.check.command) : [];
+      if (unknown.length) issues.push(`criterion ${safeSegment(k.id)} runs ${unknown.slice(0, 3).map(safeSegment).join(', ')} in a form the host does not know as a check; run the behaviour with an inline node assertion (node -e), a test runner on a test file or a repository script (it reads through env, timeout, nice, time and sh -c)`);
       if (own && commandReadsScriptFromStdin(k.check.command)) issues.push(`criterion ${safeSegment(k.id)} hands an interpreter its script on standard input (a pipe or a here-document); pass the script with -e (node --input-type=module -e '…') so the host can read what it calls`);
       const focus = commandFocus(k.check.command, c.verifyCommand);
       if (focus === 'inspect') {
@@ -774,7 +887,7 @@ export function contractQualityIssues(draft: ContractDraft, c: QualityContext): 
         continue;
       }
       if (focus === 'inert') {
-        if (own) issues.push(`criterion ${safeSegment(k.id)} runs nothing that can fail on the behaviour; an inline script must import or run the repository's code and assert (assert, throw or a non-zero exit)`);
+        if (own && !unknown.length) issues.push(`criterion ${safeSegment(k.id)} runs nothing that can fail on the behaviour; an inline script must import or run the repository's code and assert (assert, throw or a non-zero exit)`);
         continue;
       }
       if (own && c.fileExists) {

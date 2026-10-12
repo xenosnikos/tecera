@@ -1,6 +1,7 @@
+import { spawn } from 'node:child_process';
 import { lstatSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import { requireWriteGuard, resourceProblem, type Json, type JsonObject, type ProvisionedResource, type ToolContext, type ToolRequest, type ToolResult, type WriteGuard } from '@tecera/contracts';
+import { requireWriteGuard, resourceProblem, type Json, type ProvisionedResource, type ToolContext, type ToolRequest, type ToolResult, type WriteGuard } from '@tecera/contracts';
 import { combinedSignal, type AuthorizingTool } from '../tools/common.js';
 
 /**
@@ -11,7 +12,12 @@ import { combinedSignal, type AuthorizingTool } from '../tools/common.js';
  * - sqlite (kind 'sqlite'): the locator is an absolute path to a regular file (never a symlink). `query(sql,
  *   params?)` returns rows, `run(sql, params?)` returns changes. One statement per call; ATTACH, DETACH,
  *   VACUUM (INTO writes a file), PRAGMA and extension loading are refused, so a statement cannot reach any
- *   other file. Parameters are JSON scalars.
+ *   other file. Parameters are JSON scalars. The statement is model-written, so it never runs on the
+ *   supervisor thread: each call runs in a short-lived child process that is SIGKILLed at the time bound,
+ *   when the exec signal or the guard's signal fires, or when it writes more than the result bound. The
+ *   child opens the file with a page cap (the database cannot grow past maxDbBytes), a hard heap limit and
+ *   in-memory temp storage; rows stop at maxRows or maxResultBytes (truncated). Every bound fails closed
+ *   (ok:false); a killed write is rolled back by sqlite's journal on the next open.
  * - http-stub (kind 'http-stub'): the locator is a loopback http URL (127.0.0.1, ::1 or localhost) with no
  *   credentials. `get|post|put|delete(path, body?)` take a path RELATIVE to the locator; anything that would
  *   leave its origin or base path (`..`, `//host`, a scheme, a backslash, `@`) is refused, redirects are
@@ -30,6 +36,12 @@ export const RESOURCE_TOOL_LIMITS = {
   maxBodyBytes: 256 * 1024,
   maxResponseBytes: 512 * 1024,
   timeoutMs: 10_000,
+  /** sqlite: rows of one result, as JSON bytes. */
+  maxResultBytes: 1024 * 1024,
+  /** sqlite: size the database file may grow to (a file already larger cannot grow at all). */
+  maxDbBytes: 64 * 1024 * 1024,
+  /** sqlite: engine heap of one statement (page cache, sorters, in-memory temp storage). */
+  maxSqlHeapBytes: 128 * 1024 * 1024,
 } as const;
 
 export class ResourceToolError extends Error {
@@ -43,7 +55,11 @@ export interface ResourceToolOptions {
   /** Tool (and program binding) name; default the resource's capability id. */
   name?: string;
   now?: () => number;
+  /** Time bound of one request (http) or one statement (sqlite). Default RESOURCE_TOOL_LIMITS.timeoutMs. */
   timeoutMs?: number;
+  /** sqlite only: lower the result and database size bounds (never above RESOURCE_TOOL_LIMITS). */
+  maxResultBytes?: number;
+  maxDbBytes?: number;
 }
 
 /** A tool serving one provisioned resource; `resourceId` names it. */
@@ -102,12 +118,146 @@ function paramsOf(v: Json | undefined): Array<string | number | null> {
   });
 }
 
-function cell(v: unknown): Json {
-  if (v === null || typeof v === 'string' || typeof v === 'number') return v as Json;
+interface SqlJob {
+  path: string;
+  method: string;
+  sql: string;
+  params: Array<string | number | null>;
+  maxRows: number;
+  maxResultBytes: number;
+  maxDbBytes: number;
+  heapBytes: number;
+}
+
+/**
+ * The statement runner (CommonJS, run with `node -e` so it is the same from src and dist). Reads one SqlJob
+ * as JSON on stdin, writes one JSON answer on stdout: { ok: true, value } or { ok: false, name, message }.
+ * The PRAGMAs are the host's, set before the statement is prepared; the program can issue none.
+ */
+const SQL_CHILD = `
+const { DatabaseSync } = require('node:sqlite');
+const cell = (v) => {
+  if (v === null || typeof v === 'string' || typeof v === 'number') return v;
   if (typeof v === 'bigint') return v.toString();
   if (v instanceof Uint8Array) return { blob: Buffer.from(v).toString('base64') };
   return String(v);
+};
+let raw = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (c) => (raw += c));
+process.stdin.on('end', () => {
+  let out;
+  try {
+    const q = JSON.parse(raw);
+    const db = new DatabaseSync(q.path, { allowExtension: false });
+    try {
+      db.exec('PRAGMA temp_store = MEMORY');
+      const heap = db.prepare('PRAGMA hard_heap_limit = ' + q.heapBytes).get();
+      if (!heap || Number(heap.hard_heap_limit) !== q.heapBytes) throw new Error('the heap limit was not applied');
+      const pageSize = Number(db.prepare('PRAGMA page_size').get().page_size);
+      const pages = Number(db.prepare('PRAGMA page_count').get().page_count);
+      const want = Math.max(pages, Math.floor(q.maxDbBytes / pageSize), 1);
+      const got = Number(db.prepare('PRAGMA max_page_count = ' + want).get().max_page_count);
+      if (!(got <= want)) throw new Error('the database size limit was not applied');
+      const stmt = db.prepare(q.sql);
+      if (q.method === 'run') {
+        const res = stmt.run(...q.params);
+        out = { ok: true, value: { changes: Number(res.changes), lastInsertRowid: cell(res.lastInsertRowid) } };
+      } else {
+        const rows = [];
+        let truncated = false;
+        let bytes = 0;
+        for (const row of stmt.iterate(...q.params)) {
+          if (rows.length >= q.maxRows) {
+            truncated = true;
+            break;
+          }
+          const r = Object.fromEntries(Object.entries(row).map(([k, v]) => [k, cell(v)]));
+          const n = Buffer.byteLength(JSON.stringify(r), 'utf8');
+          if (n > q.maxResultBytes) {
+            const e = new Error('a row of the result is larger than ' + q.maxResultBytes + ' bytes');
+            e.name = 'ResourceToolError';
+            throw e;
+          }
+          if (bytes + n > q.maxResultBytes) {
+            truncated = true;
+            break;
+          }
+          bytes += n;
+          rows.push(r);
+        }
+        out = { ok: true, value: { rows, truncated } };
+      }
+    } finally {
+      db.close();
+    }
+  } catch (e) {
+    out = { ok: false, name: String((e && e.name) || 'Error'), message: String((e && e.message) || e) };
+  }
+  process.stdout.write(JSON.stringify(out));
+});
+`;
+
+const SQL_KILL_GRACE_MS = 5_000;
+
+/**
+ * Run one statement in its own process. Resolves with the statement's value; rejects with the engine's
+ * error, or a ResourceToolError when the child was stopped (time bound, cancel, oversized answer) or did
+ * not answer. The child is SIGKILLed on every stop, so nothing keeps running after this settles; the
+ * answer is read when the child's stdout has closed.
+ */
+function runStatement(job: SqlJob, timeoutMs: number, signal: AbortSignal): Promise<Json> {
+  return new Promise<Json>((resolve, reject) => {
+    if (signal.aborted) return reject(new ResourceToolError('the statement was not run: the exec was cancelled'));
+    const child = spawn(process.execPath, ['--no-warnings', '--max-old-space-size=256', '-e', SQL_CHILD], { stdio: ['pipe', 'pipe', 'ignore'], env: {}, cwd: '/', windowsHide: true });
+    const maxAnswer = job.maxResultBytes + 4 * job.maxRows + 64 * 1024;
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let stopped: ResourceToolError | null = null;
+    let done = false;
+    let grace: NodeJS.Timeout | undefined;
+    const stop = (why: string): void => {
+      if (stopped || done) return;
+      stopped = new ResourceToolError(why);
+      child.kill('SIGKILL');
+      // A child that cannot be reaped is not waited for: the call still fails closed.
+      grace = setTimeout(() => settle(), SQL_KILL_GRACE_MS);
+    };
+    const onAbort = (): void => stop('the statement was stopped: the exec was cancelled');
+    const timer = setTimeout(() => stop(`the statement did not finish within ${timeoutMs}ms and was stopped`), timeoutMs);
+    const settle = (spawnError?: Error): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (grace) clearTimeout(grace);
+      signal.removeEventListener('abort', onAbort);
+      if (stopped) return reject(stopped);
+      if (spawnError) return reject(new ResourceToolError(`the statement could not be run: ${spawnError.message}`));
+      let answer: { ok?: unknown; value?: Json; name?: unknown; message?: unknown };
+      try {
+        answer = JSON.parse(Buffer.concat(chunks).toString('utf8')) as typeof answer;
+      } catch {
+        return reject(new ResourceToolError('the statement runner ended without an answer'));
+      }
+      if (answer?.ok === true && answer.value !== undefined) return resolve(answer.value);
+      const err = new Error(typeof answer?.message === 'string' ? answer.message : 'the statement failed');
+      err.name = typeof answer?.name === 'string' && answer.name ? answer.name : 'Error';
+      reject(err);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    child.stdout.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > maxAnswer) return stop(`the result is larger than ${job.maxResultBytes} bytes`);
+      chunks.push(c);
+    });
+    child.stdin.on('error', () => undefined);
+    child.on('error', (e) => settle(e));
+    child.on('close', () => settle());
+    child.stdin.end(JSON.stringify(job));
+  });
 }
+
+const lowered = (v: number | undefined, max: number): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.min(Math.floor(v), max) : max);
 
 /** The database file: absolute, a regular file, not a symlink (checked on every call). */
 function dbPath(r: ProvisionedResource): string {
@@ -143,7 +293,7 @@ export function createSqliteResourceTool(resource: ProvisionedResource, o: Resou
       if (!methods.includes(req.method)) throw new ResourceToolError(`${name} has no method ${req.method}`);
       live(r, o);
     },
-    async call(req: ToolRequest, _ctx: ToolContext, guard?: WriteGuard): Promise<ToolResult> {
+    async call(req: ToolRequest, ctx: ToolContext, guard?: WriteGuard): Promise<ToolResult> {
       try {
         if (!methods.includes(req.method)) throw new ResourceToolError(`${name} has no method ${req.method}`);
         live(r, o);
@@ -151,27 +301,24 @@ export function createSqliteResourceTool(resource: ProvisionedResource, o: Resou
         const sql = sqlOf(sqlArg);
         const params = paramsOf(paramArg);
         const path = dbPath(r);
-        requireWriteGuard(guard).check();
-        const { DatabaseSync } = await import('node:sqlite');
-        const db = new DatabaseSync(path, { allowExtension: false });
+        const g = requireWriteGuard(guard);
+        g.check();
+        const job: SqlJob = {
+          path,
+          method: req.method,
+          sql,
+          params,
+          maxRows: RESOURCE_TOOL_LIMITS.maxRows,
+          maxResultBytes: lowered(o.maxResultBytes, RESOURCE_TOOL_LIMITS.maxResultBytes),
+          maxDbBytes: lowered(o.maxDbBytes, RESOURCE_TOOL_LIMITS.maxDbBytes),
+          heapBytes: RESOURCE_TOOL_LIMITS.maxSqlHeapBytes,
+        };
         try {
-          const stmt = db.prepare(sql);
-          if (req.method === 'run') {
-            const res = stmt.run(...params);
-            return ok(req, r, { changes: Number(res.changes), lastInsertRowid: cell(res.lastInsertRowid) });
-          }
-          const rows: JsonObject[] = [];
-          let truncated = false;
-          for (const row of stmt.iterate(...params)) {
-            if (rows.length >= RESOURCE_TOOL_LIMITS.maxRows) {
-              truncated = true;
-              break;
-            }
-            rows.push(Object.fromEntries(Object.entries(row as Record<string, unknown>).map(([k, v]) => [k, cell(v)])));
-          }
-          return ok(req, r, { rows, truncated });
-        } finally {
-          db.close();
+          return ok(req, r, await runStatement(job, typeof o.timeoutMs === 'number' && o.timeoutMs > 0 ? o.timeoutMs : RESOURCE_TOOL_LIMITS.timeoutMs, combinedSignal(ctx, g)));
+        } catch (e) {
+          // A statement stopped because the fence was lost reports the fence, as every other write does.
+          g.check();
+          throw e;
         }
       } catch (e) {
         return fail(req, r, e);

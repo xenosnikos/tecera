@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   AccountingFailure,
@@ -60,7 +61,7 @@ import { Brain } from '@tecera/brain';
 import { createGates, hostGit, PrGate, scrubbedAllowlist, type Gates } from '@tecera/gates';
 import { DEFAULT_LLM_RESERVATION, type SeatCost, type WorktreeChange } from '@tecera/loop';
 import { createPlanValidator, LLMPlanner, type RepoFacts } from '@tecera/planner';
-import { allowanceOf, assertMandatory, mandatoryHooks, type PermissionsDoc } from '@tecera/policy';
+import { allowanceOf, assertMandatory, criterionScriptDirs, mandatoryHooks, packageScriptsOf, type PackageScripts, type PermissionsDoc } from '@tecera/policy';
 import { createProvider, doctorProbe, priceFor, type FetchLike, type SecretStore } from '@tecera/providers';
 import type { Frontier } from '@tecera/reflex';
 import { ChildProcessRepl, createEditTool, createListFilesTool, createReadTool, MESSAGE_KINDS, MESSAGE_METHODS, resourceTools, StepWorker, STORE_KINDS, STORE_METHODS, type ReplFactory } from '@tecera/worker';
@@ -77,7 +78,7 @@ import { cancellableLLM, meteredLLM, SeatMeter, type SeatReservation } from './m
 import { OwnershipRecorder, ownerFilePath, reapPriorProcesses, type ReapResult } from './ownership.js';
 import { providerOptions, providerSetup, withIdentity } from './providerSetup.js';
 import { loadScripts, scriptedFetch, ScriptedRunPlanner, type ScriptSet, type ScriptTap } from './scripted.js';
-import type { Env } from './util/proc.js';
+import { gitSync, type Env } from './util/proc.js';
 import { diffTrees, leaseWorktree, repoFileView, WiringError, worktreesRoot, type LeasedWorktree } from './worktree.js';
 
 export { WiringError } from './worktree.js';
@@ -780,6 +781,37 @@ export function createWiring(o: WiringOptions = {}): WireFn {
       };
 
       // 5. worker
+      // The package scripts a criterion runs, as they are on the run's base (the base commit, or the business
+      // case itself when the worktree is a private copy): never the worktree a worker writes.
+      const baseScriptCache = new Map<string, Record<string, string>>();
+      const baseScriptsOfDir = (d: string): Record<string, string> => {
+        const hit = baseScriptCache.get(d);
+        if (hit) return hit;
+        const rel = d ? `${d}/package.json` : 'package.json';
+        let text = '';
+        if (wt.git) {
+          const r = gitSync(wt.path, ['cat-file', 'blob', `${wt.baseSha}:${rel}`], { env: ctx.env });
+          text = r.code === 0 ? r.stdout : '';
+        } else {
+          try {
+            text = readFileSync(join(ctx.root, rel), 'utf8');
+          } catch {
+            text = '';
+          }
+        }
+        const scripts = packageScriptsOf(text);
+        baseScriptCache.set(d, scripts);
+        return scripts;
+      };
+      const basePackageScripts = (contract: AcceptanceContract): PackageScripts => {
+        const out: Record<string, Record<string, string>> = {};
+        for (let round = 0; round < 4; round++) {
+          const missing = criterionScriptDirs(contract, out).filter((d) => !(d in out));
+          if (!missing.length) break;
+          for (const d of missing) out[d] = baseScriptsOfDir(d);
+        }
+        return out;
+      };
       const hooks = mandatoryHooks(m, {
         permissions: ctx.permissions,
         secretValues,
@@ -791,6 +823,7 @@ export function createWiring(o: WiringOptions = {}): WireFn {
         // Under a contract, a worker write to the goal file, to a file a criterion's check runs, or to a script
         // a criterion runs is refused at the tool call (D8).
         contract: () => als.getStore()?.contract ?? null,
+        packageScripts: basePackageScripts,
       });
       try {
         assertMandatory(hooks, m);

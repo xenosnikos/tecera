@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import { existsSync, symlinkSync } from 'node:fs';
+import { existsSync, statSync, symlinkSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -76,6 +76,84 @@ describe('sqlite resource tool', () => {
     expect((await tool().call(req('query', 'SELECT ?', [{ a: 1 } as unknown as Json]), ctx, liveWriteGuard())).error?.message).toMatch(/params must be/);
     expect((await tool().call(req('query', 'SELECT count(*) AS n FROM t'), ctx, liveWriteGuard())).value).toEqual({ rows: [{ n: 1 }], truncated: false });
   });
+
+  // Model-written SQL never runs on the supervisor thread: a statement that does not end is stopped by a
+  // hard timeout or by the exec signal, and the event loop keeps turning while it runs.
+  const RUNAWAY = 'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 20000000) SELECT count(*) AS n FROM c';
+  const ENDLESS = 'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) AS n FROM c';
+  const bounded = (o: Record<string, number>) => createSqliteResourceTool(resource({ locator: db, teardown: `rm -f ${db}` }), { now, ...o });
+  const ticking = (): { stop: () => number } => {
+    let n = 0;
+    const t = setInterval(() => n++, 10);
+    return { stop: () => (clearInterval(t), n) };
+  };
+
+  it('a long statement does not block the event loop and stops when the exec signal fires', async () => {
+    const ac = new AbortController();
+    const ticks = ticking();
+    const t0 = Date.now();
+    setTimeout(() => ac.abort(new Error('exec cancelled')), 100);
+    const r = await bounded({ timeoutMs: 60_000 }).call(req('query', RUNAWAY), { ...ctx, signal: ac.signal } as ToolContext, liveWriteGuard());
+    const ms = Date.now() - t0;
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatchObject({ name: 'ResourceToolError', message: expect.stringMatching(/cancelled/) });
+    expect(ms).toBeLessThan(3_000);
+    expect(ticks.stop()).toBeGreaterThan(3);
+    // A guard that lost its fence while the statement ran stops it too, and reports the fence.
+    const g = new FakeWriteGuard();
+    setTimeout(() => g.revoke('lease lost', true), 100);
+    const f = await bounded({ timeoutMs: 60_000 }).call(req('query', RUNAWAY), ctx, g.guard);
+    expect(f.error?.name).toBe('FenceLost');
+    // An already cancelled exec starts nothing.
+    expect((await bounded({}).call(req('query', 'SELECT 1'), { ...ctx, signal: ac.signal } as ToolContext, liveWriteGuard())).error?.message).toMatch(/cancelled/);
+  }, 30_000);
+
+  it('a statement that never ends is killed at the time bound, for query and for run, and the database stays usable', async () => {
+    for (const [method, sql] of [['query', ENDLESS], ['run', `INSERT INTO t (v) ${ENDLESS.replace('SELECT count(*) AS n FROM c', "SELECT 'w' FROM c")}`]] as const) {
+      const ticks = ticking();
+      const t0 = Date.now();
+      const r = await bounded({ timeoutMs: 400 }).call(req(method, sql), ctx, liveWriteGuard());
+      expect(r.ok, method).toBe(false);
+      expect(r.error, method).toMatchObject({ name: 'ResourceToolError', message: expect.stringMatching(/400 ?ms/) });
+      expect(Date.now() - t0, method).toBeLessThan(5_000);
+      expect(ticks.stop(), method).toBeGreaterThan(5);
+    }
+    // The killed write left nothing behind (rolled back from its journal on the next open).
+    expect((await tool().call(req('query', 'SELECT count(*) AS n FROM t'), ctx, liveWriteGuard())).value).toEqual({ rows: [{ n: 1 }], truncated: false });
+  }, 30_000);
+
+  it('a statement cannot grow the database past the size bound', async () => {
+    const grow = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 64) INSERT INTO t (v) SELECT zeroblob(1048576) FROM c";
+    const r = await bounded({ maxDbBytes: 4 * 1024 * 1024 }).call(req('run', grow), ctx, liveWriteGuard());
+    expect(r.ok).toBe(false);
+    expect(r.error?.message).toMatch(/full/);
+    expect(statSync(db).size).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect((await tool().call(req('query', 'SELECT count(*) AS n FROM t'), ctx, liveWriteGuard())).value).toEqual({ rows: [{ n: 1 }], truncated: false });
+    // Small writes under the bound still work.
+    expect((await bounded({ maxDbBytes: 4 * 1024 * 1024 }).call(req('run', "INSERT INTO t (v) VALUES ('y')"), ctx, liveWriteGuard())).value).toEqual({ changes: 1, lastInsertRowid: 2 });
+  }, 30_000);
+
+  it('a result is cut at the byte bound (truncated), and a single row over it is refused', async () => {
+    const wide = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 900) SELECT x, printf('%.*c', 10000, 'a') AS pad FROM c";
+    const r = await bounded({ maxResultBytes: 256 * 1024 }).call(req('query', wide), ctx, liveWriteGuard());
+    expect(r.ok).toBe(true);
+    const v = r.value as { rows: JsonObject[]; truncated: boolean };
+    expect(v.truncated).toBe(true);
+    expect(v.rows.length).toBeGreaterThan(0);
+    expect(v.rows.length).toBeLessThan(900);
+    expect(v.rows[0]).toEqual({ x: 1, pad: 'a'.repeat(10000) });
+    expect(Buffer.byteLength(JSON.stringify(v.rows))).toBeLessThanOrEqual(256 * 1024 + 2 * v.rows.length + 2);
+    const one = await bounded({ maxResultBytes: 1024 }).call(req('query', "SELECT printf('%.*c', 10000, 'a') AS pad"), ctx, liveWriteGuard());
+    expect(one.error).toMatchObject({ name: 'ResourceToolError', message: expect.stringMatching(/larger than 1024 bytes/) });
+    // Blobs, the row cap and engine errors keep their shapes across the process boundary.
+    const shapes = await tool().call(req('query', "SELECT x'0102' AS b, NULL AS n, 1.5 AS f"), ctx, liveWriteGuard());
+    expect(shapes.value).toEqual({ rows: [{ b: { blob: 'AQI=' }, n: null, f: 1.5 }], truncated: false });
+    const many = await tool().call(req('query', 'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1500) SELECT x FROM c'), ctx, liveWriteGuard());
+    expect((many.value as { rows: JsonObject[]; truncated: boolean }).rows).toHaveLength(1000);
+    expect((many.value as { truncated: boolean }).truncated).toBe(true);
+    const bad = await tool().call(req('query', 'SELECT * FROM missing'), ctx, liveWriteGuard());
+    expect(bad.error).toMatchObject({ name: 'Error', message: expect.stringMatching(/no such table: missing/) });
+  }, 30_000);
 
   it('a resource that is not recordable (relative locator, credential in the locator, wrong kind) gets no tool', () => {
     expect(() => createSqliteResourceTool(resource({ locator: 'file:///tmp/x.db?password=hunter2' }))).toThrow(ResourceToolError);

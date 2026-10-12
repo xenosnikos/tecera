@@ -103,7 +103,9 @@ function resourceNote(r: ProvisionedResource, tool: boolean): string {
     case 'tmpdir':
       return `a directory Tecera created for this work; the criteria get its path in process.env.${env}.${reach}`;
     case 'http-stub':
-      return `a local HTTP stub Tecera started; the criteria get its URL in process.env.${env}.${reach}`;
+      // The criteria run without network (their own network namespace): the stub's loopback URL is out of
+      // their reach, so it is not handed to them and a criterion that requires it counts as mocked.
+      return `a local HTTP stub Tecera started on this host's loopback.${reach} The criteria run without network and cannot reach it (they get no URL): the code under test takes its HTTP client or base URL through its own seam so the criteria can inject a fake, and a criterion that requires this capability proves it only as mocked (the goal is then provisional, never achieved).`;
     case 'git-remote':
       return 'a bare git repository the PR delivery pushes the work branch to; a step never pushes to it itself.';
     default:

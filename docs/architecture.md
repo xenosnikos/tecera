@@ -30,9 +30,10 @@ a change, the commit and pull-request steps completed. The `goal.achieved` event
 `{command, exitCode: 0, fingerprint, evidenceKey, verifiedAt}` and, under an acceptance contract, one
 proof per criterion with its fidelity. One pure function (`provenAchievement`) decides whether a ledger
 proves a goal; the Stop hook, the run's exit status and replay all call it, so a forged `goal.achieved`
-event with no verification evidence behind it proves nothing. The Stop hook also reads other run events
-to decide whether a run is still active, and that part does not yet hold against every forged event (see
-the README's known limitations).
+event with no verification evidence behind it proves nothing. The Stop hook also holds a run while the
+approvals table has an open request for it, and counts a pull request as delivered only with a consumed
+human approval and the gate's own evidence. A run with no open approval is still judged active from run
+events alone, which a process able to write the ledger can forge (see the README's known limitations).
 
 ## Acceptance and capabilities
 

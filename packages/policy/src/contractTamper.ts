@@ -10,10 +10,19 @@ import { matchesAny, matchesGlob, normalizePath } from './glob.js';
 /** Where contracts live by default (goal files with criteria, run state). */
 export const DEFAULT_CONTRACT_GLOBS: readonly string[] = ['.tecera/**'];
 
+/**
+ * The scripts of the package.json files a criterion may run through, as they are on the BASE of the work
+ * branch (never the worker's tree): directory ('' for the repository root, `tools` for tools/package.json)
+ * → script name → body. With them a criterion `npm run check` also protects what the script body runs.
+ */
+export type PackageScripts = Readonly<Record<string, Readonly<Record<string, string>>>>;
+
 export interface ContractGuard {
   contract?: AcceptanceContract | null;
   /** Globs of files that hold the contract (default DEFAULT_CONTRACT_GLOBS). */
   contractPaths?: readonly string[];
+  /** Base package.json scripts (criterionScriptDirs names the directories); absent → script bodies are not followed. */
+  packageScripts?: PackageScripts;
 }
 
 /** What criterion commands depend on: repository paths they name and package scripts they run. */
@@ -27,9 +36,24 @@ const RUNNER_VERBS = new Set(['run', 'run-script', 'exec', 'dlx', 'x']);
 const NPM_LIFECYCLE: Record<string, string> = { test: 'test', t: 'test', tst: 'test', start: 'start', stop: 'stop', restart: 'restart' };
 /** Runner options whose value is the next word (`npm --workspace api run x`, `pnpm --filter api x`). */
 const RUNNER_VALUE_FLAGS = new Set(['--workspace', '-w', '--prefix', '--filter', '-F', '-C', '--cwd', '--dir', '--scope']);
-/** Commands that run the rest of their words as a command (`env CI=1 npm test`, `time make`). */
-const WRAPPERS = new Set(['env', 'time', 'nice', 'nohup', 'exec', 'command']);
+/** Commands that run the rest of their words as a command (`env CI=1 npm test`, `time make`, `timeout 30 sh x`). */
+const WRAPPERS = new Set(['env', 'time', 'nice', 'nohup', 'exec', 'command', 'timeout', 'stdbuf', 'setsid', 'sudo']);
+/** Wrapper options whose value is the next word (`timeout -k 5 30 x`, `nice -n 5 x`, `env -u V x`, `sudo -u u x`). */
+const WRAPPER_VALUE_FLAGS = new Set(['-k', '--kill-after', '-s', '--signal', '-n', '--adjustment', '-u', '--unset', '-C', '--chdir', '-g', '-S']);
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh']);
+/** Programs whose first plain argument is the script they run, with or without an extension (`node check`, `bash run-checks`). */
+const INTERPRETERS = new Set([...SHELLS, 'node', 'nodejs', 'deno', 'tsx', 'ts-node', 'python', 'python2', 'python3', 'ruby', 'perl', 'php']);
+/** Interpreter options whose value is the next word (never the script). */
+const INTERPRETER_VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-C', '--env-file', '--input-type', '--test-reporter', '--test-reporter-destination', '--test-name-pattern', '-W', '-X', '-I', '-o', '-O']);
+/** Options after which no script file follows: inline code (`node -e`, `python -c`) or a module name (`python -m`). */
+const inlineFlag = (cmd: string, flag: string): boolean => {
+  if (SHELLS.has(cmd)) return flag === '-c';
+  if (cmd.startsWith('python')) return flag === '-c' || flag === '-m';
+  return flag === '-e' || flag === '--eval' || flag === '-p' || flag === '--print';
+};
+/** Interpreter subcommands that precede the script (`deno run x`, `deno test`). */
+const INTERPRETER_VERBS = new Set(['run', 'test', 'eval']);
+const CD_COMMANDS = new Set(['cd', 'pushd']);
 const SEPARATORS = ['&&', '||', ';', '|', '&', '\n', '(', ')'];
 
 /**
@@ -79,35 +103,85 @@ function shellCommands(line: string): string[][] {
   return out;
 }
 
-/** Collect what one simple command runs into `paths` / `scripts`; `depth` bounds `sh -c` nesting. */
-function collectTargets(input: readonly string[], paths: Set<string>, scripts: Set<string>, depth: number): void {
+/** Repository-relative `rel` under directory `cwd` ('' = root); null when it leaves the repository or is not a repository path. */
+function under(cwd: string, rel: string): string | null {
+  // Absolute paths and URLs are outside the work tree a worker can write (protectedPaths refuses them).
+  if (rel.includes('://') || rel.startsWith('/') || rel.startsWith('$') || rel.startsWith('~')) return null;
+  const parts: string[] = [];
+  for (const seg of normalizePath(cwd ? `${cwd}/${rel}` : rel).split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (!parts.length) return null;
+      parts.pop();
+    } else parts.push(seg);
+  }
+  return parts.join('/');
+}
+
+interface Collector {
+  paths: Set<string>;
+  scripts: Set<string>;
+  /** Directories whose package.json a criterion runs a script of ('' = root). */
+  dirs: Set<string>;
+  packageScripts?: PackageScripts;
+}
+
+/**
+ * Collect what one simple command runs. `cwd` is the directory earlier `cd` / `pushd` commands of the same
+ * line moved to ('' = root); returns the directory the next command runs in. A path is recorded both under
+ * `cwd` and from the root (a `cd` inside a subshell does not carry over; protecting both is the safe side).
+ * `depth` bounds `sh -c` nesting and package scripts that run package scripts.
+ */
+function collectTargets(input: readonly string[], acc: Collector, depth: number, cwd: string): string {
   let words = input.filter((w) => w.length > 0);
+  const addPath = (v: string): void => {
+    for (const base of cwd ? [cwd, ''] : ['']) {
+      const p = under(base, v);
+      if (p) acc.paths.add(p);
+    }
+  };
   // Strip environment assignments and wrapper commands, and descend into `sh -c '<command>'`.
   for (;;) {
     while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!)) words = words.slice(1);
     const head = words[0];
     if (head && WRAPPERS.has(head)) {
       words = words.slice(1);
-      while (words.length && words[0]!.startsWith('-')) words = words.slice(1);
+      while (words.length && words[0]!.startsWith('-')) words = words.slice(WRAPPER_VALUE_FLAGS.has(words[0]!) ? 2 : 1);
+      // `timeout 30 <command>`: the duration is not the command.
+      if (head === 'timeout' && words.length && /^\d/.test(words[0]!)) words = words.slice(1);
       continue;
     }
     if (head && SHELLS.has(head)) {
       const c = words.findIndex((w, i) => i > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(w));
       if (c > 0 && words[c + 1] !== undefined) {
-        if (depth < 4) for (const cmd of shellCommands(words[c + 1]!)) collectTargets(cmd, paths, scripts, depth + 1);
-        return;
+        if (depth < 4) {
+          let inner = cwd;
+          for (const cmd of shellCommands(words[c + 1]!)) inner = collectTargets(cmd, acc, depth + 1, inner);
+        }
+        return cwd;
       }
     }
     break;
   }
   const [cmd, ...rest] = words;
-  if (!cmd) return;
+  if (!cmd) return cwd;
+  if (CD_COMMANDS.has(cmd)) {
+    const to = rest.find((w) => !w.startsWith('-'));
+    // An unresolvable target (`cd "$DIR"`, `cd -`, outside the repository) leaves the directory as it was.
+    return (to !== undefined && to !== '-' ? under(cwd, to) : null) ?? cwd;
+  }
   if (RUNNERS.has(cmd)) {
     const args: string[] = [];
+    let dir = cwd;
     for (let i = 0; i < rest.length; i++) {
       const w = rest[i]!;
       if (w === '--') break;
       if (w.startsWith('-')) {
+        const eq = w.indexOf('=');
+        const name = eq === -1 ? w : w.slice(0, eq);
+        const value = eq === -1 ? rest[i + 1] : w.slice(eq + 1);
+        // `npm --prefix tools run check`, `yarn --cwd tools check`: the script is tools/package.json's.
+        if ((name === '--prefix' || name === '-C' || name === '--cwd' || name === '--dir') && value !== undefined) dir = under(cwd, value) ?? dir;
         if (RUNNER_VALUE_FLAGS.has(w)) i++;
         continue;
       }
@@ -117,39 +191,102 @@ function collectTargets(input: readonly string[], paths: Set<string>, scripts: S
     if (cmd === 'yarn' && args[0] === 'workspace') args.splice(0, 2);
     else if (cmd === 'yarn' && args[0] === 'workspaces' && args[1] === 'foreach') args.splice(0, 2);
     const first = args[0];
-    if (first && RUNNER_VERBS.has(first) && args[1]) scripts.add(args[1]);
-    else if (first && cmd === 'npm' && NPM_LIFECYCLE[first]) scripts.add(NPM_LIFECYCLE[first]!);
-    else if (first && cmd !== 'npm') scripts.add(first);
-  }
-  if (cmd === 'make') paths.add('Makefile');
-  for (const w of words) {
-    const v = w.includes('=') && w.startsWith('-') ? w.slice(w.indexOf('=') + 1) : w;
-    // Absolute paths and URLs are outside the work tree a worker can write (protectedPaths refuses them).
-    if (v.startsWith('-') || v.includes('://') || v.startsWith('/') || v.startsWith('$')) continue;
-    if (v.includes('/') || /\.[A-Za-z0-9]{1,8}$/.test(v)) {
-      const p = normalizePath(v.replace(/^\.\//, '')).replace(/\/+$/, '');
-      if (p && p !== '.' && !p.startsWith('..')) paths.add(p);
+    let script: string | undefined;
+    if (first && RUNNER_VERBS.has(first) && args[1]) script = args[1];
+    else if (first && cmd === 'npm' && NPM_LIFECYCLE[first]) script = NPM_LIFECYCLE[first]!;
+    else if (first && cmd !== 'npm') script = first;
+    if (script !== undefined) {
+      acc.scripts.add(script);
+      // The script's body is what the criterion really runs: follow it (and its pre/post scripts) in the
+      // package's directory, on the base package.json the caller read.
+      for (const d of new Set([dir, ''])) {
+        acc.dirs.add(d);
+        for (const name of [script, `pre${script}`, `post${script}`]) {
+          const body = acc.packageScripts?.[d]?.[name];
+          if (typeof body !== 'string' || depth >= 4) continue;
+          let inner = d;
+          for (const c of shellCommands(body)) inner = collectTargets(c, acc, depth + 1, inner);
+        }
+      }
     }
   }
+  if (cmd === 'make') addPath('Makefile');
+  if (INTERPRETERS.has(cmd)) {
+    // The first plain argument is the script, extension or not (`bash run-checks`, `node check`).
+    for (let i = 0; i < rest.length; i++) {
+      const w = rest[i]!;
+      if (w === '--') {
+        if (rest[i + 1] !== undefined) addPath(rest[i + 1]!);
+        break;
+      }
+      if (inlineFlag(cmd, w)) break;
+      if (w.startsWith('-')) {
+        if (INTERPRETER_VALUE_FLAGS.has(w)) i++;
+        continue;
+      }
+      if (i === 0 && INTERPRETER_VERBS.has(w) && !SHELLS.has(cmd)) continue;
+      addPath(w);
+      break;
+    }
+  }
+  for (const w of words) {
+    const v = w.includes('=') && w.startsWith('-') ? w.slice(w.indexOf('=') + 1) : w;
+    if (v.startsWith('-')) continue;
+    if (v.includes('/') || /\.[A-Za-z0-9]{1,8}$/.test(v)) addPath(v.replace(/\/+$/, ''));
+  }
+  return cwd;
+}
+
+function collect(contract: AcceptanceContract | null | undefined, packageScripts?: PackageScripts): Collector {
+  const acc: Collector = { paths: new Set(), scripts: new Set(), dirs: new Set(), ...(packageScripts ? { packageScripts } : {}) };
+  for (const k of contract?.criteria ?? []) {
+    if (k.check?.kind !== 'command' || typeof k.check.command !== 'string') continue;
+    let cwd = '';
+    for (const words of shellCommands(k.check.command)) cwd = collectTargets(words, acc, 0, cwd);
+  }
+  return acc;
 }
 
 /**
  * Paths and package scripts the contract's command criteria run: the program of each check (script files,
- * package scripts, Makefile), not the code it checks. Over-approximates; never executes anything.
+ * package scripts, Makefile), not the code it checks. Follows `cd` / `pushd`, wrapper commands, `sh -c`
+ * strings, an interpreter's script argument (with or without an extension) and, when `opts.packageScripts`
+ * holds the base package.json scripts, the body of every package script a criterion runs. Errs toward
+ * protecting more (a path is recorded under the current directory and from the root); never executes
+ * anything. A bare runner (`node --test`, `pytest`) names no program of its own: its tests are covered by the
+ * test rules, not here.
  */
-export function criterionTargets(contract: AcceptanceContract | null | undefined): CriterionTargets {
-  const paths = new Set<string>();
-  const scripts = new Set<string>();
-  for (const k of contract?.criteria ?? []) {
-    if (k.check?.kind !== 'command' || typeof k.check.command !== 'string') continue;
-    for (const words of shellCommands(k.check.command)) collectTargets(words, paths, scripts, 0);
+export function criterionTargets(contract: AcceptanceContract | null | undefined, opts: { packageScripts?: PackageScripts } = {}): CriterionTargets {
+  const acc = collect(contract, opts.packageScripts);
+  for (const s of [...acc.scripts]) acc.scripts.add(`pre${s}`).add(`post${s}`);
+  return { paths: [...acc.paths], scripts: [...acc.scripts] };
+}
+
+/**
+ * The directories ('' = root) whose package.json holds a script some criterion runs. The caller reads those
+ * files from the base of the work branch and passes their scripts back as `packageScripts`. Scripts that run
+ * scripts of another directory are found by calling this again with what was read (it is monotonic).
+ */
+export function criterionScriptDirs(contract: AcceptanceContract | null | undefined, packageScripts?: PackageScripts): string[] {
+  return [...collect(contract, packageScripts).dirs];
+}
+
+/**
+ * Parse package.json text into its scripts (name → body). Anything that is not an object of strings yields
+ * no scripts: an unreadable manifest protects nothing more, and the script-key rules still apply.
+ */
+export function packageScriptsOf(text: string): Record<string, string> {
+  try {
+    const scripts = (JSON.parse(text) as { scripts?: unknown } | null)?.scripts;
+    if (!scripts || typeof scripts !== 'object' || Array.isArray(scripts)) return {};
+    return Object.fromEntries(Object.entries(scripts as Record<string, unknown>).filter((e): e is [string, string] => typeof e[1] === 'string'));
+  } catch {
+    return {};
   }
-  for (const s of [...scripts]) scripts.add(`pre${s}`).add(`post${s}`);
-  return { paths: [...paths], scripts: [...scripts] };
 }
 
 /** Whether a change to `path` is contract tampering: the contract's own file, or a file a criterion runs. */
-export function contractTouch(path: string, guard: ContractGuard, targets: CriterionTargets = criterionTargets(guard.contract)): { code: 'contract-edit' | 'criterion-edit'; detail: string } | null {
+export function contractTouch(path: string, guard: ContractGuard, targets: CriterionTargets = criterionTargets(guard.contract, guard.packageScripts ? { packageScripts: guard.packageScripts } : {})): { code: 'contract-edit' | 'criterion-edit'; detail: string } | null {
   const p = normalizePath(path).replace(/^\.\//, '');
   const held = matchesAny(p, guard.contractPaths ?? DEFAULT_CONTRACT_GLOBS);
   if (held) return { code: 'contract-edit', detail: `${p} holds the acceptance contract (${held})` };

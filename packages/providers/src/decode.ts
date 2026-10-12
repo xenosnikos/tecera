@@ -8,7 +8,7 @@ import type { Json } from '@tecera/contracts';
  * string and its decoded views:
  *
  * - escape layers: escape sequences decoded (JSON / JS `\uXXXX`, `\u{…}`, `\xHH`, short escapes, `&#…;`
- *   entities) and percent-encoded runs decoded. Every escape decoding strictly shortens the string, so a
+ *   entities) and percent-encoded runs of any length decoded (a single `%HH` included). Every escape decoding strictly shortens the string, so a
  *   chain of them is cheap; up to MAX_ESCAPE_LAYERS nested escape layers are followed.
  * - token layers: every base64 / base64url token (at all four alignments) and every hex token whose bytes
  *   decode to printable UTF-8 text. Up to MAX_DECODE_LAYERS nested token layers are followed, and at most
@@ -66,13 +66,36 @@ export function unescapeAll(s: string): string {
     if (dec) return cp(parseInt(dec, 10));
     return _m;
   });
-  return once.replace(PCT_RUN, (run) => {
-    const bytes = Buffer.from(run.replace(/%/g, ''), 'hex');
-    return textOf(bytes) ?? run;
-  });
+  return once.replace(PCT_RUN, (run) => percentText(Buffer.from(run.replace(/%/g, ''), 'hex')));
 }
 
-const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/**
+ * The text of a percent-encoded run of any length: one byte is enough (a secret with a single character
+ * encoded must still be found). Each well-formed UTF-8 sequence becomes its character; a byte that is not
+ * part of one stays `%HH`. The 6-byte floor of textOf is for base64 / hex tokens only, where a short match
+ * is usually an ordinary word.
+ */
+function percentText(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; ) {
+    const b = bytes[i]!;
+    const n = b < 0x80 ? 1 : b >= 0xc2 && b < 0xe0 ? 2 : b >= 0xe0 && b < 0xf0 ? 3 : b >= 0xf0 && b < 0xf5 ? 4 : 0;
+    if (n > 0 && i + n <= bytes.length) {
+      try {
+        out += STRICT_UTF8.decode(bytes.subarray(i, i + n));
+        i += n;
+        continue;
+      } catch {
+        /* not a sequence: the byte stays encoded */
+      }
+    }
+    out += `%${b.toString(16).padStart(2, '0').toUpperCase()}`;
+    i++;
+  }
+  return out;
+}
 
 /** Bytes as text when they are valid UTF-8 and mostly printable; otherwise null. */
 function textOf(bytes: Uint8Array): string | null {

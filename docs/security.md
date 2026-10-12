@@ -254,8 +254,9 @@ runner, and `tecera run` end to end) with scripted models in place of providers.
 `packages/adversarial/src/index.ts` maps each id to its file and status. The "Lives" column names the
 layer the case targets, not a directory. Approval cases use the local human principal of section 4.
 
-The suite covers these named cases; it is not exhaustive. In particular it has no case yet for a forged
-`run.ended` or a forged `pr.requested` event against the Stop hook.
+The suite covers these named cases; it is not exhaustive. It includes forged `run.ended` and forged
+`pr.requested` events against the Stop hook for a run held at its pull request; a forged `run.ended` on a
+run with no open approval is a known gap.
 
 | Test | Attack | Expected | Lives |
 |---|---|---|---|
@@ -309,7 +310,7 @@ The shared redactor (`contracts/src/redact.ts`) runs on strings crossing to a pr
 sink, review packet or reflex state: exact secret values and their common encodings (JSON-escaped, base64
 and base64url, hex, percent-encoded), the key-pattern regexes, and `TECERA_CANARY_*`; replacement
 `[REDACTED:<kind>:<sha8>]`. Redaction is pattern matching: it is not a guarantee against every possible
-re-encoding of a secret (a value that is only partly percent-encoded is a known gap).
+re-encoding of a secret.
 
 Canary tests: plant `TECERA_CANARY_<rand>` in supervisor env, a repo file, a tool result and `__history__`;
 run the full first job with fake providers; byte-scan captured prompts, child stdin/env, verify env, review

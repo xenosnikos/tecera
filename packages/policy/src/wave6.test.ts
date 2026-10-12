@@ -23,10 +23,10 @@ import {
 import { MemoryLedger } from '@tecera/ledger';
 import { DEFAULT_PERMISSIONS, PermissionsError, classify, parsePermissions, permissionsProblems } from './permissions.js';
 import { validatePlan } from './validatePlan.js';
-import { activeRunsOf, evaluateStopEvents, evaluateStopLedger, stopDecision, stopDecisionForRuns } from './stop.js';
+import { activeRunsOf, evaluateStopEvents, evaluateStopLedger, heldByOpenApprovals, stopDecision, stopDecisionForRuns } from './stop.js';
 import { allowanceOf, mockDeclarationProblem, provisionRequestProblem, provisionedResourceProblem } from './provisioning.js';
 import { DEFAULT_CONFIG_GLOBS, DEFAULT_TEST_GLOBS, tamperFindings } from './tamper.js';
-import { criterionScriptProblem, criterionTargets, packageScriptWriteProblem } from './contractTamper.js';
+import { criterionScriptDirs, criterionScriptProblem, criterionTargets, packageScriptWriteProblem, packageScriptsOf } from './contractTamper.js';
 import { parseHunks } from './snapshot.js';
 import { mandatoryHooks } from './hooks/mandatory.js';
 
@@ -264,6 +264,48 @@ describe('review repairs: script tampering, shell forms, contract binding, PR ap
     expect(one(`node "scripts/a b.js"`).paths).toContain('scripts/a b.js');
   });
 
+  it('criterionTargets protects what a check really runs: package script bodies, files behind cd, extensionless scripts, wrapped commands', () => {
+    // (a) the body of the package script, read from the base package.json
+    const scripts = { '': { 'check:rate': 'node scripts/rate.js --strict', 'precheck:rate': 'bash tools/seed', lint: 'eslint .', all: 'npm run check:rate && cd e2e && node run.mjs' }, api: { smoke: 'node smoke.mjs' } };
+    const withScripts = (command: string) => criterionTargets(contract({ criteria: [{ id: 'a', statement: 'a', check: { kind: 'command', command, timeoutSec: 5 } }] }), { packageScripts: scripts });
+    expect(one('npm run check:rate').paths).toEqual([]);
+    expect(withScripts('npm run check:rate').paths).toEqual(expect.arrayContaining(['scripts/rate.js', 'tools/seed']));
+    expect(withScripts('npm run check:rate').paths).not.toContain('eslint');
+    // a script that runs a script, and a cd inside a script body
+    expect(withScripts('yarn all').paths).toEqual(expect.arrayContaining(['scripts/rate.js', 'e2e/run.mjs']));
+    // a script of another package: its body runs in that package's directory
+    for (const cmd of ['cd api && npm run smoke', 'npm --prefix api run smoke', 'npm --prefix=api run smoke', 'yarn --cwd api smoke', 'pnpm -C api run smoke']) expect(withScripts(cmd).paths, cmd).toContain('api/smoke.mjs');
+    expect(criterionScriptDirs(contract({ criteria: [{ id: 'a', statement: 'a', check: { kind: 'command', command: 'cd api && npm run smoke', timeoutSec: 5 } }] })).sort()).toEqual(['', 'api']);
+    expect(criterionScriptDirs(contract({ criteria: [{ id: 'a', statement: 'a', check: { kind: 'command', command: 'node --test', timeoutSec: 5 } }] }))).toEqual([]);
+    expect(packageScriptsOf('{"scripts":{"a":"node a.js","b":1}}')).toEqual({ a: 'node a.js' });
+    expect(packageScriptsOf('not json')).toEqual({});
+    // (b) cd / pushd move the directory the next command runs in
+    expect(one('cd tools && node verify.mjs').paths).toContain('tools/verify.mjs');
+    expect(one('pushd tools/sub; node ../verify.mjs').paths).toContain('tools/verify.mjs');
+    expect(one('cd tools && cd .. && node verify.mjs').paths).toContain('verify.mjs');
+    expect(one(`sh -c 'cd tools && node verify.mjs'`).paths).toContain('tools/verify.mjs');
+    expect(one('cd ../.. && node verify.mjs').paths).toEqual(['verify.mjs']);
+    // (c) the script an interpreter or shell runs, with or without an extension, behind any wrapper
+    for (const cmd of ['bash run-checks', 'sh -e run-checks', 'node run-checks', 'node --require ./setup.cjs run-checks', 'python3 run-checks', 'timeout 30 bash run-checks', 'env CI=1 timeout -k 5 30 bash run-checks', 'nice -n 5 bash run-checks', 'bash -- run-checks']) {
+      expect(one(cmd).paths, cmd).toContain('run-checks');
+    }
+    expect(one('cd tools && bash run-checks').paths).toContain('tools/run-checks');
+    // inline code, modules and bare runners name no file
+    for (const cmd of ['node -e "process.exit(0)"', 'python3 -m pytest', 'python3 -c "print(1)"', 'node --test', 'deno test']) expect(one(cmd).paths, cmd).toEqual([]);
+    // end to end through the gate's and the hook's entry points
+    const c2 = contract({ criteria: [{ id: 'rate', statement: 'rate limited', check: { kind: 'command', command: 'npm run check:rate', timeoutSec: 60 } }, { id: 'v', statement: 'v', check: { kind: 'command', command: 'cd tools && node verify.mjs', timeoutSec: 60 } }, { id: 'r', statement: 'r', check: { kind: 'command', command: 'bash run-checks', timeoutSec: 60 } }] });
+    const changes = [{ path: 'scripts/rate.js', status: 'M' as const }, { path: 'tools/verify.mjs', status: 'M' as const }, { path: 'run-checks', status: 'M' as const }, { path: 'src/a.ts', status: 'M' as const }];
+    const found = tamperFindings(changes, [{ path: 'scripts/rate.js', added: ['process.exit(0)'] }], { ...tOpts, contract: c2, packageScripts: scripts });
+    expect(found.filter((f) => f.code === 'criterion-edit').map((f) => f.path).sort()).toEqual(['run-checks', 'scripts/rate.js', 'tools/verify.mjs']);
+    // without the base scripts the script body stays unknown (the script key is still protected)
+    expect(tamperFindings(changes, [], { ...tOpts, contract: c2 }).filter((f) => f.code === 'criterion-edit').map((f) => f.path).sort()).toEqual(['run-checks', 'tools/verify.mjs']);
+    const view = { capabilities: { tools: ['edit'], paths: { read: ['**'], write: ['**'], protected: [] }, network: 'none' as const, limits: { usd: 1, tokens: 1, calls: 1, wallMs: 1, depth: 1, iterations: 1 } }, blackboard: {}, hooks: [] };
+    const enter = (input: Record<string, unknown>): SpanEvent => ({ span: 'ToolCall', stage: 'Enter', spanId: 's', run: { runId: 'r', invokeId: 'i', depth: 0 }, attempt: 1, input: input as SpanEvent['input'] });
+    const hook = mandatoryHooks(manifest(), { permissions: DEFAULT_PERMISSIONS, contract: () => c2, packageScripts: () => scripts }).find((h) => h.id === 'tamperCheck')!;
+    for (const path of ['scripts/rate.js', 'tools/verify.mjs', 'run-checks']) expect(hook.handle(enter({ tool: 'edit', method: 'write', path }), view), path).toMatchObject([{ type: 'Abort', code: 'policy', reason: expect.stringMatching(/is run by a criterion's check command/) }]);
+    expect(hook.handle(enter({ tool: 'edit', method: 'write', path: 'src/a.ts' }), view)).toEqual([]);
+  });
+
   it('criterionScriptProblem and tamperFindings see a removed script and a deleted or renamed package.json', () => {
     const t = criterionTargets(c);
     expect(criterionScriptProblem('package.json', [], t, ['    "check:rate": "node scripts/rate.js",'])).toMatch(/script check:rate is run by a criterion's check command \(removed\)/);
@@ -488,5 +530,67 @@ describe('Stop decision through the single-source proof (sprint 5 item 1)', () =
     await expect(evaluateStopLedger({ events: empty.events.bind(empty), getEvidence: empty.getEvidence.bind(empty) } as never)).resolves.toMatchObject({ decision: { decision: 'block', reason: expect.stringMatching(/does not support chain verification/) } });
     const throwing = { events: empty.events.bind(empty), getEvidence: empty.getEvidence.bind(empty), verifyChain: async () => Promise.reject(new Error('io')) };
     await expect(evaluateStopLedger(throwing as never)).resolves.toMatchObject({ decision: { decision: 'block', reason: expect.stringMatching(/cannot be verified: io/) } });
+  });
+
+  it('an appended run.ended (chain intact) never hides a run whose approval is still open in the approvals table', async () => {
+    const T = 1_000;
+    const held = async (): Promise<MemoryLedger> => {
+      const l = new MemoryLedger();
+      const open = runEvents('r1', { outcome: 'open', exit: 4 });
+      const trace = { goalId: 'g_r1', intentionId: 'i_r1', stepId: 'pr' };
+      await l.requestApproval({ requestId: 'ap1', runId: 'r1', sessionId: 's', actionHash: 'h', requester: sys, reason: 'gate.pr', expiresAt: T + 60_000 });
+      for (const e of open.events.slice(0, -1)) await l.append(e);
+      await l.append(event('approval.requested', { id: 'req1', at: 9, actor: sys, runId: 'r1', trace, payload: { requestId: 'ap1', actionHash: 'h', sessionId: 's' } }));
+      await l.append(open.events.at(-1)!);
+      return l;
+    };
+    const forge = (l: MemoryLedger, exitCode: number) => l.append(event('run.ended', { id: `forged-${exitCode}`, at: 20, actor: { kind: 'agent', id: 'worker' }, runId: 'r1', trace: {}, payload: { exitCode, reason: 'forged' } }));
+    const all = async (l: MemoryLedger): Promise<TeceraEvent[]> => {
+      const out: TeceraEvent[] = [];
+      for await (const e of l.events()) out.push(e);
+      return out;
+    };
+    for (const exitCode of [0, 1, 5, 7]) {
+      const l = await held();
+      expect((await evaluateStopLedger(l, { now: T })).decision.decision).toBe('block');
+      await forge(l, exitCode);
+      expect(await l.verifyChain()).toMatchObject({ ok: true });
+      // the events alone say nothing is active
+      expect(activeRunsOf(await all(l))).toEqual([]);
+      const s = await evaluateStopLedger(l, { now: T });
+      expect(s.decision, `exit ${exitCode}`).toMatchObject({ decision: 'block', exitCode: 2 });
+      expect(s.decision.reason).toMatch(/approval ap1 is still open in the approvals table/);
+      expect(s.runs.map((r) => r.run)).toEqual([{ runId: 'r1', goalId: 'g_r1', state: 'held', openApprovals: ['ap1'] }]);
+      // the pure variant decides the same once it is handed the row, and is blind without it (documented)
+      const row = (await l.getApproval('ap1'))!;
+      expect(evaluateStopEvents(await all(l), [], { ...INTACT, approvals: [row], now: T }).decision.decision).toBe('block');
+      expect(heldByOpenApprovals(await all(l), [], [row], T).map((r) => r.runId)).toEqual(['r1']);
+    }
+    // a granted, unconsumed approval holds the run too
+    const granted = await held();
+    await granted.approve('ap1', { kind: 'human', id: 'ana' }, 's', T);
+    await forge(granted, 1);
+    expect((await evaluateStopLedger(granted, { now: T })).decision.decision).toBe('block');
+    // what really closes a hold: the human denies it, or it expires; a row of another run holds nothing
+    const denied = await held();
+    await denied.deny('ap1', { kind: 'human', id: 'ana' }, 'no', T);
+    await forge(denied, 1);
+    expect((await evaluateStopLedger(denied, { now: T })).decision).toMatchObject({ decision: 'allow', reason: 'no active Tecera run on this business case' });
+    const expired = await held();
+    await forge(expired, 1);
+    expect((await evaluateStopLedger(expired, { now: T + 60_000 })).decision.decision).toBe('allow');
+    const foreign = await held();
+    await foreign.requestApproval({ requestId: 'ap2', runId: 'r9', sessionId: 's', actionHash: 'h', requester: sys, reason: 'x', expiresAt: T + 60_000 });
+    await foreign.deny('ap1', { kind: 'human', id: 'ana' }, 'no', T);
+    await foreign.append(event('approval.requested', { id: 'req2', at: 21, actor: sys, runId: 'r1', trace: { goalId: 'g_r1', intentionId: 'i_r1', stepId: 'pr' }, payload: { requestId: 'ap2' } }));
+    await forge(foreign, 1);
+    expect((await evaluateStopLedger(foreign, { now: T })).decision.decision).toBe('allow');
+    // an approvals table that cannot be read blocks: the ended run cannot be told from a hidden one
+    const l = await held();
+    await forge(l, 1);
+    const noTable = { events: l.events.bind(l), getEvidence: l.getEvidence.bind(l), verifyChain: l.verifyChain.bind(l) };
+    await expect(evaluateStopLedger(noTable, { now: T })).resolves.toMatchObject({ decision: { decision: 'block', reason: expect.stringMatching(/approvals table cannot be read: the ledger does not support approval lookup/) } });
+    const throwing = { ...noTable, getApproval: async () => Promise.reject(new Error('locked')) };
+    await expect(evaluateStopLedger(throwing as never, { now: T })).resolves.toMatchObject({ decision: { decision: 'block', reason: expect.stringMatching(/approvals table cannot be read: locked/) } });
   });
 });

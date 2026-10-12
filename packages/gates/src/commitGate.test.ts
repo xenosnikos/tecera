@@ -21,8 +21,8 @@ interface Setup {
   fresh(extra?: Partial<CreateGatesOptions>): ReturnType<typeof createGates>;
 }
 
-async function prepared(opts: { ledger?: Ledger; change?: (r: Repo) => void; m?: Manifest; p?: Plan; extra?: Partial<CreateGatesOptions>; expectApprove?: boolean } = {}): Promise<Setup> {
-  const repo = makeRepo();
+async function prepared(opts: { ledger?: Ledger; change?: (r: Repo) => void; m?: Manifest; p?: Plan; extra?: Partial<CreateGatesOptions>; expectApprove?: boolean; files?: Record<string, string> } = {}): Promise<Setup> {
+  const repo = makeRepo(opts.files);
   (opts.change ?? ((r) => r.write('src/a.ts', 'export const a = 2;\n')))(repo);
   const ledger = opts.ledger ?? memLedger();
   const clock = { t: NOW };
@@ -308,6 +308,21 @@ describe('CommitGate classification, tamper and boundary → exit 8', () => {
     noBranch(s.repo);
     const plain = await prepared();
     expect((await plain.gates.commit(plain.commitCtx())).exitCode).toBe(0);
+  });
+
+  it('a criterion that runs a package script protects what the script body runs, read from the base package.json', async () => {
+    const contract = (command: string): AcceptanceContract => ({ goalId: 'g1', statement: 'make a two', criteria: [{ id: 'a-check', statement: 'the a check passes', check: { kind: 'command', command, timeoutSec: 30 } }], outOfScope: [], assumptions: [] });
+    const files = { 'package.json': JSON.stringify({ name: 'w', scripts: { check: 'node src/a.ts', lint: 'node src/lint.ts' } }, null, 2) + '\n', 'tools/package.json': JSON.stringify({ scripts: { verify: 'cd .. && node src/a.ts' } }) + '\n' };
+    for (const command of ['npm run check', 'timeout 20 yarn check', 'cd tools && npm run verify', 'npm --prefix tools run verify']) {
+      const s = await prepared({ files });
+      const r = await s.gates.commit({ ...s.commitCtx(), contract: contract(command) });
+      expect(r, command).toMatchObject({ exitCode: 8, reason: 'tamper', terminal: true });
+      expect(JSON.stringify((await s.ledger.getEvidence(r.evidenceKey))!.body), command).toMatch(/criterion-edit/);
+      noBranch(s.repo);
+    }
+    // a script whose body runs another file leaves the candidate alone
+    const other = await prepared({ files });
+    expect((await other.gates.commit({ ...other.commitCtx(), contract: contract('npm run lint') })).exitCode).toBe(0);
   });
 
   it('a small untracked binary is refused (8) even if a reviewer had approved the tree', async () => {

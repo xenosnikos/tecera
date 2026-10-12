@@ -3,7 +3,8 @@ import { composeEffects, type Composed } from './compose.js';
 
 /**
  * Emits one frozen event to every active hook at once, collects effects, composes them, and applies
- * blackboard CAS writes. A hook that throws or exceeds its time budget becomes an Abort (fail closed).
+ * blackboard CAS writes. A hook that throws or exceeds its time budget becomes an Abort (fail closed) at
+ * every stage, Exit included: the span's Exit then reports the failure instead of losing the hook's records.
  * Hooks never see each other's effects at the same stage; the next stage carries the committed result.
  */
 export class Dispatcher {

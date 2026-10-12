@@ -11,9 +11,9 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
   `authenticated: false`. Separation of duty is the ledger's: the requester (the loop) can never approve, a
   principal never approves its own request, and only a human principal can approve (exit 8). The name is
   asserted, not verified: any local process that can run `tecera` can approve under any name. Workers
-  have no shell and no such tool. For a host assistant, the Claude Code pre-tool hook is meant to refuse
-  `tecera approve` and the other decision commands; that hook is under repair after a review found a way
-  past it, and the Codex adapter installs no hook at all.
+  have no shell and no such tool. For a host assistant, the Claude Code pre-tool hook refuses every
+  `tecera` command except `gate`, `status`, `why` and `validate` with their listed flags; the decision
+  commands themselves carry no second check, and the Codex adapter installs no hook at all.
 - **reflexes on.** Seams are `rule` / `model` / `frontier` (the manifest refuses `off`); the planner seat is
   the frontier, wired into the reflex router and as `LoopPorts.frontier` (metered by its own SeatMeter).
 - **budgets off by default.** `openRunPools` opens usd / tokens / calls / wallMs with `budgets.enforce`
@@ -32,9 +32,10 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
   proven, while a run ended provisional (exit 10) and neither it nor a later run of the same goal is
   proven, when the ledger's chain does not verify, or when the business case's `tecera.json` (or the one
   named with `--manifest`) cannot be found, read or validated; exit 0 otherwise (also outside any business
-  case). It never considers budget. Every decision is recorded (`stop.blocked` / `stop.allowed`). Whether a
-  run counts as active is read from run events, and a review found forged events that make the hook allow
-  a held run; that is being fixed. The hook is installed for Claude Code only.
+  case). It never considers budget. Every decision is recorded (`stop.blocked` / `stop.allowed`). A run with
+  an open approval request stays held whatever its events say, and delivery counts only with a consumed
+  human approval plus the PR gate's evidence. A run with no open approval is judged from run events, which
+  a process that can write the ledger can forge. The hook is installed for Claude Code only.
 - **review plugged in.** `review.foreign` must be true; the reviewer seat runs live on its own key and the
   review gate checks provider AND key fingerprint against every writer. `--allow-same-vendor-review` is gone.
 - **PR-level gating.** Writes inside `repo.allowedChanges` on the leased work branch proceed under any

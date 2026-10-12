@@ -65,6 +65,23 @@ export function matchesAny(path: string, globs: readonly string[]): string | nul
   return null;
 }
 
+/**
+ * matchesAny for a list that PROTECTS paths: a pattern that names a directory the gitignore way (`tests/`,
+ * or a plain name without glob characters such as `tests` or `.github`) also covers everything below it.
+ * Allow lists keep the exact rule (matchesAny): there a wider reading would grant more, here it refuses more.
+ */
+export function matchesProtected(path: string, globs: readonly string[]): string | null {
+  const p = normalizePath(path);
+  for (const g of globs) {
+    if (matchesGlob(p, g)) return g;
+    const dir = normalizePath(g).replace(/\/+$/, '');
+    if (dir === '' || /[*?{}]/.test(dir)) continue;
+    // A name without a slash matches at any depth, like the pattern itself does.
+    if (matchesGlob(p, dir) || matchesGlob(p, `${dir}/**`) || (!dir.includes('/') && matchesGlob(p, `**/${dir}/**`))) return g;
+  }
+  return null;
+}
+
 /** True when `inner` can only match paths that `outer` also matches, for the simple prefix forms we allow. */
 export function globWithin(inner: string, outer: string): boolean {
   if (inner === outer) return true;

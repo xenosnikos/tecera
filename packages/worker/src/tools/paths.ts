@@ -1,8 +1,9 @@
 import { randomBytes } from 'node:crypto';
-import { constants as C, existsSync, fstatSync, linkSync, lstatSync, readlinkSync, realpathSync, renameSync, unlinkSync, type BigIntStats } from 'node:fs';
+import { constants as C, existsSync, fstatSync, linkSync, lstatSync, readlinkSync, renameSync, unlinkSync, type BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readlink, realpath, type FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { requireWriteGuard, sha256, type WriteGuard, type WriteIntent } from '@tecera/contracts';
+import { quarantineWorktree, worktreeQuarantine } from '../sandbox/quarantine.js';
 
 /**
  * Worktree confinement (docs/security.md, tamper.symlink_hardlink).
@@ -104,32 +105,22 @@ function errno(e: unknown): string | undefined {
 
 // ---------------------------------------------------------------- taint registry
 
-const TAINTED = new Map<string, string>();
+/**
+ * The taint registry is the process-wide worktree quarantine (sandbox/quarantine.ts): one source of truth
+ * shared with the REPL and the verify runner. A taint recorded here refuses them; a taint they record (a
+ * REPL or verify run that left work unresolved) refuses every file and verify tool and the broker's fence.
+ */
 
-function keysOf(path: string): string[] {
-  const keys = new Set<string>([resolve(path)]);
-  try {
-    keys.add(realpathSync(path));
-  } catch {
-    /* the worktree may be gone: the lexical key still matches */
-  }
-  return [...keys];
-}
-
-/** Quarantine a worktree: every later file and verify tool on it refuses (this process). */
+/** Quarantine a worktree: every later file tool, verify run and REPL exec on it refuses (this process). */
 export function markWorktreeTainted(worktree: string, reason: string): void {
   if (typeof worktree !== 'string' || !worktree) return;
-  for (const k of keysOf(worktree)) if (!TAINTED.has(k)) TAINTED.set(k, reason);
+  quarantineWorktree(worktree, { source: 'tools', reason, outstanding: [], processes: [] });
 }
 
-/** Why the worktree is quarantined, or null. */
+/** Why the worktree is quarantined (by the tools, the broker, a REPL or a verify run), or null. */
 export function worktreeTaint(worktree: string): string | null {
   if (typeof worktree !== 'string' || !worktree) return null;
-  for (const k of keysOf(worktree)) {
-    const r = TAINTED.get(k);
-    if (r !== undefined) return r;
-  }
-  return null;
+  return worktreeQuarantine(worktree)?.reason ?? null;
 }
 
 function assertNotTainted(worktree: string): void {

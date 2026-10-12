@@ -433,5 +433,27 @@ describe('secret (security.md §6, §7)', () => {
     expect(exposed.length, 'no raw secret in a returned result or an evidence key').toBe(0);
     // the keys still name the identifier, as a digest
     expect(v.evidenceKey).toMatch(/^verify:h_[0-9a-f]{24}:\d+$/);
+
+    // the refused-verify path (an unsafe repository: no slot key was ever built) keys by the digest too
+    const unsafe = gateRig({ extra: { secrets: [SECRET] }, change: (r) => (r.g('config', 'core.hooksPath', '.hooks'), r.write('src/a.ts', 'export const a = 2;\n')) });
+    await unsafe.ready;
+    const uv = await unsafe.gates.verify(unsafe.ctx('v', { intentionId }));
+    expect(uv.exitCode).not.toBe(0);
+    expect(uv.evidenceKey).toMatch(/^verify-refused:h_[0-9a-f]{24}:/);
+    const urecs = await (unsafe.ledger as unknown as typeof ledger).listEvidence('run1');
+    expect(urecs.length).toBeGreaterThan(0);
+    expect([JSON.stringify(uv), ...urecs.map((x) => x.key)].filter((t) => t.includes(SECRET)), 'raw secret on the refused-verify path').toEqual([]);
+
+    // a secret in the RUN id: verify and review refuse (their shared keys are derived from the raw id); no key holds it
+    const runId = `run-${SECRET}`;
+    const byRun = gateRig({ extra: { secrets: [SECRET] }, change: (r) => r.write('src/a.ts', 'export const a = 2;\n') });
+    await byRun.ready;
+    const rv = await byRun.gates.verify(byRun.ctx('v', { runId }));
+    const rr = await byRun.gates.review(byRun.ctx('r', { runId }));
+    expect(rv.exitCode).not.toBe(0);
+    expect(rr.verdict).toBe('reject');
+    const rrecs = await (byRun.ledger as unknown as typeof ledger).listEvidence(runId);
+    expect(rrecs.length, 'both refusals are recorded').toBe(2);
+    expect([JSON.stringify(rv), JSON.stringify(rr), ...rrecs.map((x) => x.key)].filter((t) => t.includes(SECRET)), 'raw secret in a key or result for a secret-bearing run id').toEqual([]);
   }, 120_000);
 });

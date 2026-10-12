@@ -6,7 +6,8 @@ import { event, makeRedactor, parseManifest, type Manifest, type TeceraEvent } f
 import { MemoryLedger, SqliteLedger } from '@tecera/ledger';
 import { DEFAULT_PERMISSIONS } from '@tecera/policy';
 import { buildVerifyEnv, reviewAllowlist, UnsafeEnvError } from './env.js';
-import { decideBash, decidePreTool, type HookContext } from './hook.js';
+import { BOOL_FLAGS, parseArgs, VALUE_FLAGS } from './cli/args.js';
+import { decideBash, decidePreTool, shellWords, teceraProblem, type HookContext } from './hook.js';
 import { RedactingLedger } from './redactingLedger.js';
 import { inspectPath, safeReadFile, safeWriteFile, UnsafePathError, walkTree } from './util/safefs.js';
 import { HostVerifyRunner, toolingProblem } from './verify.js';
@@ -187,6 +188,84 @@ describe('host hook: links, protected aliases and mediated Bash', () => {
       expect(d.allow, p).toBe(false);
     }
     expect(decidePreTool({ tool_name: 'Edit', tool_input: { file_path: 'src/x.js' }, cwd: root }, ctx)).toEqual({ allow: true });
+  });
+
+  it('Bash: no spelling of a tecera command line reaches approve, sign-off, learning or resources (default deny, the CLI\'s own parser)', () => {
+    const ctx = hookCtx(tmp());
+    const forbidden = ['approve ap_1', 'deny ap_1', 'criteria accept r_1', 'criteria amend r_1', 'criteria show r_1', 'plans graduate p_1', 'memory graduate m_1', 'resources release res_1', 'resources transfer res_1', 'run fix-failing-test', 'run --resume r_1', 'evidence r_1', 'doctor', 'init', 'adapters install claude', 'hook stop', 'migrate', 'preflight g'];
+    const reads = ['gate', 'status', 'why', 'validate'];
+    const refused: string[] = [];
+    // every value flag of the CLI in front of a forbidden subcommand, its value spelled as a read subcommand:
+    // the CLI gives the word to the flag and dispatches what follows
+    for (const flag of VALUE_FLAGS) {
+      for (const read of reads) {
+        for (const cmd of forbidden) refused.push(`tecera --${flag} ${read} ${cmd}`, `tecera --${flag}=${read} ${cmd}`, `tecera --${flag} "${read}" ${cmd}`);
+      }
+    }
+    for (const flag of BOOL_FLAGS) for (const cmd of forbidden) refused.push(`tecera --${flag} ${cmd}`);
+    for (const cmd of forbidden) {
+      refused.push(
+        `tecera ${cmd}`,
+        `tecera -q ${cmd}`,
+        `tecera -- ${cmd}`,
+        `tecera status ${cmd}`,
+        `tecera status -- ${cmd}`,
+        `tecera status --run x ${cmd}`,
+        `tecera gate g ${cmd}`,
+        `tecera "${cmd.split(' ')[0]}" ${cmd.split(' ').slice(1).join(' ')}`,
+        `tecera '${cmd.split(' ')[0]}' ${cmd.split(' ').slice(1).join(' ')}`,
+        `tecera status; tecera ${cmd}`,
+        `tecera status && tecera ${cmd}`,
+        `tecera status || tecera ${cmd}`,
+        `tecera status | tecera ${cmd}`,
+        `tecera status & tecera ${cmd}`,
+        `(tecera ${cmd})`,
+        `{ tecera ${cmd}; }`,
+        `echo $(tecera ${cmd})`,
+        `echo \`tecera ${cmd}\``,
+        `tecera status\ntecera ${cmd}`,
+        `FOO=1 tecera ${cmd}`,
+        `env tecera ${cmd}`,
+        `env FOO=1 tecera ${cmd}`,
+        `node node_modules/.bin/tecera ${cmd}`,
+        `node packages/runtime/dist/cli/bin.js ${cmd}`,
+        `./node_modules/.bin/tecera ${cmd}`,
+        `/usr/local/bin/tecera ${cmd}`,
+        `npx tecera ${cmd}`,
+        `yarn tecera ${cmd}`,
+        `sh -c "tecera ${cmd}"`,
+        `bash -c 'tecera ${cmd}'`,
+        `eval tecera ${cmd}`,
+        `exec tecera ${cmd}`,
+        `command tecera ${cmd}`,
+        `xargs tecera ${cmd}`,
+        `find . -maxdepth 0 -exec tecera ${cmd} ;`,
+        `te""cera ${cmd}`,
+        `tecer\\a ${cmd}`,
+        `tecera --run * ${cmd}`,
+        `tecera * `,
+        `tecera status --run *`,
+        `tecera sta?us`,
+        `tecera ~/x`,
+      );
+    }
+    // flags no agent passes, on a read subcommand too
+    refused.push('tecera status --as bob', 'tecera gate g --reason x', 'tecera validate --manifest ../other/tecera.json', 'tecera validate --manifest=x', 'tecera status --export out', 'tecera gate g --fix', 'tecera status --yes', 'tecera status --resume', 'tecera gate g --scripted dir', 'tecera status --file c.json', 'tecera status --session s', 'tecera status --to me', 'tecera status --rationale x', 'tecera status --watch', 'tecera status --force', 'tecera validate --dry-run');
+    // wrong shape: unknown flags, a missing or extra argument, help and version, nothing at all
+    refused.push('tecera', 'tecera --json', 'tecera --version', 'tecera --help', 'tecera gate --help', 'tecera -h', 'tecera gate', 'tecera gate a b', 'tecera why', 'tecera status extra', 'tecera validate x', 'tecera status --nope', 'tecera status -z', 'tecera status --run', 'tecera status --run --json', 'tecera status --json=1', 'tecera --json status', 'tecera -q status', 'tecera --run r_1 status');
+    for (const cmd of refused) {
+      const d = decideBash(cmd, ctx);
+      expect(d.allow, cmd).toBe(false);
+    }
+    for (const cmd of ['tecera gate fix-failing-test', 'tecera gate fix-failing-test --json', 'tecera status', 'tecera status --json', 'tecera status --json --quiet', 'tecera status -q', 'tecera status --run r_1', 'tecera status --run=r_1 --no-color', 'tecera why ev_12', 'tecera why -- ev_12', 'tecera validate', 'tecera validate --strict', 'tecera "status" --json', "tecera gate 'fix-failing-test'"]) {
+      expect(decideBash(cmd, ctx), cmd).toEqual({ allow: true });
+      // what the hook allowed is what the CLI dispatches
+      expect(['gate', 'status', 'why', 'validate']).toContain(parseArgs(shellWords(cmd)!.slice(1)).positionals[0]);
+    }
+    // the hook and the CLI agree on every allowed line; and every refused tecera line that parses dispatches
+    // a subcommand the hook saw (the flag-first spellings are refused outright)
+    expect(teceraProblem(['--reason', 'gate', 'approve', 'ap_1'])).toMatch(/not available to agents/);
+    expect(parseArgs(['--reason', 'gate', 'approve', 'ap_1']).positionals[0]).toBe('approve');
   });
 
   it('Bash: writes, deletes, config edits and approvals through the shell are refused; read-only and verify commands run', () => {

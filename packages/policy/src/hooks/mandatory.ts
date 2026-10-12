@@ -1,7 +1,7 @@
 import { MANDATORY_HOOKS, SECRET_PATTERNS, stringLeaves, type AcceptanceContract, type AttemptFingerprint, type Effect, type Hook, type HookDescriptor, type Json, type Manifest, type SpanEvent } from '@tecera/contracts';
-import { matchesAny, pathProblem } from '../glob.js';
+import { matchesAny, matchesProtected, pathProblem } from '../glob.js';
 import { APPROVAL_ONLY_ACTIONS, MERGE_ACTIONS, PR_GATE_ACTIONS, classify, type PermissionsDoc } from '../permissions.js';
-import { contractTouch, criterionTargets, packageScriptWriteProblem } from '../contractTamper.js';
+import { contractTouch, criterionTargets, packageScriptWriteProblem, type PackageScripts } from '../contractTamper.js';
 import { BudgetPool, IterationLimit, RecursionLimit } from './limits.js';
 import { ProgressCheck } from './progress.js';
 
@@ -32,8 +32,11 @@ function simple(id: string, spans: SpanEvent['span'][], handle: (e: SpanEvent, v
 
 const toolCallInput = (e: SpanEvent) => e.input as { tool?: string; method?: string; args?: Json[]; path?: string };
 
-/** A file write on the work branch (the protectedPaths hook decides where it may land). */
-const isWrite = (tool: string | undefined, method: string | undefined): boolean => tool === 'edit' || method === 'write' || method === 'edit';
+/**
+ * A file write on the work branch through the repository's own write tool (the protectedPaths hook decides
+ * where it may land). Only that tool: a method another tool happens to call `write` or `edit` is not one.
+ */
+const isWrite = (tool: string | undefined): boolean => tool === 'edit';
 
 export interface MandatoryDeps {
   permissions: PermissionsDoc;
@@ -55,6 +58,12 @@ export interface MandatoryDeps {
    */
   contract?: () => AcceptanceContract | null | undefined;
   contractPaths?: readonly string[];
+  /**
+   * The base package.json scripts (contractTamper PackageScripts, read from the base of the work branch,
+   * never from the worker's tree): the tamperCheck hook then also refuses a write to a file that a package
+   * script run by a criterion runs. Absent → only the script's key in package.json is protected.
+   */
+  packageScripts?: (contract: AcceptanceContract) => PackageScripts | undefined;
 }
 
 export function mandatoryHooks(m: Manifest, deps: MandatoryDeps): Hook[] {
@@ -87,7 +96,7 @@ export function mandatoryHooks(m: Manifest, deps: MandatoryDeps): Hook[] {
       const problem = pathProblem(path);
       if (problem) return [{ type: 'Abort', code: 'protected', reason: `${problem}: ${path}` }];
       const writes = method === 'write' || method === 'edit' || method === 'delete' || tool === 'edit';
-      const prot = matchesAny(path, view.capabilities.paths.protected);
+      const prot = matchesProtected(path, view.capabilities.paths.protected);
       if (prot && writes) return [{ type: 'Abort', code: 'protected', reason: `${path} is protected by ${prot}` }];
       if (writes && !matchesAny(path, view.capabilities.paths.write)) return [{ type: 'Abort', code: 'protected', reason: `${path} is outside the write allowlist` }];
       if (!writes && view.capabilities.paths.read.length && !matchesAny(path, view.capabilities.paths.read)) return [{ type: 'Abort', code: 'protected', reason: `${path} is outside the read allowlist` }];
@@ -113,10 +122,13 @@ export function mandatoryHooks(m: Manifest, deps: MandatoryDeps): Hook[] {
       if (pr) return [{ type: 'Abort', code: 'policy', reason: `${pr} happens only at the gate.pr step, on its human approval` }];
       // D6: writes inside allowedChanges on the leased work branch need no approval under any isolation; the
       // protectedPaths hook, the write guard and the tamper/diff gates confine them.
-      if (isWrite(tool, method)) return [];
-      // Most specific name first: tool_method, then the method alone, then the tool.
-      const cls = names.map((a) => classify(a, deps.permissions)).find((c) => c !== undefined);
-      if (cls === 'requiresApproval') {
+      // The most restrictive class any of the names carries wins: `never` for tool_method, the method alone or
+      // the tool refuses the call, before anything is allowed or held.
+      const classes = names.map((a) => [a, classify(a, deps.permissions)] as const);
+      const never = classes.find(([, c]) => c === 'never');
+      if (never) return [{ type: 'Abort', code: 'policy', reason: `${never[0]} is never allowed` }];
+      if (isWrite(tool)) return [];
+      if (classes.some(([, c]) => c === 'requiresApproval')) {
         const requestId = `ap_${e.run.runId}_${e.spanId}`;
         return [{ type: 'Suspend', request: { requestId, action, actionHash: (e.input as { actionHash?: string }).actionHash ?? e.spanId, reason: `${action} requires approval`, requester: 'worker' } }];
       }
@@ -132,7 +144,8 @@ export function mandatoryHooks(m: Manifest, deps: MandatoryDeps): Hook[] {
       if (!writes || !path) return [];
       const contract = deps.contract();
       if (!contract) return [];
-      const targets = criterionTargets(contract);
+      const packageScripts = deps.packageScripts?.(contract);
+      const targets = criterionTargets(contract, packageScripts ? { packageScripts } : {});
       const hit = contractTouch(path, { contract, ...(deps.contractPaths ? { contractPaths: deps.contractPaths } : {}) }, targets);
       const why = hit?.detail ?? packageScriptWriteProblem(toolCallInput(e), targets);
       return why ? [{ type: 'Abort', code: 'policy', reason: `tampering: ${why}; the contract and its checks are the requestor's` }] : [];

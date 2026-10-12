@@ -38,6 +38,7 @@ import { Dispatcher } from '../hooks/dispatcher.js';
 import { currentScope, scope } from '../scope.js';
 import { SubInvokeDenied, type Broker, type EffectRecord, type ExecReport, type SubInvokeRequest, type SubInvokeResult, type TaintInfo } from '../broker/broker.js';
 import { sandboxCallbacks, type SandboxCallbacks } from '../broker/sandboxBridge.js';
+import { quarantineWorktree } from '../sandbox/quarantine.js';
 import { parseProgram } from '../protocol/parser.js';
 import { renderTask, STANDARD_STUBS, workerSystemPrompt, type StubDoc } from '../protocol/prompts.js';
 import { newNonce, redactorFor, SERIALIZER_LIMITS, serializeInputs, truncate, wrapUntrusted } from '../protocol/serializer.js';
@@ -74,8 +75,10 @@ import { applyPatches, SpanRunner, type AbortReason, type TraceEntry } from './s
  *   current scope first (a child whose data the current scope can no longer read is not replayed), and a
  *   refusal (or changed arguments) refuses the call instead of running the child again.
  * - Quarantine: when the broker reports the tree tainted (an unresolved writer at drain timeout, or an
- *   unverifiable commit), no checkpoint is written and every outcome becomes `aborted` with a
- *   `tainted:` reason and a `tainted` field (TaintedOutcome). The worktree must not be reused or gated.
+ *   unverifiable commit) or the worktree is in the process-wide quarantine (a REPL exec or a verify run
+ *   that left work unresolved; a REPL taint is recorded here against the broker's worktree), no checkpoint
+ *   is written and every outcome becomes `aborted` with a `tainted:` reason and a `tainted` field
+ *   (TaintedOutcome). The worktree must not be reused or gated.
  * - Secrets: value inputs carrying secret material are refused at Invoke/Enter; everything handed to the
  *   child, persisted (checkpoints, journal), traced or returned in an Outcome passes the contracts redactor.
  *   The redactor built from InvokeOptions.secrets is adopted by the broker, so the broker, its tools and
@@ -650,6 +653,20 @@ async function runInvoke(st: State, opts: Internal, rerun?: { code: string; exec
           report = await opts.broker.endExec();
           opts.signal?.removeEventListener('abort', onAbort);
           if (repl && isFactory(opts.repl)) await repl.dispose().catch(() => undefined);
+        }
+        // A REPL that left work unresolved (a host call or a process group that outlived the exec) taints the
+        // broker's worktree whether or not the REPL was constructed with one: the registry entry refuses every
+        // later tool, verify run and REPL on it, and `exec.tainted` evidence carries it across a restart.
+        const replTaint = (res as { tainted?: { reason?: unknown; outstanding?: unknown; processes?: unknown } }).tainted;
+        if (replTaint && typeof replTaint === 'object' && opts.broker.worktree) {
+          const reason = red.redactText(typeof replTaint.reason === 'string' && replTaint.reason ? replTaint.reason : 'the REPL left work unresolved');
+          const outstanding = Array.isArray(replTaint.outstanding) ? replTaint.outstanding.filter((x): x is string => typeof x === 'string') : [];
+          const processes = Array.isArray(replTaint.processes) ? replTaint.processes.filter((x): x is number => typeof x === 'number') : [];
+          quarantineWorktree(opts.broker.worktree, { source: 'repl', reason, outstanding, processes });
+          // A failed write is sticky in the SpanRunner (code 'ledger') and reported by the Exit below.
+          await spans
+            .evidence(`taint:repl:${run.runId}:${run.invokeId}:e${execNo}:g${st.generation}`, 'exec.tainted', { reason, unresolved: [...outstanding, ...processes.map((p) => `pgid:${p}`)], worktree: opts.broker.worktree, execNo, invokeId: run.invokeId, source: 'repl' })
+            .catch(() => undefined);
         }
         // Quarantine dominates: no suspension checkpoint, no further turn.
         if (report.tainted || opts.broker.tainted) return exitWith('Aborted', () => finish(aborted(report.fatal ?? [])));

@@ -105,6 +105,36 @@ describe('redactJson', () => {
     expect(out.arr).toEqual([1, GETTER_MARKER]);
   });
 
+  it('a secret held in a Buffer, typed array, ArrayBuffer or boxed String is redacted and reported, never emitted as an index map', () => {
+    const utf8 = Buffer.from(`token ${PLAIN} end`, 'utf8');
+    const utf16 = Buffer.from(PLAIN, 'utf16le');
+    const ab = utf8.buffer.slice(utf8.byteOffset, utf8.byteOffset + utf8.byteLength);
+    const cases: Record<string, unknown> = { buffer: utf8, u8: new Uint8Array(utf8), view: new DataView(ab), ab, utf16, u16: new Uint16Array(utf16.buffer.slice(utf16.byteOffset, utf16.byteOffset + utf16.byteLength)), boxed: new String(PLAIN), nested: [{ x: Buffer.from(PLAIN) }] };
+    for (const [name, v] of Object.entries(cases)) {
+      expect(containsSecret({ v }, [PLAIN]), name).toBe('secret');
+      const out = JSON.stringify(redactJson({ v }, [PLAIN]));
+      expect(out, name).not.toContain(PLAIN);
+      expect(out, name).not.toContain('"0":');
+      expect(out, name).not.toContain(PLAIN.split('').join('\\u0000'));
+    }
+    expect(redactJson({ v: utf8 }, [PLAIN])).toEqual({ v: `token ${MARK} end` });
+    expect(redactJson({ v: utf16 }, [PLAIN])).toEqual({ v: `[binary:${utf16.byteLength}]` });
+    expect(redactJson({ s: new String('plain'), n: new Number(3), b: new Boolean(false), t: Buffer.from('text') }, [PLAIN])).toEqual({ s: 'plain', n: 3, b: false, t: 'text' });
+    expect(containsSecret({ t: Buffer.from('text'), s: new String('plain') }, [PLAIN])).toBeNull();
+  });
+
+  it('containsSecret never calls a value clean when part of it was not scanned (too deep, or unreadable)', () => {
+    let deep: unknown = PLAIN;
+    for (let i = 0; i < 70; i++) deep = { d: deep };
+    expect(containsSecret(deep, [PLAIN])).toBe('unscanned');
+    let ok: unknown = 'leaf';
+    for (let i = 0; i < 20; i++) ok = { d: ok };
+    expect(containsSecret(ok, [PLAIN])).toBeNull();
+    const hostile = new Proxy({}, { ownKeys: () => { throw new Error('boom'); } });
+    expect(containsSecret({ h: hostile }, [PLAIN])).toBe('unscanned');
+    expect(containsSecret({ h: hostile, s: PLAIN }, [PLAIN])).toBe('secret');
+  });
+
   it('bounds depth, survives cycles and throwing proxies, follows JSON semantics for undefined', () => {
     const cyc: Record<string, unknown> = { a: 1 };
     cyc.self = cyc;

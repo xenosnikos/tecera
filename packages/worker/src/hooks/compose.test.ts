@@ -11,7 +11,7 @@ describe('composeEffects', () => {
     { effect: { type: 'PatchInput', path: 'a', value: 1 }, valid: ['Enter'] },
     { effect: { type: 'ReplaceOutput', value: 1 }, valid: ['Send'] },
     { effect: { type: 'PatchOutput', path: 'a', value: 1 }, valid: ['Complete'] },
-    { effect: { type: 'Abort', code: 'policy', reason: 'r' }, valid: ['Enter', 'Send', 'Complete', 'Retry'] },
+    { effect: { type: 'Abort', code: 'policy', reason: 'r' }, valid: stages },
     { effect: { type: 'Suspend', request: susp }, valid: ['Send'] },
     { effect: { type: 'RestrictCapabilities', to: { tools: [] } }, valid: ['Enter'] },
     { effect: { type: 'ReserveBudget', pool: 'usd', amount: 1 }, valid: ['Send'] },
@@ -127,6 +127,19 @@ describe('Dispatcher', () => {
     const slow = new Dispatcher([hook('slow', () => new Promise(() => {}))], { hookTimeoutMs: 20 });
     const s = await slow.emit(ev('Enter'), view);
     expect(s.abort?.reasons[0]?.reason).toMatch(/timed out/);
+  });
+
+  it('a throwing, hanging or aborting hook at Exit is an Abort too (never ignored); evidence of the other hooks survives', async () => {
+    const rec = hook('rec', () => [{ type: 'AppendEvidence', key: 'k', kind: 'span', body: 1 }]);
+    const boom = await new Dispatcher([hook('boom', () => { throw new Error('kaboom'); }), rec], { hookTimeoutMs: 50 }).emit(ev('Exit'), view);
+    expect(boom.abort?.reasons).toEqual([{ code: 'hookError', hookId: 'boom', reason: 'hook failed: kaboom' }]);
+    expect(boom.evidence.map((e) => e.key)).toEqual(['k']);
+    expect(boom.ignored).toHaveLength(0);
+    const slow = await new Dispatcher([hook('slow', () => new Promise(() => {}))], { hookTimeoutMs: 20 }).emit(ev('Exit'), view);
+    expect(slow.abort?.reasons[0]).toMatchObject({ code: 'hookError', hookId: 'slow' });
+    expect(slow.abort?.reasons[0]?.reason).toMatch(/timed out/);
+    const says = await new Dispatcher([hook('says', () => [{ type: 'Abort', code: 'policy', reason: 'no' }])]).emit(ev('Exit'), view);
+    expect(says.abort?.reasons).toEqual([{ code: 'policy', hookId: 'says', reason: 'no' }]);
   });
 
   it('hooks only receive the spans they subscribe to; blackboard CAS applies when expected matches', async () => {

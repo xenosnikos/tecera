@@ -1,7 +1,7 @@
 import type { AcceptanceContract } from '@tecera/contracts';
 import { matchesAny } from './glob.js';
 import type { Change } from './diffBoundary.js';
-import { contractTouch, criterionScriptProblem, criterionTargets, isPackageJson } from './contractTamper.js';
+import { contractTouch, criterionScriptProblem, criterionTargets, isPackageJson, type PackageScripts } from './contractTamper.js';
 
 /**
  * Gate tamper checks (Builderlync verify-be.sh + security.md §5): never weaken the gate to pass it.
@@ -28,6 +28,11 @@ export interface TamperOptions {
   contract?: AcceptanceContract | null;
   /** Globs of files holding the contract (default DEFAULT_CONTRACT_GLOBS); a change to one is 'contract-edit'. Applied only with `contract`. */
   contractPaths?: readonly string[];
+  /**
+   * The base package.json scripts (contractTamper PackageScripts): with them a change to a file that a
+   * package script run by a criterion runs is 'criterion-edit' too. Applied only with `contract`.
+   */
+  packageScripts?: PackageScripts;
 }
 
 export interface Finding {
@@ -63,13 +68,20 @@ export const DEFAULT_CONFIG_GLOBS = [
   '.claude/**',
 ];
 
-const FOCUS_RE = /\b(it|test|describe)\.(only|skip|todo)\b|\b(xit|xdescribe|xtest|fit|fdescribe)\s*\(/;
+/**
+ * A test switched off or narrowed: `.only` / `.skip` / `.todo` / `.skipIf` / `.runIf` / `.fails` anywhere in a
+ * member chain after it / test / describe / suite (`it.concurrent.skip`, `describe.skipIf(x)`), the same by
+ * bracket access, and the x / f prefixes.
+ */
+const FOCUS_RE = /\b(it|test|describe|suite)(\.\w+)*\.(only|skip|todo|skipIf|runIf|fails|failing)\b|\b(it|test|describe|suite)(\.\w+)*\s*\[\s*['"`](only|skip|todo|skipIf|runIf|fails|failing)['"`]\s*\]|\b(xit|xdescribe|xtest|fit|fdescribe)\s*\(/;
+/** Forms that only mean "skip" inside a test file: a `skip:` / `todo:` / `only:` test option, `this.skip()`, `t.skip()`. */
+const TEST_FILE_SKIP_RE = /\b(skip|todo|only)\s*:\s*(true\b|1\b|['"`])|\bthis\.skip\s*\(|\b(t|ctx|context)\.(skip|todo)\s*\(/;
 
 export function tamperFindings(changes: readonly Change[], hunks: readonly Hunk[], opts: TamperOptions): Finding[] {
   const f: Finding[] = [];
   const maxBytes = opts.maxFileBytes ?? 2 * 1024 * 1024;
   const guard = opts.contract ? { contract: opts.contract, ...(opts.contractPaths ? { contractPaths: opts.contractPaths } : {}) } : null;
-  const targets = guard ? criterionTargets(guard.contract) : null;
+  const targets = guard ? criterionTargets(guard.contract, opts.packageScripts ? { packageScripts: opts.packageScripts } : {}) : null;
   for (const c of changes) {
     if (guard) {
       for (const p of c.from ? [c.from, c.path] : [c.path]) {
@@ -92,8 +104,9 @@ export function tamperFindings(changes: readonly Change[], hunks: readonly Hunk[
     if (c.status === '!') f.push({ code: 'ignored-file', path: c.path, detail: 'ignored file changed' });
   }
   for (const h of hunks) {
+    const inTest = matchesAny(h.path, opts.testGlobs) !== null;
     for (const line of h.added) {
-      if (FOCUS_RE.test(line)) f.push({ code: 'focus-or-skip', path: h.path, detail: line.trim().slice(0, 120) });
+      if (FOCUS_RE.test(line) || (inTest && TEST_FILE_SKIP_RE.test(line))) f.push({ code: 'focus-or-skip', path: h.path, detail: line.trim().slice(0, 120) });
     }
     if (h.path.endsWith('package.json') && h.added.some((l) => /"scripts"\s*:/.test(l) || /^\s*"(test|pretest|posttest|prepare|postinstall|preinstall)"\s*:/.test(l))) {
       f.push({ code: 'scripts-edit', path: h.path, detail: 'package.json scripts changed' });

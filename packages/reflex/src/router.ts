@@ -108,7 +108,9 @@ export class ReflexRouter implements Reflex {
 
   /** A model / frontier answer may tighten the rules' answer, never loosen it, on the safety seams. */
   private noLessSafe<S extends ReflexSeam>(seam: S, rule: ReflexResult<S>, r: ReflexResult<S>): ReflexResult<S> {
-    if (r === rule || r.provider === 'rules') return r;
+    // Only the rules' own answer (the same object) is exempt: a label is a claim, and a model or frontier
+    // answer that calls itself 'rules' is clamped like any other.
+    if (r === rule) return r;
     if (seam === 'gate') {
       const a = (rule.answer as ReflexResult<'gate'>['answer']).decision;
       const b = (r.answer as ReflexResult<'gate'>['answer'])?.decision;

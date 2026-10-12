@@ -96,7 +96,8 @@ async function stopHook(c: CommandContext, text: string): Promise<number> {
       return EXIT.ok;
     }
     const ledger = rt.ledger();
-    const ev = await evaluateStop(ledger, provenOptionsOf(rt.manifest, rt.redactor));
+    // The clock approvals expire against is the run's own (injected in tests), never a second one.
+    const ev = await evaluateStop(ledger, { ...provenOptionsOf(rt.manifest, rt.redactor), now: c.opts.now() });
     const runId = ev.activeRun?.runId ?? ev.provedRunId;
     const payload: Record<string, Json> = {
       reason: ev.decision.reason,

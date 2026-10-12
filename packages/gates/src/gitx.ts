@@ -15,7 +15,8 @@ import { isAbsolute, join, resolve } from 'node:path';
  *  - command-line overrides that disable hooks, fsmonitor, attribute files, external diff, pagers,
  *    signing, credential helpers, ssh commands and every transport protocol.
  * And `assertSafeRepo` refuses (before any other git call) a repository whose own config could still name
- * a program: filter/textconv/merge drivers, hooksPath, fsmonitor, sshCommand, credential helpers, includes.
+ * a program: filter/textconv/merge drivers, hooksPath, fsmonitor, sshCommand, credential helpers, includes,
+ * transport policy (protocol.*).
  */
 
 export interface GitIdentity {
@@ -147,6 +148,9 @@ const DANGEROUS_KEYS: readonly RegExp[] = [
   /^uploadpack\./,
   /^receive\./,
   /^remote\..*\.(uploadpack|receivepack|vcs)$/,
+  // Which transports git may use is the gate's decision alone: a repository-level protocol.<name>.allow would
+  // beat the command line's protocol.allow=never for that transport (ext::, a remote helper).
+  /^protocol\./,
   /^pager\./,
   /^trace2\./,
   /^extensions\.(partialclone|refstorage)$/,

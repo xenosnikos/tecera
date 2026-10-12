@@ -55,6 +55,8 @@ export {
   commandRunsFiles,
   commandImports,
   commandSandboxProblems,
+  commandStatusProblems,
+  commandUnknownPrograms,
   callShapeConflict,
   packageOf,
   isNodeBuiltin,

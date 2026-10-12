@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { event, verifyCommandDigest, type Json, type JsonObject, type LLM, type LLMRequest, type LLMResponse, type RunVerdict, type TeceraEvent } from '@tecera/contracts';
+import { approvalGrantedEvent, event, prActionHash, verifyCommandDigest, type Json, type JsonObject, type LLM, type LLMRequest, type LLMResponse, type RunVerdict, type TeceraEvent } from '@tecera/contracts';
 import { MemoryLedger } from '@tecera/ledger';
 import { applyManagedBlock, BLOCK_END, BLOCK_START, jsonContains, jsonMerge, MergeError, securityConflicts } from './adapters/merge.js';
 import { parseArgs, UsageError } from './cli/args.js';
@@ -205,14 +205,22 @@ describe('D4: the active run of a business case (Stop hook)', () => {
   it('only a run ledgerProvenRun proves lets the assistant stop: a well-formed proof whose verify evidence is missing, of another run, not exit 0, without its digest or without its verify.passed blocks', async () => {
     const CHECK = { command: 'node --test', timeoutSec: 60 };
     const body = (o: Record<string, Json> = {}): JsonObject => ({ command: CHECK.command, commandDigest: verifyCommandDigest(CHECK.command), timeoutSec: 30, exitCode: 0, outcome: 'passed', fingerprint: 'f', runId: 'r1', ...o });
-    const build = async (o: { key?: string; body?: JsonObject; rid?: string; passed?: boolean; held?: boolean; delivered?: 'granted' | 'pending' | 'none' } = {}): Promise<MemoryLedger> => {
+    const prHash = prActionHash({ intentionId: 'i1', stepId: 'pr', attempt: 0, sha: 'c1' });
+    type Delivered = 'consumed' | 'granted' | 'pending' | 'none';
+    const build = async (o: { key?: string; body?: JsonObject; rid?: string; passed?: boolean; held?: boolean; delivered?: Delivered; pr?: Record<string, Json> | null } = {}): Promise<MemoryLedger> => {
       const l = new MemoryLedger();
       await l.evidence({ key: 'vk', kind: 'gate.verify', runId: o.rid ?? 'r1', body: o.body ?? body() });
-      // the PR the achievement follows: an approval the approvals table holds (granted by a human, or still pending)
-      const delivered = o.delivered ?? 'granted';
+      // the PR the achievement follows: the approval the PR gate consumed and the gate.pr record it wrote (or,
+      // for the refused cases, an approval that is only granted or still pending, or no delivery record)
+      const delivered = o.delivered ?? 'consumed';
       if (delivered !== 'none') {
-        await l.requestApproval({ requestId: 'ap_pr', runId: 'r1', sessionId: 's', actionHash: 'h', requester: { kind: 'system', id: 'loop' }, reason: 'open_pr', expiresAt: Date.now() + 60_000 });
-        if (delivered === 'granted') await l.approve('ap_pr', { kind: 'human', id: 'ana' }, 's', Date.now());
+        await l.requestApproval({ requestId: 'ap_pr', runId: 'r1', sessionId: 's', actionHash: prHash, requester: { kind: 'system', id: 'loop' }, reason: 'open_pr', expiresAt: Date.now() + 60_000 });
+        const ana = { kind: 'human' as const, id: 'ana' };
+        if (delivered !== 'pending') await l.approve('ap_pr', ana, 's', Date.now(), approvalGrantedEvent({ id: 'grant-pr', at: 1, requestId: 'ap_pr', runId: 'r1', sessionId: 's', actionHash: prHash, approver: ana, trace: { goalId: 'g', intentionId: 'i1', stepId: 'pr' } }));
+        if (delivered === 'consumed') await l.consume('ap_pr', prHash, 's', 'gate.pr:r1:ap_pr', Date.now());
+      }
+      if (o.pr !== null) {
+        await l.evidence({ key: 'pk', kind: 'gate.pr', runId: 'r1', body: { intentionId: 'i1', stepId: 'pr', goalId: 'g', attempt: 0, sha: 'c1', outcome: 'requested', exitCode: 0, approval: { requestId: 'ap_pr', sessionId: 's', actionHash: prHash }, ...(o.pr ?? {}) } });
       }
       const g = { goalId: 'g' };
       const it1 = { goalId: 'g', intentionId: 'i1', planId: 'p', stepId: 'verify' };
@@ -240,13 +248,20 @@ describe('D4: the active run of a business case (Stop hook)', () => {
       expect(s.decision.exitCode, name).toBe(2);
       expect(s.missing, name).toMatch(/run r1 \(goal g\) is held for a human decision; its goal.achieved is not proven/);
     }
-    // a proven goal.achieved of a run that never delivered its PR, or whose PR approval the approvals table
-    // does not hold as granted by a human, does not let the assistant stop
-    for (const [name, delivered, why] of [
-      ['no PR', 'none', /claims its goal achieved before delivering it: no PR was delivered/],
-      ['PR approval not granted', 'pending', /claims its goal achieved before delivering it: its PR names no approval a human granted/],
+    // a proven goal.achieved of a run that never delivered its PR does not let the assistant stop: no PR
+    // event, an approval that is pending, or granted but never consumed by the PR gate (a pr.requested appended
+    // between `tecera approve` and the resume), or a consumed approval without the PR gate's delivery record
+    for (const [name, o, why] of [
+      ['no PR', { delivered: 'none' }, /claims its goal achieved before delivering it: no PR was delivered/],
+      ['PR approval not granted', { delivered: 'pending' }, /claims its goal achieved before delivering it: its PR names no approval a human granted/],
+      ['PR approval granted, never consumed', { delivered: 'granted' }, /its PR approval ap_pr is granted in the approvals table, not consumed/],
+      ['no delivery record', { pr: null }, /no delivery record of the PR gate \(evidence pk is not in the ledger\)/],
+      ['a refused delivery', { pr: { outcome: 'refused', exitCode: 8 } }, /evidence pk does not record a delivery/],
+      ['a delivery of another commit', { pr: { sha: 'c2' } }, /evidence pk is of another commit/],
+      ['a delivery on another approval', { pr: { approval: { requestId: 'ap_other', sessionId: 's', actionHash: prHash } } }, /delivered on another approval/],
+      ['an approval that is not this PR\'s', { pr: { attempt: 1 } }, /approval ap_pr is not the PR approval of this commit/],
     ] as const) {
-      const s = await evaluateStop(await build({ delivered }));
+      const s = await evaluateStop(await build(o as never));
       expect(s.decision.exitCode, name).toBe(2);
       expect(s.missing, name).toMatch(why);
     }

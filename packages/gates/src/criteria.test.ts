@@ -232,6 +232,31 @@ describe.each(LEDGERS)('gate.verify runs every command criterion on the frozen c
     expect(w.criteria!.map((p) => p.fidelity)).toEqual(['mocked', 'mocked', 'real']);
   });
 
+  it('a provisioned http-stub is out of a criterion\'s reach (criteria run without network): no URL is handed over and the criterion is mocked, never provisioned', async () => {
+    const repo = makeRepo();
+    repo.write('src/a.ts', 'export const a = 2;\n');
+    const ledger = mk();
+    const res: ProvisionedResource = { id: 'res-api', capability: 'api', kind: 'http-stub', provider: 'local', locator: 'http://127.0.0.1:45123', teardown: "rm -rf -- '/tmp/tecera-res/res-api'", createdAt: NOW - 1000, expiresAt: NOW + 3_000_000, transfer: 'pending', goalId: 'g1', runId: 'run1' };
+    await ledger.append(ev('resource.provisioned', { resource: res }));
+    const contract: AcceptanceContract = {
+      ...CONTRACT,
+      criteria: [
+        { id: 'env', statement: 'the client calls the api', check: { kind: 'command', command: 'node -e "fetch(process.env.TECERA_RESOURCE_API)"', timeoutSec: 30 }, requires: ['api'] },
+        { id: 'url', statement: 'the client calls the api', check: { kind: 'command', command: 'node call.mjs http://127.0.0.1:45123', timeoutSec: 30 }, requires: ['api'] },
+      ],
+    };
+    const hash = contractHash(contract);
+    const inv: CapabilityRecord[] = [{ id: 'api', kind: 'http-stub', state: 'provisioned', resourceId: 'res-api' }];
+    const runner = new FakeRunner();
+    const g = createGates({ manifest: manifest(), ledger, verifyRunner: runner, reviewer: new FakeReviewer('openai'), writers: WRITERS, worktree: repo.dir, now: () => NOW, sessionId: 's1' });
+    const c = ctx('v', { worktree: repo.dir });
+    const v = await g.verify({ ...c, goal: { ...c.goal, criteria: contract.criteria, contractHash: hash }, contract, contractHash: hash, inventory: inv });
+    expect(v.criteria!.map((p) => [p.criterionId, p.fidelity])).toEqual([['env', 'mocked'], ['url', 'mocked']]);
+    // nothing is exported to the criterion's shell
+    expect(runner.calls.map((r) => r.command)).toEqual(['node -e "fetch(process.env.TECERA_RESOURCE_API)"', 'node call.mjs http://127.0.0.1:45123', 'node --test']);
+    expect((await ledger.getEvidence(criterionEvidenceKey('run1', 'env', v.fingerprint)))!.body).toMatchObject({ fidelity: 'mocked', resourceUnused: ['api'] });
+  });
+
   it('a criterion that mutates the candidate is terminal (9 mutated), like the goal check', async () => {
     const repo = makeRepo();
     repo.write('src/a.ts', 'export const a = 2;\n');

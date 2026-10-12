@@ -232,6 +232,58 @@ describe('tamper (security.md §6)', () => {
     expect(existsSync(join(markers2, 'filter'))).toBe(false);
   });
 
+  it('tamper.git_hook [second push URL]: a repository whose origin has a second pushurl behind ext:: never runs its program at delivery: with protocol.ext.allow the run is refused before any gate works; without it the PR gate refuses the transport, spends no grant, pushes nothing', async () => {
+    const bare = (): string => {
+      const o = tmp('tecera-adv-origin-');
+      execFileSync('git', ['init', '-q', '--bare', '-b', 'main', o], { stdio: 'ignore' });
+      return o;
+    };
+    const plant = (allowExt: boolean, marker: string, origin: string) => (d: string) => {
+      const g = (...a: string[]) => execFileSync('git', ['-C', d, ...a], { stdio: 'ignore' });
+      g('remote', 'add', 'origin', origin);
+      g('push', '-q', 'origin', 'main');
+      // `git push origin` delivers to every pushurl: the bare repository and the program behind ext::
+      g('config', '--add', 'remote.origin.pushurl', origin);
+      g('config', '--add', 'remote.origin.pushurl', `ext::sh -c touch% ${marker}`);
+      if (allowExt) g('config', 'protocol.ext.allow', 'always');
+    };
+    const remoteBranches = (origin: string): string => execFileSync('git', ['-C', origin, 'for-each-ref', '--format=%(refname)', 'refs/heads/tecera'], { encoding: 'utf8' }).trim();
+
+    // (a) no protocol override: the run reaches its PR hold, a human approves, the gate refuses the delivery
+    const markers = hookMarkerDir();
+    const origin = bare();
+    const { dir, wt } = await sampleRepo({ afterCommit: plant(false, join(markers, 'ext'), origin) });
+    const flow = new Flow(dir, wt);
+    const held = await flow.drive();
+    expect(held.code, held.err + held.out + (await dump(dir))).toBe(4);
+    const rid = await flow.approvePending('pr');
+    const done = await flow.segment();
+    expect(done.code, done.err + done.out).not.toBe(0);
+    const evs = await flow.events();
+    expect(existsSync(join(markers, 'ext')), 'the ext:: program ran').toBe(false);
+    expect(evs.filter((e) => e.kind === 'pr.requested' || e.kind === 'pr.opened'), 'a PR was delivered').toEqual([]);
+    expect(evs.map((e) => e.kind)).not.toContain('goal.achieved');
+    const failed = evs.find((e) => e.kind === 'pr.failed');
+    expect(failed?.payload, 'the refusal is on the ledger').toMatchObject({ reason: 'transport-refused' });
+    expect(evs.filter((e) => e.kind === 'approval.consumed' && (e.payload as { requestId?: string }).requestId === rid), 'the human grant was spent on a refused delivery').toEqual([]);
+    expect(remoteBranches(origin), 'the work branch reached the remote').toBe('');
+
+    // (b) with protocol.ext.allow=always in the repository config: refused as an unsafe repository, nothing runs
+    const markers2 = hookMarkerDir();
+    const origin2 = bare();
+    const b = await sampleRepo({ afterCommit: plant(true, join(markers2, 'ext'), origin2) });
+    const flow2 = new Flow(b.dir, b.wt);
+    const seg = await flow2.drive();
+    expect(seg.code, seg.err + seg.out).not.toBe(0);
+    expect(seg.code).not.toBe(4);
+    const evs2 = await flow2.events().catch(() => []);
+    expect(evs2.filter((e) => e.kind === 'commit.recorded' || e.kind === 'pr.requested' || e.kind === 'pr.opened' || e.kind === 'goal.achieved')).toEqual([]);
+    expect(existsSync(join(markers2, 'ext')), 'the ext:: program ran').toBe(false);
+    expect(remoteBranches(origin2)).toBe('');
+    rmSync(markers, { recursive: true, force: true });
+    rmSync(markers2, { recursive: true, force: true });
+  }, 480_000);
+
   it('tamper.git_hook [runtime e2e]: a repository full of hooks; tecera run → approve → resume never runs one', async () => {
     const markers = hookMarkerDir();
     const { dir, wt } = await sampleRepo({

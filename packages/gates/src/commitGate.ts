@@ -1,5 +1,5 @@
-import { FenceLost, type Json, type Ledger, type Manifest, type Redactor, type SecretInput } from '@tecera/contracts';
-import { BoundaryViolation, DEFAULT_CONFIG_GLOBS, DEFAULT_TEST_GLOBS, enforceChanges, matchesAny, tamperFindings } from '@tecera/policy';
+import { FenceLost, type AcceptanceContract, type Json, type Ledger, type Manifest, type Redactor, type SecretInput } from '@tecera/contracts';
+import { BoundaryViolation, criterionScriptDirs, DEFAULT_CONFIG_GLOBS, DEFAULT_TEST_GLOBS, enforceChanges, matchesAny, packageScriptsOf, tamperFindings, type PackageScripts } from '@tecera/policy';
 import { addedLines, buildCandidateTree, fileManifest, lsTree, manifestMismatch, policyChanges, sameEntries, snapshotCandidate, type BuiltTree, type Candidate } from './candidate.js';
 import { claim, commandDigest, commitEvidenceKey, defaultIds, errMsg, GateMemo, ignoredBaseline, keyPart, latestReview, latestVerify, obj, redactorFrom, safeText, usableGuard, writeEvidence, type ReviewMemo, type VerifyMemo } from './evidence.js';
 import { assertSafeRepo, DEFAULT_IDENTITY, hostGit, refSafe, UnsafeRepo, type GitIdentity } from './gitx.js';
@@ -99,6 +99,25 @@ export function testsReadOnlyFor(ctx: Pick<StepContext, 'goal' | 'plan'>, overri
     (g) => matchesAny(g, DEFAULT_TEST_GLOBS) !== null || /(^|\/)(tests?|__tests__|spec)(\/|$)|\.(test|spec)\./.test(g),
   );
   return !explicit;
+}
+
+/**
+ * The scripts of every package.json a criterion of `contract` runs a script of, read from the BASE tree
+ * (blob ids from the snapshot, never the worktree): policy criterionTargets follows their bodies to the files
+ * they run. Scripts that run scripts of another directory are followed for a few rounds. A blob that cannot
+ * be read throws (the tamper check fails closed).
+ */
+export async function basePackageScripts(dir: string, baseEntries: ReadonlyMap<string, { mode: string; oid: string }>, contract: AcceptanceContract, signal?: AbortSignal): Promise<PackageScripts> {
+  const out: Record<string, Record<string, string>> = {};
+  for (let round = 0; round < 4; round++) {
+    const missing = criterionScriptDirs(contract, out).filter((d) => !(d in out));
+    if (!missing.length) break;
+    for (const d of missing) {
+      const entry = baseEntries.get(d ? `${d}/package.json` : 'package.json');
+      out[d] = entry ? packageScriptsOf(await hostGit(dir, ['cat-file', 'blob', entry.oid], { signal })) : {};
+    }
+  }
+  return out;
 }
 
 interface Intent {
@@ -214,7 +233,9 @@ export class CommitGate {
       findings = [
         // Under an acceptance contract the goal file and whatever a criterion's check runs are the requestor's
         // (D8): a candidate that changes them is tampering, inside allowedChanges or not.
-        ...tamperFindings(changes, await addedLines(dir, snap, ctx.signal), { testGlobs: DEFAULT_TEST_GLOBS, configGlobs: DEFAULT_CONFIG_GLOBS, testsReadOnly, maxFileBytes: this.o.maxFileBytes, ...(ctx.contract ? { contract: ctx.contract } : {}) }),
+        // The package scripts are read from the base tree: what a criterion's `npm run x` runs is the
+        // requestor's script, never one the candidate rewrote.
+        ...tamperFindings(changes, await addedLines(dir, snap, ctx.signal), { testGlobs: DEFAULT_TEST_GLOBS, configGlobs: DEFAULT_CONFIG_GLOBS, testsReadOnly, maxFileBytes: this.o.maxFileBytes, ...(ctx.contract ? { contract: ctx.contract, packageScripts: await basePackageScripts(dir, snap.baseEntries, ctx.contract, ctx.signal) } : {}) }),
         ...(await this.localFindings(dir, snap)),
       ];
     } catch (err) {

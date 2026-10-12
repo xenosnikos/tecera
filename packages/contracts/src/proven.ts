@@ -180,8 +180,12 @@ export function provenAchievement(events: Iterable<TeceraEvent>, evidence: Evide
         const cid = body.criterionId;
         if (cid !== undefined && cid !== k.id) return no(`criterion ${k.id}: its evidence is for criterion ${String(cid)}`, verified);
         // The fidelity the verify gate measured when the criterion ran is a ceiling: a capability relabelled
-        // afterwards (a later probe, a later resource) never makes a mocked run real.
-        if (isFidelity(body.fidelity) && FIDELITY_RANK[p.fidelity] < FIDELITY_RANK[body.fidelity]) return no(`criterion ${k.id} claims ${p.fidelity}, its verify evidence recorded ${body.fidelity}`, verified);
+        // afterwards (a later probe, a later resource) never makes a mocked run real. Evidence that records
+        // no fidelity (or a malformed one) measured nothing, so it supports only the weakest claim.
+        const measured: Fidelity = isFidelity(body.fidelity) ? body.fidelity : 'mocked';
+        if (FIDELITY_RANK[p.fidelity] < FIDELITY_RANK[measured]) {
+          return no(isFidelity(body.fidelity) ? `criterion ${k.id} claims ${p.fidelity}, its verify evidence recorded ${body.fidelity}` : `criterion ${k.id} claims ${p.fidelity}, its verify evidence records no fidelity`, verified);
+        }
       } else {
         if (answered.has(p.evidenceKey)) return no(`criterion ${k.id}: approval ${p.evidenceKey} already answers another criterion`, verified);
         answered.add(p.evidenceKey);

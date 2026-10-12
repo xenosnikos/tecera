@@ -421,7 +421,8 @@ interface RunScan {
  * are recorded (budget.exhausted, once per pool) and the run continues; with budgets.enforce true they end
  * the goal with a terminal 'budget' failure, and the run deadline (budgets.wallClockSec, recorded in
  * run.started, surviving a restart) is enforced before every dispatch, during every step and on restore.
- * Loop-safety limits (maxAttempts, maxDepth, maxIterations, per-exec timeouts) are always enforced.
+ * Loop-safety limits (maxAttempts, maxDepth, maxIterations, per-exec timeouts) are always enforced;
+ * maxAttempts also caps the intentions of one goal that reconsideration may drop and re-plan.
  *
  * Achievement (D4): goal.achieved carries a proof {command, exitCode 0, fingerprint, evidenceKey,
  * verifiedAt} built from the final verify.passed evidence; without it the goal stays open.
@@ -2306,10 +2307,30 @@ export class Loop {
     await this.emit('intention.dropped', { intention: dropped as unknown as Json, cause }, this.traceFor(i.id));
     const goal = this.goals.get(i.goalId);
     if (goal && goal.status === 'open') {
+      // Loop-safety: every interrupted intention of a goal counts against maxAttempts, exactly as a failed
+      // attempt of one intention does. A new intention starts at attempt 1, so without this a fact that
+      // keeps breaking the plan context would buy one planner call and one worker run per event, forever.
+      const max = this.p.manifest.budgets.maxAttempts;
+      const interrupted = await this.interruptedIntentions(goal.id);
+      if (interrupted >= max) {
+        await this.dropGoal(goal, `re-deliberation limit reached: ${interrupted} intentions of goal ${goal.id} were interrupted (maxAttempts ${max}); the last by ${cause}`);
+        return;
+      }
       // Re-deliberate: the goal still stands, the plan did not.
       const adopted = await this.lastEvent('goal.adopted', goal.id);
       if (adopted) await this.deliberate(goal, adopted);
     }
+  }
+
+  /**
+   * Intentions of `goalId` this run dropped by reconsideration, counted from the ledger (so a restart, or
+   * anything a worker returns, cannot reset it). An intention dropped because the acceptance contract was
+   * amended is not counted: that is a human's change of the goal, gated by a new sign-off.
+   */
+  private async interruptedIntentions(goalId: string): Promise<number> {
+    let n = 0;
+    for await (const e of this.p.ledger.events({ runId: this.p.runId, kinds: ['intention.dropped'] })) if (e.trace.goalId === goalId && e.payload.cause !== 'criteria.amended') n++;
+    return n;
   }
 
   /**
@@ -2427,9 +2448,21 @@ export class Loop {
       this.stop(`ledger refused approval request ${requestId}: ${msgOf(err)}`);
       throw new LoopStopped(this.stopped!.reason);
     }
+    // Park the latest state: a sibling step may have moved while the approval was requested. An intention
+    // that ended meanwhile is not held again, and one that moved to another attempt is not held under an
+    // action hash of the old one: the step goes back to pending and is held afresh (the request made here
+    // stays pending and expires unused).
+    const attempt = i.attempt;
+    i = this.intentions.get(i.id)!;
+    if (!this.isActive(i) || i.attempt !== attempt) {
+      const active = this.isActive(i);
+      if (active) this.intentions.update({ ...i, stepStatus: { ...i.stepStatus, [step.id]: 'pending' } });
+      await this.emit('step.cancelled', { step: step.id, reason: active ? `intention ${i.id} moved to attempt ${i.attempt} before the hold` : `intention ${i.status}`, requestId }, this.traceFor(i.id, step.id));
+      return;
+    }
     this.held.set(heldKey(i.id, step.id), { intentionId: i.id, stepId: step.id, requestId, actionHash, owner });
     i = transitionStep(i, step.id, 'held');
-    i = transitionIntention(i, 'held');
+    if (i.status !== 'held') i = transitionIntention(i, 'held');
     i = { ...clearHold(i), heldRequestId: requestId };
     this.intentions.update(i);
     await this.emit('approval.requested', { requestId, actionHash, step: step.id, sessionId: this.sessionId, owner, candidateD1, attempt: i.attempt, isolationDegraded: this.isolationDegraded, ...(pr ? { sha: pr.sha, reviewedD1: pr.d1 ?? null } : {}) }, this.traceFor(i.id, step.id));
@@ -2505,6 +2538,13 @@ export class Loop {
       const route = await this.ask('route', { state: { stepId: step.id }, options: allowed });
       seatId = route.answer.seatId;
     }
+    // Transition the latest state: a sibling step of this intention may have moved while the reflex was
+    // consulted, and writing the snapshot read before it would undo that step's own transition.
+    i = this.intentions.get(intentionId)!;
+    if (!this.isActive(i)) {
+      await this.emit('step.cancelled', { step: step.id, reason: `intention ${i.status}` }, this.traceFor(intentionId, step.id));
+      return;
+    }
     i = transitionStep(i, step.id, 'running');
     this.intentions.update(i);
     const resumed = mode.kind !== 'fresh';
@@ -2546,6 +2586,8 @@ export class Loop {
     const guard = this.writeGuard(intentionId, step.id, ac.signal);
     if (step.kind === 'worker') this.stepBefore.set(k, this.riskOf(plan, step) === 'write' && this.p.worktreeCheckpoint ? (baseline ?? null) : (this.cpState.get(intentionId)?.checkpointId ?? null));
     try {
+      // The step is handed the intention as it stands now (events were appended since the transition).
+      i = this.intentions.get(intentionId)!;
       const ctx: GateContext = { ...this.gateContext(i, plan, step, ac.signal, mode.kind === 'approved' ? mode.approval : undefined, recovery !== undefined), guard, ...(await this.contractFields(i, step)) };
       let result = await this.runStep(ctx, seatId, ac.signal, mode, recovery);
       const delivered = (result.kind === 'gate.commit' || result.kind === 'gate.pr') && result.exitCode === 0 && !result.terminal;
@@ -2756,9 +2798,15 @@ export class Loop {
           return;
         }
       }
+      // Park the latest state: a sibling step may have moved while the suspension was checked and checkpointed.
+      i = this.intentions.get(intentionId)!;
+      if (!this.isActive(i)) {
+        await this.emit('step.cancelled', { step: step.id, reason: `intention ${i.status}`, result: summarize(result) }, this.traceFor(intentionId, step.id));
+        return;
+      }
       this.held.set(heldKey(intentionId, step.id), { intentionId, stepId: step.id, requestId: req.requestId, actionHash: req.actionHash, owner: 'worker', resumeToken, ...(worktreeCheckpoint ? { worktreeCheckpoint } : {}) });
       i = transitionStep(i, step.id, 'held');
-      i = transitionIntention(i, 'held');
+      if (i.status !== 'held') i = transitionIntention(i, 'held');
       i = { ...i, resumeToken, heldRequestId: req.requestId };
       this.intentions.update(i);
       await this.emit('step.held', { requestId: req.requestId, reason: req.reason, owner: 'worker', actionHash: req.actionHash, ...(worktreeCheckpoint ? { worktreeCheckpoint } : {}) }, this.traceFor(intentionId, step.id));
@@ -3205,8 +3253,14 @@ export class Loop {
     else i = { ...i, stepStatus: { ...i.stepStatus, [step.id]: 'failed' } };
     this.held.delete(heldKey(i.id, step.id));
     this.intentions.update(i);
+    const failedAttempt = i.attempt;
     if (!opts.recorded) await this.emit('step.failed', { step: step.id, reason, blocked, terminal, ...failure, ...(opts.noChange ? { noChange: true } : {}) }, this.traceFor(i.id, step.id));
-    const sameAttemptKey = `${heldKey(i.id, step.id)}#${i.attempt}`;
+    // Continue from the latest state: a sibling step may have completed, failed or been held while the event
+    // was appended, and writing the snapshot read before it would undo that. An intention that ended
+    // meanwhile stays ended (the step.failed above is its record).
+    i = this.intentions.get(i.id)!;
+    if (!this.isActive(i)) return;
+    const sameAttemptKey = `${heldKey(i.id, step.id)}#${failedAttempt}`;
     if (opts.noChange && !blocked && !terminal && step.kind === 'worker' && !this.noChangeRetried.has(sameAttemptKey)) {
       this.noChangeRetried.add(sameAttemptKey);
       i = clearHold({ ...i, status: i.status === 'held' || i.status === 'committed' ? 'running' : i.status, stepStatus: { ...i.stepStatus, [step.id]: 'pending' } });
@@ -3224,12 +3278,15 @@ export class Loop {
       const s = plan.steps.find((x) => x.id === id);
       return !!s && editsFiles(plan, s);
     });
-    const canRetry = !blocked && !terminal && reworkable && i.attempt < this.p.manifest.budgets.maxAttempts;
+    // A sibling that failed in the same attempt has already moved the intention to the next one: this
+    // failure joins that retry instead of consuming a second attempt.
+    const joins = i.attempt > failedAttempt;
+    const canRetry = !blocked && !terminal && reworkable && (joins || i.attempt < this.p.manifest.budgets.maxAttempts);
     if (canRetry) {
       // A retry keeps the intention running with attempt + 1 and the re-run steps pending again.
       const stepStatus = { ...i.stepStatus };
       for (const id of rerun) stepStatus[id] = 'pending';
-      i = clearHold({ ...i, status: i.status === 'held' || i.status === 'committed' ? 'running' : i.status, attempt: i.attempt + 1, stepStatus });
+      i = clearHold({ ...i, status: i.status === 'held' || i.status === 'committed' ? 'running' : i.status, attempt: joins ? i.attempt : i.attempt + 1, stepStatus });
       this.intentions.update(i);
       await this.emit('intention.advanced', { intention: i as unknown as Json, retry: step.id, attempt: i.attempt, ...(rerun.length > 1 ? { rerun } : {}) }, this.traceFor(i.id));
       return;

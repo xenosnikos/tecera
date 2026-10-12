@@ -2,10 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import type { GateApproval, Ledger } from '@tecera/contracts';
 import { CommitGate, type CommitGateOptions } from './commitGate.js';
-import { hostGit } from './gitx.js';
+import { assertSafeRepo, hostGit } from './gitx.js';
 import { createGates, type CreateGatesOptions } from './index.js';
 import { PUSH_PROTOCOLS, pushUrlProblem } from './prGate.js';
 import { ctx, FakeReviewer, FakeRunner, GIT_TEST_ENV, LEDGERS, liveGuard, makeRepo, manifest, NOW, prGrant, recordVerify, WRITERS, type Repo } from './testkit/fixtures.js';
@@ -238,6 +238,76 @@ describe('git transports are default-deny: only file, ssh and https', () => {
     tryRemote('https://example.invalid/acme/widget.git', (r, m) => r.g('config', `url.ext::sh -c touch% ${m} #.insteadOf`, 'https://example.invalid/')));
   it('a push URL rewritten by pushInsteadOf to plain http is refused', () => tryRemote('https://example.invalid/acme/widget.git', (r) => r.g('config', 'url.http://plain.invalid/.pushInsteadOf', 'https://example.invalid/')));
   it('an https URL carrying a password is refused', () => tryRemote('https://user:hunter2@127.0.0.1:9/acme/widget.git'));
+
+  it('a second push URL is refused before the grant is spent: gate.pr never pushes to a remote name', async () => {
+    for (const allowExt of [false, true]) {
+      const s = await committed();
+      const origin = bareOrigin(s.repo);
+      const marker = join(mkdtempSync(join(tmpdir(), 'tecera-transport-')), 'ran');
+      // `git push origin` would go to both: the checked bare repository and the program behind ext::
+      s.repo.g('config', '--add', 'remote.origin.pushurl', origin);
+      s.repo.g('config', '--add', 'remote.origin.pushurl', `ext::sh -c touch% ${marker}`);
+      if (allowExt) s.repo.g('config', 'protocol.ext.allow', 'always');
+      const ap = await prGrant(s.ledger, { sha: s.sha, requestId: `pr-two-${allowExt}` });
+      const r = await s.gates.pr(s.prCtx(ap));
+      expect(r, `protocol.ext.allow=${allowExt}`).toMatchObject({ exitCode: allowExt ? 9 : 8, reason: allowExt ? 'unsafe-repo' : 'transport-refused', terminal: true });
+      expect(existsSync(marker)).toBe(false);
+      expect((await s.ledger.getApproval(ap.requestId))!.state).toBe('granted');
+      expect(remoteRef(origin, 'refs/heads/tecera/g1')).toBeNull();
+      expect(existsSync(bundleDir(s))).toBe(false);
+    }
+    // two plain url values are two push destinations as well
+    const s = await committed();
+    const origin = bareOrigin(s.repo);
+    const other = mkdtempSync(join(tmpdir(), 'tecera-gates-origin-'));
+    execFileSync('git', ['init', '-q', '--bare', other], { env: GIT_TEST_ENV });
+    s.repo.g('config', '--add', 'remote.origin.url', other);
+    const ap = await prGrant(s.ledger, { sha: s.sha, requestId: 'pr-two-urls' });
+    expect(await s.gates.pr(s.prCtx(ap))).toMatchObject({ exitCode: 8, reason: 'transport-refused' });
+    expect((await s.ledger.getApproval(ap.requestId))!.state).toBe('granted');
+    expect(remoteRef(origin, 'refs/heads/tecera/g1')).toBeNull();
+    expect(remoteRef(other, 'refs/heads/tecera/g1')).toBeNull();
+  });
+
+  it('a repository-level protocol.<name>.allow is refused outright (it would beat protocol.allow=never)', async () => {
+    for (const key of ['protocol.ext.allow', 'protocol.evil.allow', 'protocol.allow']) {
+      const repo = makeRepo();
+      repo.g('config', key, 'always');
+      await expect(assertSafeRepo(repo.dir), key).rejects.toThrow(new RegExp(`config key ${key.replace(/\./g, '\\.')} \\(local\\) is not allowed`));
+    }
+    await expect(assertSafeRepo(makeRepo().dir)).resolves.toMatchObject({ objectFormat: 'sha1' });
+  });
+
+  it('the push reads no repository config: it goes to the one validated URL, by value, from an empty repository', async () => {
+    const s = await committed();
+    const origin = bareOrigin(s.repo);
+    const marker = join(mkdtempSync(join(tmpdir(), 'tecera-transport-')), 'ran');
+    // A second rewrite that applies only to the already-rewritten URL: a push run inside this repository
+    // would follow it to ext::, although the effective URL the gate checked is the bare repository.
+    s.repo.g('config', 'remote.origin.url', 'https://example.invalid/acme/widget.git');
+    s.repo.g('config', `url.${origin}.insteadOf`, 'https://example.invalid/acme/widget.git');
+    s.repo.g('config', `url.ext::sh -c touch% ${marker} #.insteadOf`, origin);
+    // Transport options a repository could set for its own pushes.
+    s.repo.g('config', 'push.pushOption', 'ci.skip');
+    s.repo.g('config', 'http.sslVerify', 'false');
+    const ap = await prGrant(s.ledger, { sha: s.sha, requestId: 'pr-clean' });
+    const r = await s.gates.pr(s.prCtx(ap));
+    expect(r).toMatchObject({ exitCode: 0, pushed: true, outcome: 'requested' });
+    expect(existsSync(marker)).toBe(false);
+    expect(remoteRef(origin, 'refs/heads/tecera/g1')).toBe(s.sha);
+    expect((await s.ledger.getApproval(ap.requestId))!.state).toBe('consumed');
+    // nothing was left behind in the delivered repository's config by the push
+    expect(s.repo.g('config', '--local', '--list')).not.toMatch(/^branch\.tecera\/g1\./m);
+  });
+
+  it('a relative local push URL still means a path next to the delivered repository', async () => {
+    const s = await committed();
+    const origin = bareOrigin(s.repo);
+    s.repo.g('config', 'remote.origin.url', relative(s.repo.dir, origin));
+    const ap = await prGrant(s.ledger, { sha: s.sha, requestId: 'pr-relative' });
+    expect(await s.gates.pr(s.prCtx(ap))).toMatchObject({ exitCode: 0, pushed: true });
+    expect(remoteRef(origin, 'refs/heads/tecera/g1')).toBe(s.sha);
+  });
 
   it('the git layer itself refuses every other transport (protocol.allow=never before file/ssh/https)', async () => {
     const repo = makeRepo();

@@ -21,7 +21,7 @@ import {
   type VerifyRunner,
 } from '@tecera/contracts';
 import { fileManifest, snapshotCandidate, type Candidate } from './candidate.js';
-import { commandCriteria, commandUsesResource, contractOf, criterionFidelity, inventoryById, LOCATED_KINDS, resourceEnvName, shellExports, withLedgerMocks } from './criteria.js';
+import { commandCriteria, commandUsesResource, contractOf, criterionFidelity, inventoryById, LOCATED_KINDS, NETWORK_KINDS, resourceEnvName, shellExports, withLedgerMocks } from './criteria.js';
 import { commandDigest, defaultIds, errMsg, GateMemo, IGNORED_BASELINE_VERSION, ignoredBaseline, ignoredBaselineKey, ignoredBaselineOf, keyPart, obj, redactorFrom, safeText, tail, writeEvidence } from './evidence.js';
 import { UnsafeRepo } from './gitx.js';
 import { EXIT, TOOLING_EXITS, type StepContext, type VerifyOutcomeKind, type VerifyResult } from './types.js';
@@ -56,10 +56,11 @@ import { EXIT, TOOLING_EXITS, type StepContext, type VerifyOutcomeKind, type Ver
  * it requires in GateContext.inventory. A capability GateContext lists as missing counts as mocked when the run's
  * ledger inventory records a stand-in for it (capability.mocked after the context was built). A required
  * capability that is missing proves nothing: the gate refuses (9) before anything runs and names the criterion.
- * A criterion that requires a provisioned sqlite / tmpdir / http-stub gets its locator in TECERA_RESOURCE_<ID>
+ * A criterion that requires a provisioned sqlite / tmpdir gets its locator in TECERA_RESOURCE_<ID>
  * (resourceEnvName) inside the contained process, and is proven at fidelity provisioned only when its command
  * names that variable or the locator; one that ignores the resource (its own :memory: or temp database) proves
- * nothing about it and is recorded mocked. A criterion that exits non-zero fails the step
+ * nothing about it and is recorded mocked. A provisioned http-stub is out of a criterion's reach (criteria run
+ * without network, NETWORK_KINDS): no locator is handed over and the criterion is recorded mocked. A criterion that exits non-zero fails the step
  * (1, retryable, named in failedCriteria) and the goal check does not run; a criterion that mutates the
  * tree, times out or cannot start is terminal like the goal check. A goal that names a contract while
  * GateContext carries none is refused (9).
@@ -182,9 +183,12 @@ export class VerifyGate {
     let evidenceKey: string | undefined;
     const proofs: CriterionProof[] = [];
     const failed: string[] = [...gaps];
-    if (!wt.ok || !chk.ok || !con.ok || gaps.length) {
+    // Criterion and review records are found under keys every reader derives from the run id (and the
+    // criterion id) as they are; an id carrying a registered secret cannot be keyed without leaking it.
+    const idSecret = this.secretId(ctx.runId, con.ok && con.contract ? commandCriteria(con.contract).map((k) => k.id) : []);
+    if (!wt.ok || !chk.ok || !con.ok || gaps.length || idSecret) {
       evidenceKey = `verify-refused:${keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}`)}:${this.ids()}`;
-      const why = !wt.ok ? wt.reason : !chk.ok ? chk.reason : !con.ok ? con.reason : `criteria ${gaps.join(', ')} require a capability the inventory lacks: nothing can prove them`;
+      const why = !wt.ok ? wt.reason : !chk.ok ? chk.reason : !con.ok ? con.reason : gaps.length ? `criteria ${gaps.join(', ')} require a capability the inventory lacks: nothing can prove them` : idSecret!;
       r = this.refused(why, { startedAt: this.now(), ...(con.ok && con.hash ? { contractHash: con.hash } : {}) });
     } else {
       const contract = con.contract;
@@ -207,7 +211,7 @@ export class VerifyGate {
         if (!contract) return null;
         return this.criteria(ctx, contract, con.hash!, before.fingerprint, evidenceKey, proofs, failed, view!);
       });
-      evidenceKey ??= `verify-refused:${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${this.ids()}`;
+      evidenceKey ??= `verify-refused:${keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}`)}:${this.ids()}`;
       if (prior) r.body.interruptedVerify = { key: prior.key, d1: prior.d1 };
       if (contract) {
         r.body.contractHash = con.hash!;
@@ -221,6 +225,13 @@ export class VerifyGate {
     // Proofs only for a step that passed as a whole: one per command criterion, all on `fingerprint`.
     if (con.ok && con.contract) return { ...out, criteria: r.outcome === 'passed' ? proofs : [], ...(failed.length ? { failedCriteria: [...failed] } : {}) };
     return out;
+  }
+
+  /** Why the run id or a criterion id cannot appear in an evidence key (it carries a registered secret), or null. */
+  private secretId(runId: string, criterionIds: readonly string[]): string | null {
+    if (keyPart(this.redactor, runId) !== runId) return 'the run id carries a registered secret: its evidence cannot be keyed without leaking it (fail closed)';
+    if (criterionIds.some((id) => keyPart(this.redactor, id) !== id)) return 'a criterion id carries a registered secret: its evidence cannot be keyed without leaking it (fail closed)';
+    return null;
   }
 
   /** Command criteria whose required capabilities the inventory cannot back (fidelityFor null). */
@@ -265,8 +276,10 @@ export class VerifyGate {
       const rec = view.inv.byId[id];
       if (rec?.state !== 'provisioned' || !LOCATED_KINDS.has(rec.kind)) continue;
       const res = rec.resourceId ? view.resources.get(rec.resourceId) : undefined;
-      if (res) env[resourceEnvName(id)] = res.locator;
-      if (!res || !commandUsesResource(k.check.command, id, res.locator)) unused.push(id);
+      // A resource behind the network is out of a criterion's reach (NETWORK_KINDS): no locator, never used.
+      const reachable = !NETWORK_KINDS.has(rec.kind);
+      if (res && reachable) env[resourceEnvName(id)] = res.locator;
+      if (!res || !reachable || !commandUsesResource(k.check.command, id, res.locator)) unused.push(id);
     }
     if (unused.length && fidelity !== null) fidelity = 'mocked';
     return { fidelity, env, unused };
@@ -301,7 +314,7 @@ export class VerifyGate {
         return { outcome: 'refused', reason: `criterion ${k.id}: its evidence key already holds another record`, exitCode: EXIT.human };
       }
       const why = drift ? `criterion ${k.id} saw another candidate than D1 (the tree changed)` : `criterion ${k.id}: ${c.reason}`;
-      await writeEvidence(this.o.ledger, this.redactor, { key: `verify-criterion:${ctx.runId}:${k.id}:${this.ids()}`, kind: 'gate.verify', runId: ctx.runId, body: { ...body, ...meta, outcome, ...(drift ? { exitCode: EXIT.human, terminal: true } : {}), reason: this.diag(why) } });
+      await writeEvidence(this.o.ledger, this.redactor, { key: `verify-criterion:${keyPart(this.redactor, `${ctx.runId}:${k.id}`)}:${this.ids()}`, kind: 'gate.verify', runId: ctx.runId, body: { ...body, ...meta, outcome, ...(drift ? { exitCode: EXIT.human, terminal: true } : {}), reason: this.diag(why) } });
       failed.push(k.id);
       if (outcome !== 'failed') return { outcome, reason: why, exitCode: drift ? EXIT.human : c.exitCode };
     }
@@ -375,10 +388,11 @@ export class VerifyGate {
    * goal's check when the run has one (else the manifest's verify command runs).
    */
   async baseline(ctx: { runId: string; worktree?: string; signal?: AbortSignal; check?: EnvironmentalCheck }): Promise<VerifyResult> {
-    const evidenceKey = `verify-baseline:${ctx.runId}:${this.ids()}`;
+    const evidenceKey = `verify-baseline:${keyPart(this.redactor, ctx.runId)}:${this.ids()}`;
     const wt = gateWorktree(ctx.worktree ?? this.o.worktree, this.o.worktree);
     const chk = resolveCheck(ctx.check !== undefined ? { check: ctx.check } : undefined, this.o.manifest);
-    const r = !wt.ok ? this.refused(wt.reason, { startedAt: this.now() }) : !chk.ok ? this.refused(chk.reason, { startedAt: this.now() }) : await this.runOnce(wt.dir, ctx.runId, chk.check, ctx.signal, false);
+    const idSecret = this.secretId(ctx.runId, []);
+    const r = idSecret ? this.refused(idSecret, { startedAt: this.now() }) : !wt.ok ? this.refused(wt.reason, { startedAt: this.now() }) : !chk.ok ? this.refused(chk.reason, { startedAt: this.now() }) : await this.runOnce(wt.dir, ctx.runId, chk.check, ctx.signal, false);
     if (r.before && r.outcome !== 'mutated' && r.outcome !== 'refused' && r.before.files.every((f) => f.status === '!')) {
       const existing = await ignoredBaseline(this.o.ledger, this.memo, ctx.runId);
       if (!existing) {

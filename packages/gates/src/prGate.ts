@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { accessSync, constants, statSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import {
   acceptedContractOf,
@@ -68,10 +69,12 @@ import { gateWorktree, resolveCheck } from './verifyGate.js';
  *  7. GateContext.approval is for exactly this PR — contracts prActionHash({intentionId, stepId, attempt,
  *     sha}) — granted by a human other than the requester, in this run and the gate's session, unexpired;
  *     the gate claims the delivery and consumes the grant itself, exactly once (8);
- *  8. when the worktree has an 'origin' remote, `git push -u origin refs/heads/<branch>` with hooks off, no
- *     credential helper, no prompts, ssh in BatchMode and every transport refused but file/ssh/https
- *     (protocol.allow=never first; a push that needs interactive auth fails: 9, fail closed); the remote ref
- *     is then read back and must be the sha;
+ *  8. when the worktree has an 'origin' remote, it must have exactly one push URL, on an allowed transport
+ *     (8 'transport-refused' otherwise, before the grant is spent). The sha is pushed to that URL by value,
+ *     `git push <url> <sha>:refs/heads/<branch>`, from an empty repository made for the push (the delivered
+ *     repository's config is never read by it), with hooks off, no credential helper, no prompts, ssh in
+ *     BatchMode and every transport refused but file/ssh/https (protocol.allow=never first; a push that
+ *     needs interactive auth fails: 9, fail closed); the remote ref is then read back and must be the sha;
  *  9. when gh is on PATH and `gh auth status` succeeds and the branch was pushed, `gh pr create --base <base>
  *     --head <branch> --title … --body-file -` with a body built from the run evidence (goal, proof,
  *     criteria and their fidelity, pending transfers, review verdict, cost line) → url (pr.opened);
@@ -144,6 +147,14 @@ export function pushUrlProblem(url: string): string | null {
   if (colon > 0 && (slash === -1 || colon < slash)) return /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+:[^:]/.test(url) ? null : 'push URL is neither a path nor an ssh address';
   return null;
 }
+/** True when a push URL pushUrlProblem accepted is a local path (no scheme, not scp-style ssh). */
+function localPath(url: string): boolean {
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(url)) return false;
+  const colon = url.indexOf(':');
+  const slash = url.indexOf('/');
+  return !(colon > 0 && (slash === -1 || colon < slash));
+}
+
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 /** Variables gh may see by default: nothing from the supervisor (no model keys). */
 const GH_ENV_KEYS = ['PATH', 'HOME', 'XDG_CONFIG_HOME', 'GH_CONFIG_DIR', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_HOST', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy'];
@@ -310,9 +321,17 @@ export class PrGate {
     // ---- where the branch would go: an allowed transport, decided before anything is spent ----
     const remote = this.o.remote ?? 'origin';
     const url = await this.remoteUrl(dir, remote);
-    const pushUrl = url ? await this.pushUrl(dir, remote) : null;
+    const pushUrls = url ? await this.pushUrls(dir, remote) : [];
+    // Exactly one destination: `git push <remote>` would deliver to every push URL the repository lists,
+    // checked or not. The push below goes to this one URL by value, never to the remote name.
+    const pushUrl = pushUrls.length === 1 ? pushUrls[0]! : null;
     if (url) {
-      const why = pushUrl ? pushUrlProblem(pushUrl) : 'the push URL cannot be read';
+      const why =
+        pushUrls.length > 1
+          ? `remote ${remote} has ${pushUrls.length} push URLs; gate.pr delivers to exactly one`
+          : pushUrl
+            ? pushUrlProblem(pushUrl)
+            : 'the push URL cannot be read';
       if (why) return fail(EXIT.policy, 'transport-refused', { remote, why });
     }
 
@@ -361,7 +380,7 @@ export class PrGate {
     if (url) {
       const lost = await fenced();
       if (lost) return lost;
-      const p = await this.push(dir, remote, branch, sha, ctx.signal);
+      const p = await this.push(dir, pushUrl!, branch, sha, ctx.signal);
       if (!p.ok) {
         // Fail closed (auth needed, rejected, unreachable). Leave the human a bundle to deliver by hand.
         const lost = await fenced();
@@ -632,28 +651,54 @@ export class PrGate {
     return u || null;
   }
 
-  /** The URL a push to `remote` would use, after insteadOf / pushInsteadOf rewriting, or null. */
-  private async pushUrl(dir: string, remote: string): Promise<string | null> {
-    const u = (await hostGit(dir, ['remote', 'get-url', '--push', remote]).catch(() => '')).split('\n')[0]!.trim();
-    return u || null;
+  /**
+   * Every URL a push to `remote` would use (all of remote.<name>.pushurl, else all of its url), after
+   * insteadOf / pushInsteadOf rewriting. Empty when they cannot be read.
+   */
+  private async pushUrls(dir: string, remote: string): Promise<string[]> {
+    const out = await hostGit(dir, ['remote', 'get-url', '--push', '--all', remote]).catch(() => '');
+    return out.split('\n').map((l) => l.trim()).filter((l) => l !== '');
   }
 
-  /** Push the work branch (never forced, never the base). Fails closed on any prompt need. */
-  private async push(dir: string, remote: string, branch: string, sha: string, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; detail: string }> {
+  /**
+   * Push the committed sha to the work branch at `url` (never forced, never the base). Fails closed on any
+   * prompt need.
+   *
+   * The push does not run in the delivered repository: its config is the one thing a gate cannot switch off,
+   * and it can name further destinations (several pushurl values), rewrite the URL again (url.*.insteadOf),
+   * allow a transport (protocol.<name>.allow) or set transport options (http.*, push.*). It runs in an empty
+   * bare repository made for this push, whose only config is git's own, with the delivered repository's
+   * objects as an alternate; the destination is the one validated URL, by value. Global and system config
+   * are off (gitEnv), every transport but file, ssh and https is refused (PUSH_PROTOCOLS), credential helpers
+   * are cleared and ssh runs as GIT_SSH_COMMAND below (batch mode, strict host keys), which git prefers over
+   * any core.sshCommand.
+   */
+  private async push(dir: string, url: string, branch: string, sha: string, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; detail: string }> {
     const sig = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.o.timeoutMs ?? 120_000)]);
-    const env: Record<string, string> = {
-      GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o StrictHostKeyChecking=yes',
-      ...(process.env.SSH_AUTH_SOCK ? { SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK } : {}),
-    };
     const ref = `refs/heads/${branch}`;
+    let clean: string | null = null;
     try {
-      await hostGit(dir, [...PUSH_PROTOCOLS, 'push', '--no-verify', '--porcelain', '-u', remote, `${ref}:${ref}`], { env, signal: sig });
-      const ls = await hostGit(dir, [...PUSH_PROTOCOLS, 'ls-remote', remote, ref], { env, signal: sig });
+      const objects = resolve(dir, (await hostGit(dir, ['rev-parse', '--git-path', 'objects'], { signal: sig })).trim());
+      const format = (await hostGit(dir, ['rev-parse', '--show-object-format'], { signal: sig })).trim();
+      if (format !== 'sha1' && format !== 'sha256') return { ok: false, detail: `unsupported object format ${format}` };
+      clean = await mkdtemp(join(tmpdir(), 'tecera-gates-push-'));
+      await hostGit(clean, ['init', '-q', '--bare', '--template=', `--object-format=${format}`, '.'], { signal: sig });
+      const env: Record<string, string> = {
+        GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o StrictHostKeyChecking=yes',
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: objects,
+        ...(process.env.SSH_AUTH_SOCK ? { SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK } : {}),
+      };
+      // A relative local path means what it meant in the delivered repository.
+      const to = localPath(url) && !isAbsolute(url) ? resolve(dir, url) : url;
+      await hostGit(clean, [...PUSH_PROTOCOLS, 'push', '--no-verify', '--porcelain', to, `${sha}:${ref}`], { env, signal: sig });
+      const ls = await hostGit(clean, [...PUSH_PROTOCOLS, 'ls-remote', to, ref], { env, signal: sig });
       const got = ls.split('\n').find((l) => l.endsWith(`\t${ref}`))?.split('\t')[0];
       if (got !== sha) return { ok: false, detail: `remote ${ref} is ${got ?? 'absent'} after the push, not ${sha}` };
       return { ok: true };
     } catch (err) {
       return { ok: false, detail: safeText(this.redactor, errMsg(err)).slice(0, 2000) };
+    } finally {
+      if (clean) await rm(clean, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 

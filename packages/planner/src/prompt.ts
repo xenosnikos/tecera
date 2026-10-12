@@ -243,7 +243,11 @@ function existingApiRules(i: PlannerPromptInput): string[] {
 const MESSAGE_FAMILY = /^(mail|email|smtp|message|messaging|sms|chat|webhook|notification|queue)$/i;
 const STORE_FAMILY = /^(kv|store|database|db|sql|sqlite|postgres|mysql|redis)$/i;
 /** Provisioned kinds whose locator a contained criterion and the code under test read from the environment. */
-const LOCATED_KINDS = new Set(['sqlite', 'tmpdir', 'http-stub']);
+/** Provisioned kinds a criterion's own process opens by location. An http-stub is not one: criteria run without network. */
+const LOCATED_KINDS = new Set(['sqlite', 'tmpdir']);
+/** Provisioned kinds only the worker's tool reaches (the host's loopback); a criterion that requires one proves it as mocked. */
+const NETWORK_KINDS = new Set(['http-stub']);
+const NETWORK_NOTE = 'the criteria run without network and cannot reach it: the code takes its HTTP client or base URL through its own seam, the criteria inject a fake there, and a criterion that requires it is proven only as mocked (the goal is then provisional)';
 
 /** The variable a provisioned resource's locator is exported as for the criteria that require it. */
 export function resourceEnvName(capability: string): string {
@@ -264,14 +268,14 @@ function capabilityTools(i: PlannerPromptInput): string[] {
     const name = `\`${id}\` (${kind})`;
     if (rung === 'available') out.push(`  - ${name} is available: the code uses it as the repository already does.`);
     else if (rung === 'provisioned') {
-      const via = [tool ? `worker tool \`${id}\` reaches it` : '', LOCATED_KINDS.has(kind) ? `the code under test and the criteria read its location from \`${resourceEnvName(id)}\`` : kind === 'git-remote' ? 'the PR delivery pushes to it' : ''].filter(Boolean).join('; ');
+      const via = [tool ? `worker tool \`${id}\` reaches it` : '', LOCATED_KINDS.has(kind) ? `the code under test and the criteria read its location from \`${resourceEnvName(id)}\`` : NETWORK_KINDS.has(kind) ? NETWORK_NOTE : kind === 'git-remote' ? 'the PR delivery pushes to it' : ''].filter(Boolean).join('; ');
       out.push(`  - ${name} is provisioned by Tecera${via ? `: ${via}` : ''}.${tool ? ` ${ownOnly(id)}` : ''}`);
     } else if (rung === 'mock') {
       const methods = MESSAGE_FAMILY.test(kind) ? 'send(message), outbox()' : STORE_FAMILY.test(kind) ? 'get/set/delete/list, insert/select/update/remove' : 'its declared methods';
       const seams = seamsFor(i.repo, kind, id);
       const seam = seams.length ? seams.map((x) => `\`${x.path}\` of \`${x.declared}\` in \`${x.module}\``).join('; ') : 'an injected dependency the existing code takes, e.g. a `deps.mailer` argument; an analysis step names it from the code';
       out.push(`  - ${name} is missing: worker tool \`${id}\` is a simulated stand-in (${methods}); nothing real happens, and a goal resting on it is provisional, never achieved. ${ownOnly(id)} The code reaches the capability through the repository's own seam (${seam}), and the criteria inject a fake through that seam: the instruction names the seam, never the tool, as what the code calls.`);
-    } else if (rung === 'provision') out.push(`  - ${name} is missing and is provisioned before the work starts: ${tool ? `worker tool \`${id}\`; ` : ''}${LOCATED_KINDS.has(kind) ? `the code and criteria read its location from \`${resourceEnvName(id)}\`` : 'the host uses it'}.${tool ? ` ${ownOnly(id)}` : ''}`);
+    } else if (rung === 'provision') out.push(`  - ${name} is missing and is provisioned before the work starts: ${tool ? `worker tool \`${id}\`; ` : ''}${LOCATED_KINDS.has(kind) ? `the code and criteria read its location from \`${resourceEnvName(id)}\`` : NETWORK_KINDS.has(kind) ? NETWORK_NOTE : 'the host uses it'}.${tool ? ` ${ownOnly(id)}` : ''}`);
     else out.push(`  - ${name} is missing and cannot be stood in for: a human is asked.`);
   }
   if (routes.some((x) => x.tool)) out.push('- A step instruction that tells the worker to use such a tool from the code ("send it using the mail tool", `mail.send(…)` in src) is refused. So is a plan for a stood-in capability with a seam named above whose instructions never name that seam.');
@@ -418,7 +422,7 @@ function repoSection(repo: RepoFacts | undefined, r: Redactor): string[] {
     deps === null
       ? '- Import only Node built-ins and packages the repository already lists in package.json.'
       : `- Packages the repository installs (package.json): ${deps.length ? deps.slice(0, 40).map((d) => `\`${safeText(d, r, 80)}\``).join(', ') : 'none'}. A criterion that imports any other package can never pass: use the built-ins.`,
-    `- A capability Tecera provisions (a database file, a temporary directory, an HTTP stub) is reached through the variable \`TECERA_RESOURCE_<ID>\` (the capability id upper-cased, e.g. \`${resourceEnvName('db')}\` for \`db\`): a criterion that requires it opens exactly that location; one that opens its own \`:memory:\` or temporary database proves nothing about the capability.`,
+    `- A capability Tecera provisions as a database file or a temporary directory is reached through the variable \`TECERA_RESOURCE_<ID>\` (the capability id upper-cased, e.g. \`${resourceEnvName('db')}\` for \`db\`): a criterion that requires it opens exactly that location; one that opens its own \`:memory:\` or temporary database proves nothing about the capability. A provisioned HTTP stub listens on the host and is out of a criterion's reach (no network): only the worker's tool calls it.`,
   ];
   const api = apiLines(repo, r);
   if (api.length) {
@@ -473,7 +477,7 @@ export function buildContractPrompt(i: ContractPromptInput): LLMMessage[] {
     `- \`command\`: a shell command run in the repository root that exits 0 exactly when the behaviour holds. It must FAIL on the repository as it is now and PASS once the work is done. Timeout at most ${MAX_CRITERION_TIMEOUT_SEC}s.`,
     "- Write each command as an inline assertion that runs the behaviour: `node --input-type=module -e 'import assert from \"node:assert/strict\"; import { fn } from \"./src/module.js\"; assert.equal(fn(input), expected);'` (await works at the top level; spawn a CLI with node:child_process spawnSync), or a focused existing test (`node --test test/<file>.test.js`).",
     '- Criterion commands may only run code that exists or that the work itself will add to the code; they never run test files the work would write (a worker may not edit what a criterion runs).',
-    '- The verify sandbox has no network and a criterion\'s exit status must be the check\'s own. A criterion calls the code in-process: it imports the module and calls the function or handler with its input, as the existing tests do. It never starts a server and fetches it, never uses `&` or a background job, `sleep`, `kill` or `wait`, and never reaches the network (`fetch`, `http.request`, `curl`, `wget`, `localhost`, `127.0.0.1`, a port); time is passed in or faked, never waited for (no timer of a second or more). The script is passed with `-e`, never piped to the interpreter or wrapped in another shell, and it imports the names it calls (`import { name } from "./src/module.js"`) and calls them directly. Such a criterion is refused.',
+    '- The verify sandbox has no network and a criterion\'s exit status must be the check\'s own. A criterion calls the code in-process: it imports the module and calls the function or handler with its input, as the existing tests do. It never starts a server and fetches it, never uses `&` or a background job, `sleep`, `kill` or `wait`, and never reaches the network (`fetch`, `http.request`, `curl`, `wget`, `localhost`, `127.0.0.1`, a port); time is passed in or faked, never waited for (no timer of a second or more). The script is passed with `-e`, never piped to the interpreter or wrapped in another shell, and it imports the names it calls (`import { name } from "./src/module.js"`) and calls them directly. The command is that one check, at most after setup steps joined with `&&`: never `|`, `||`, `;`, `!`, `exit`, `trap`, `if` or `$(…)` around it (`check | tail`, `check || echo failed` and `check; echo done` exit 0 whatever the check found), and never a program the host cannot read as a check (only the interpreter, a test runner on a test file or a repository script). Such a criterion is refused.',
     `- Never a text search or a file check (grep, rg, ls, test -f, cat): a keyword proves nothing. Never only the whole suite: \`${verify}\` (or a bare test runner) may appear once, as the "existing behaviour unchanged" criterion, beside focused ones. Never \`true\`, \`exit 0\` or \`echo\`.`,
     '- `human`: a yes/no question for a human reviewer, only for what no command can judge. A contract needs at least one command criterion; human judgments alone prove nothing.',
     '- `tags`: short lowercase kebab-case names of what the criterion checks: `http-<status>` for a status code, the header name in lowercase, `<thing>-<behaviour>` (e.g. `orders-persist`), `<thing>-unchanged` for a regression guard, `per-<scope>`, `configurable-<thing>`.',

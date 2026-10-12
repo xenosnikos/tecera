@@ -22,6 +22,7 @@ import { deepSecretKind, inertDepth, MAX_PLAN_DEPTH, patternRedactor, UNSCANNABL
 import { extractFirstJsonObject } from './parse.js';
 import { MAX_TAGS, normalizeTag, type ImpliedNeed } from './quality.js';
 import { CAPABILITY_ID_RE, formatZodIssues, safeSegment } from './schema.js';
+import { base, readShell, type ShellNode } from './shell.js';
 
 /**
  * Acceptance contracts at the planner seat (owner decision D8).
@@ -59,10 +60,91 @@ const TRIVIAL_INTERPRETER = /^\s*(?:node|python3?)\s+(?:-e|-c)\s+(['"])\s*(?:pro
 /** A head, tail or branch that forces success: `true || …`, `… || true`, `…; exit 0`, `… | true`, `… || exit 0 …`. */
 const FORCED_SUCCESS = [/^\s*(?:true|:|!\s*false)\s*\|\|/, /(?:\|\||;|\|)\s*(?:true|:|exit\s+0)\s*;?\s*$/, /(?:^|;|\|\|)\s*exit\s+0\b/];
 
+/** Programs that exit 0 whatever they are given. */
+const EXITS_ZERO = new Set(['true', ':', 'echo', 'printf', 'tee', 'tr', 'pwd', 'export', 'unset', 'set']);
+/** Filters that exit 0 on anything piped to them, when they are handed no file of their own. */
+const PASSES_THROUGH = new Set(['tail', 'head', 'cat', 'wc', 'sort', 'uniq', 'cut', 'nl']);
+
+/** True when a simple command (unwrapped words) exits 0 whatever the repository holds. `piped`: it reads a pipe. */
+function exitsZero(w: readonly string[], piped: boolean): boolean {
+  const prog = base(w[0]!);
+  const args = w.slice(1);
+  if (EXITS_ZERO.has(prog)) return true;
+  if (PASSES_THROUGH.has(prog)) return piped && args.every((a) => a.startsWith('-') || /^\+?\d+$/.test(a));
+  if (prog === 'exit') return args.length === 1 && /^0+$/.test(args[0]!);
+  // `test 1`, `[ ok ]`: a constant.
+  const operand = prog === 'test' ? args : prog === '[' && args[args.length - 1] === ']' ? args.slice(0, -1) : null;
+  return operand !== null && operand.length === 1 && /^[A-Za-z0-9_.-]+$/.test(operand[0]!);
+}
+
+const programOf = (n: ShellNode): string => (n.kind === 'command' && n.words.length ? base(n.words[0]!) : '');
+
+/**
+ * Whether a parsed command line can exit non-zero at all, by the shell's own rules: a pipeline exits as its
+ * last stage, `a || b` fails only when both can, `a && b` when either can, a `;` list exits as its last
+ * command (as any of them under `set -e`), a background job always exits 0.
+ */
+function canFail(n: ShellNode, piped = false): boolean {
+  switch (n.kind) {
+    case 'command':
+      // Assignments alone exit 0, unless one runs a command substitution.
+      return n.words.length ? !exitsZero(n.words, piped) : n.subs.length > 0;
+    case 'group':
+      return canFail(n.body);
+    case 'pipeline': {
+      const last = n.stages[n.stages.length - 1]!;
+      if (n.negated) return programOf(last) !== 'false';
+      return canFail(last, n.stages.length > 1);
+    }
+    case 'and':
+      return canFail(n.left) || canFail(n.right);
+    case 'or':
+      return canFail(n.left) && canFail(n.right);
+    case 'list': {
+      let errexit = n.errexit;
+      let earlier = false;
+      for (let i = 0; i < n.items.length; i++) {
+        const item = n.items[i]!;
+        const last = i === n.items.length - 1;
+        const stops = item.kind === 'command' && programOf(item) === 'exit' && exitsZero(item.words, false);
+        if (stops || (last && n.background[i])) return earlier;
+        if (n.background[i]) continue;
+        if (last) return earlier || canFail(item);
+        if (errexit && canFail(item)) earlier = true;
+        if (item.kind === 'command' && programOf(item) === 'set') {
+          const a = item.words.slice(1);
+          if (a.some((x, j) => /^-[A-Za-z]*e/.test(x) || (x === '-o' && a[j + 1] === 'errexit'))) errexit = true;
+          if (a.some((x, j) => /^\+[A-Za-z]*e/.test(x) || (x === '+o' && a[j + 1] === 'errexit'))) errexit = false;
+        }
+      }
+      return earlier;
+    }
+  }
+}
+
+/**
+ * True when the shell structure of `cmd` leaves it no way to exit non-zero: the check's status is replaced by
+ * a command that always succeeds (`check || echo failed`, `check && echo PASS || echo FAIL`, `check | tail -5`,
+ * `check | tee log`, `check; echo done`, `check || /bin/true`, `check || (exit 0)`, `check &`), also behind
+ * known prefixes and inside nested shells (`timeout 5 true`, `sh -c 'check; echo ok'`). A line the reader
+ * cannot follow (control flow, unreadable syntax) is not judged here.
+ */
+function cannotFail(cmd: string): boolean {
+  try {
+    const read = readShell(cmd);
+    if (read.marks.has('unreadable') || read.marks.has('control')) return false;
+    return !canFail(read.tree);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * True when `cmd` exits 0 whatever the repository holds. A coarse screen, not a proof: it catches the plain
- * no-ops, their shell and interpreter wrappers, and a success forced by the command's tail; a disguised no-op
- * still reaches the requestor, whose sign-off is the authority on what each criterion checks.
+ * no-ops, their shell and interpreter wrappers, and a success forced by the shell around the check (a
+ * fallback, a pipe into a filter, a trailing command: cannotFail); a disguised no-op still reaches the
+ * requestor, whose sign-off is the authority on what each criterion checks. The stricter screen over a
+ * drafted criterion's exit status is quality commandStatusProblems.
  */
 export function commandAlwaysPasses(cmd: string): boolean {
   let c = cmd;
@@ -72,7 +154,7 @@ export function commandAlwaysPasses(cmd: string): boolean {
     c = w[2]!;
   }
   if (TRIVIAL_COMMAND.test(c) || TRIVIAL_INTERPRETER.test(c)) return true;
-  return FORCED_SUCCESS.some((re) => re.test(c));
+  return FORCED_SUCCESS.some((re) => re.test(c)) || cannotFail(cmd);
 }
 
 /** The draft was refused after every attempt. `issues` are sanitised (redacted, single-line, bounded). */
@@ -303,7 +385,7 @@ export function contractDraftIssues(draft: ContractDraft, c: Pick<DraftContext, 
         if (cmd.length > MAX_COMMAND_CHARS) issues.push(`criterion ${id}: command is longer than ${MAX_COMMAND_CHARS} characters`);
         // eslint-disable-next-line no-control-regex
         if (/[\u0000-\u001f\u007f]/.test(cmd)) issues.push(`criterion ${id}: command must be one line without control characters`);
-        if (commandAlwaysPasses(cmd)) issues.push(`criterion ${id}: command exits 0 whatever the repository holds; it checks nothing`);
+        if (commandAlwaysPasses(cmd)) issues.push(`criterion ${id}: command exits 0 whatever the repository holds; it checks nothing (the exit status must be the check's own: no "|| …", "| tail", "; echo" or "exit 0" around it)`);
         if (x.check.timeoutSec > MAX_CRITERION_TIMEOUT_SEC) issues.push(`criterion ${id}: timeout ${x.check.timeoutSec}s exceeds ${MAX_CRITERION_TIMEOUT_SEC}s`);
       } else if (x.check.prompt.length > MAX_STATEMENT_CHARS) {
         issues.push(`criterion ${id}: prompt is longer than ${MAX_STATEMENT_CHARS} characters`);

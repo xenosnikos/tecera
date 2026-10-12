@@ -191,6 +191,18 @@ describe('ReflexRouter', () => {
     expect((await stop.route('reconsider', { state: asState({ commitment: 'single-minded', eventKind: 'belief.added', invalidatesContext: true, goalChanged: false }) })).result.answer.interrupt).toBe(true);
   });
 
+  it('an answer that labels itself provider rules is clamped like any model answer: the label never skips the no-less-safe rule', async () => {
+    const sink = new RecordingSink();
+    const mislabelled = (answer: unknown): Reflex => ({ ask: async (seam: ReflexSeam) => ({ seam, answer: answer as never, confidence: 0.99, provider: 'rules', abstained: false }) }) as unknown as Reflex;
+    const irreversible = { state: asState({ tool: 'gate.pr', risk: 'irreversible', permission: 'requiresApproval' }), options: [{ decision: 'allow' as const }, { decision: 'hold' as const }, { decision: 'block' as const }] };
+    const gate = new ReflexRouter({ settings: { ...allRule, gate: 'model' }, threshold: 0.6 }, { sink, runId: 'r', model: mislabelled({ decision: 'allow' }) });
+    expect((await gate.route('gate', irreversible)).result.answer.decision).toBe('hold');
+    const close = new ReflexRouter({ settings: { ...allRule, closeOut: 'model' }, threshold: 0.6 }, { sink, runId: 'r', model: mislabelled({ achieved: true }) });
+    expect((await close.route('closeOut', { state: asState({ stepKind: 'gate.verify', exitCode: 1 }) })).result.answer.achieved).toBe(false);
+    const keep = new ReflexRouter({ settings: { ...allRule, reconsider: 'model' }, threshold: 0.6 }, { sink, runId: 'r', model: mislabelled({ interrupt: false }) });
+    expect((await keep.route('reconsider', { state: asState({ commitment: 'single-minded', eventKind: 'belief.added', invalidatesContext: true, goalChanged: false }) })).result.answer.interrupt).toBe(true);
+  });
+
   it('D2/L5-F2: a rule closeOut below threshold (unchecked change) escalates to the frontier, which may only refuse it', async () => {
     const sink = new RecordingSink();
     const asked: string[] = [];

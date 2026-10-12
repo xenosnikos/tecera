@@ -171,6 +171,54 @@ describe('approval (security.md §6; D1 local principal, D6 PR gate)', () => {
     expect(prEvents(await h.flow.events())).toHaveLength(1);
   }, 240_000);
 
+  it('approval.self_approve [flag before the subcommand]: no spelling of the command line gets an agent through the host pre-tool hook to approve, sign-off, learning or resources; the request stays pending', async () => {
+    const h = await prHold();
+    const id = h.requestId;
+    const attempts = [
+      // the CLI gives the word after a value flag to the flag and dispatches what follows
+      `tecera --reason gate approve ${id}`,
+      `tecera --as status approve ${id}`,
+      `tecera --as=status approve ${id}`,
+      `tecera --run gate approve ${id} --as reviewer-human --yes`,
+      `tecera --manifest validate approve ${id}`,
+      `tecera --rationale why approve ${id}`,
+      `tecera --yes approve ${id}`,
+      `tecera -y approve ${id}`,
+      `tecera -- approve ${id}`,
+      `tecera status -- approve ${id}`,
+      `tecera --reason "gate" approve ${id}`,
+      `tecera 'approve' ${id}`,
+      `tecera status; tecera approve ${id}`,
+      `tecera status && tecera approve ${id}`,
+      `tecera status | tecera approve ${id}`,
+      `echo $(tecera approve ${id})`,
+      `(tecera approve ${id})`,
+      `USER=reviewer-human tecera approve ${id}`,
+      `env tecera approve ${id}`,
+      `node node_modules/.bin/tecera approve ${id}`,
+      `./node_modules/.bin/tecera approve ${id}`,
+      `sh -c "tecera approve ${id}"`,
+      `tecera --reason status criteria accept ${h.runId}`,
+      `tecera --reason status criteria amend ${h.runId} --file c.json`,
+      `tecera --rationale why plans graduate p1`,
+      `tecera --rationale why memory graduate m1`,
+      `tecera --run gate resources release res_1`,
+      `tecera --run gate resources transfer res_1 --to me`,
+      `tecera --reason gate deny ${id}`,
+      `tecera --run gate run --resume ${h.runId}`,
+    ];
+    for (const cmd of attempts) {
+      const r = await preToolBash(h.dir, cmd);
+      expect(r.code, `pre-tool hook let an agent run: ${cmd}\n${r.out}${r.err}`).toBe(2);
+    }
+    // the read-only commands an agent does have still pass, in the one spelling the hook reads
+    for (const cmd of ['tecera status', 'tecera status --json', `tecera status --run ${h.runId}`, 'tecera gate fix-failing-test', 'tecera validate']) {
+      expect((await preToolBash(h.dir, cmd)).code, cmd).toBe(0);
+    }
+    expect(await approvalState(h.dir, id)).toBe('pending');
+    await nothingDelivered(h);
+  }, 240_000);
+
   it('approval.replay', async () => {
     const { l } = ledger();
     await l.requestApproval(req());

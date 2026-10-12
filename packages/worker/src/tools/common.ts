@@ -94,7 +94,10 @@ export function combinedSignal(ctx: ToolContext, guard: WriteGuard): AbortSignal
   return s ? AbortSignal.any([s, guard.signal]) : guard.signal;
 }
 
-/** Refuse when the step has no worktree (contract: '' = refuse every file and verify tool) or it is quarantined. */
+/**
+ * Refuse when the step has no worktree (contract: '' = refuse every file and verify tool) or it is
+ * quarantined, by whoever recorded it (file tools, broker, REPL or verify run: one registry).
+ */
 export function assertWorktree(ctx: ToolContext): void {
   if (typeof ctx.worktree !== 'string' || ctx.worktree.length === 0) throw new ToolInputError('no worktree is configured for this step; file and verify tools are refused');
   const t = worktreeTaint(ctx.worktree);

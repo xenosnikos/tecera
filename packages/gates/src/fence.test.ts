@@ -84,7 +84,8 @@ describe.each(LEDGERS)('commit gate write guard (%s)', (_n, mk) => {
     expect((await ok.gates.commit(ok.commitCtx({ guard: probe.guard }))).exitCode).toBe(0);
     const total = probe.checks;
     // hash-object (1 change) + write-tree + intent claim + commit-tree + update-ref + symbolic-ref + read-tree
-    expect(total).toBeGreaterThanOrEqual(7);
+    // The exact count pins every check in place: removing one (say the check before update-ref) changes it.
+    expect(total).toBe(8);
     for (let n = 1; n <= total; n++) {
       const g = liveGuard();
       let seen = 0;
@@ -97,6 +98,15 @@ describe.each(LEDGERS)('commit gate write guard (%s)', (_n, mk) => {
       expect(await s.ledger.getEvidence('commit:run1:i1:c:0'), `check ${n}`).toBeNull();
       // HEAD never moves unless the symbolic-ref check passed, which is one of the last two checks.
       if (n < total - 1) expect(s.repo.g('symbolic-ref', 'HEAD').trim(), `check ${n}`).toBe('refs/heads/main');
+      // The work branch exists only once the update-ref check (third from last) passed: a holder revoked at
+      // or before it never moved the branch.
+      let branch = true;
+      try {
+        s.repo.g('rev-parse', '--verify', '--quiet', 'refs/heads/tecera/g1');
+      } catch {
+        branch = false;
+      }
+      expect(branch, `check ${n}: work branch`).toBe(n > total - 2);
     }
   });
 

@@ -212,6 +212,9 @@ export class ReviewGate {
     }
     const wt = gateWorktree(ctx.worktree, this.o.worktree);
     if (!wt.ok) return refuse('no-worktree', wt.reason);
+    // The verdict is found under reviewEvidenceKey(run, D1) by every reader: a run id carrying a registered
+    // secret cannot be keyed without leaking it.
+    if (keyPart(this.redactor, ctx.runId) !== ctx.runId) return refuse('incomplete-packet', 'the run id carries a registered secret: its review cannot be keyed without leaking it (fail closed)');
     const dir = wt.dir;
     const baseline = await ignoredBaseline(ledger, this.memo, ctx.runId);
 

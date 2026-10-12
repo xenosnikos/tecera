@@ -207,7 +207,8 @@ function scenario(o: Opts = {}) {
   else b.add('goal.achieved', { goal: goal as unknown as JsonObject, proof: proof as unknown as JsonObject }, g);
   o.after?.(b);
   const fp = o.evidenceFingerprint === null ? undefined : (o.evidenceFingerprint ?? 'fp1');
-  const evidence = [rec('v1', body(CHECK.command, fp)), rec(criterionEvidenceKey(RUN, 'db', 'fp1'), body('node db.js', 'fp1', { criterionId: 'db' }))];
+  // Criterion evidence records the fidelity the verify gate measured (a record without one supports only 'mocked').
+  const evidence = [rec('v1', body(CHECK.command, fp, { fidelity: 'real' })), rec(criterionEvidenceKey(RUN, 'db', 'fp1'), body('node db.js', 'fp1', { criterionId: 'db', fidelity: dbFid }))];
   return { events: b.list, evidence, hash: h, contract: c, proof };
 }
 
@@ -545,6 +546,13 @@ describe('provenAchievement: the single-source "proven achieved" decision', () =
     const v = provenAchievement(s.events, mockedAtVerify, { runId: RUN, goalId: 'g' });
     expect(v.achieved).toBe(false);
     expect(v.why).toMatch(/criterion db claims provisioned, its verify evidence recorded mocked/);
+    // evidence that records no fidelity (absent, null or malformed) measured nothing: it never supports more than mocked
+    for (const fidelity of [undefined, null, 'MOCKED', 7] as const) {
+      const unmeasured = s.evidence.map((r) => (r.key === criterionEvidenceKey(RUN, 'db', 'fp1') ? rec(r.key, body('node db.js', 'fp1', { criterionId: 'db', ...(fidelity === undefined ? {} : { fidelity }) })) : r));
+      const u = provenAchievement(s.events, unmeasured, { runId: RUN, goalId: 'g' });
+      expect(u.achieved, String(fidelity)).toBe(false);
+      expect(u.why, String(fidelity)).toMatch(/criterion db claims provisioned, its verify evidence records no fidelity/);
+    }
     // the same recorded fidelity, or a weaker claim, stands
     const asRecorded = s.evidence.map((r) => (r.key === criterionEvidenceKey(RUN, 'db', 'fp1') ? rec(r.key, body('node db.js', 'fp1', { criterionId: 'db', fidelity: 'provisioned' })) : r));
     expect(provenAchievement(s.events, asRecorded, { runId: RUN, goalId: 'g' }).achieved).toBe(true);

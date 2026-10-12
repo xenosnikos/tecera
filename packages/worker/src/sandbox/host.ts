@@ -702,7 +702,17 @@ class ExecSession {
     );
     child.stdout?.on('data', (c: Buffer) => this.reader?.push(c));
     child.stderr?.on('data', (c: Buffer) => this.onStderr(c));
+    // The exit status is recorded at 'exit'. finalize() waits for 'exit' (waitExit, killTree), not for
+    // 'close', which comes only after the stdio pipes have drained and may be later than the report.
+    child.once('exit', (code, sig) => this.recordExit(code, sig));
     child.on('close', (code, sig) => this.onClose(code, sig));
+  }
+
+  /** The child's exit status, written once (from 'exit', 'close', or the handle when neither was seen yet). */
+  private recordExit(code: number | null, sig: NodeJS.Signals | null): void {
+    if (this.trace.exit) return;
+    if (typeof code !== 'number' && typeof sig !== 'string') return;
+    this.trace.exit = { code: typeof code === 'number' ? code : null, signal: typeof sig === 'string' ? sig : null };
   }
 
   private onStderr(c: Buffer): void {
@@ -719,7 +729,7 @@ class ExecSession {
   }
 
   private onClose(code: number | null, sig: NodeJS.Signals | null): void {
-    this.trace.exit = { code, signal: sig };
+    this.recordExit(code, sig);
     if (this.finished) return;
     if (this.cancelRequested) return this.stop('E_CANCELLED', 'exec cancelled', 'cancel');
     const err = Buffer.concat(this.stderr).toString('utf8');
@@ -1125,6 +1135,8 @@ class ExecSession {
       const k0 = await killTree(child.pid, { child }).catch((): KillTreeResult => ({ gone: false, signalled: false }));
       const k = this.opts.testKillOverride ? this.opts.testKillOverride(k0) : k0;
       gone = k.gone;
+      // A child that has exited by now has its status in the trace before the trace is reported.
+      this.recordExit(child.exitCode, child.signalCode);
       if (cause !== 'result') {
         this.trace.killed = { cause, gone: k.gone };
         this.evidence({ kind: 'sandbox.kill', execNo: this.req.execNo, body: { cause, gone: k.gone } });

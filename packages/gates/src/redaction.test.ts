@@ -149,6 +149,41 @@ describe.each(LEDGERS)('a registered secret inside a run or intention id never r
   });
 });
 
+describe.each(LEDGERS)('a registered secret in a RUN id, or on a refused path, never reaches an evidence key or a result (%s)', (_n, mk) => {
+  it('an intention id with a secret on the refused-verify path (unsafe repository): the fallback key carries a digest', async () => {
+    const repo = makeRepo();
+    repo.g('config', 'core.hooksPath', '.hooks');
+    const spy = new SpyLedger(mk());
+    const g = createGates({ manifest: manifest(), ledger: spy.inner, verifyRunner: new FakeRunner(), reviewer: new FakeReviewer('openai'), writers: WRITERS, worktree: repo.dir, now: () => NOW, sessionId: 's1', secrets: [KNOWN] });
+    repo.write('src/a.ts', 'export const a = 2;\n');
+    const v = await g.verify(ctx('v', { worktree: repo.dir, intentionId: `i-${KNOWN}` }));
+    expect(v.exitCode).not.toBe(0);
+    expect(v.evidenceKey).toMatch(/^verify-refused:h_[0-9a-f]{24}:/);
+    expect(JSON.stringify(v)).not.toContain(KNOWN);
+    expect(spy.written.length).toBeGreaterThan(0);
+    for (const w of spy.written) expect(w.key, w.key).not.toContain(KNOWN);
+  });
+
+  it('a run id with a secret: verify, baseline and review refuse (their shared keys are derived from the raw id) and no key holds it', async () => {
+    const repo = makeRepo();
+    const spy = new SpyLedger(mk());
+    const g = createGates({ manifest: manifest(), ledger: spy.inner, verifyRunner: new FakeRunner(), reviewer: new FakeReviewer('openai'), writers: WRITERS, worktree: repo.dir, now: () => NOW, sessionId: 's1', secrets: [KNOWN] });
+    repo.write('src/a.ts', 'export const a = 2;\n');
+    const runId = `run-${KNOWN}`;
+    const base = await g.baseline({ runId, worktree: repo.dir });
+    expect(base.exitCode).not.toBe(0);
+    expect(base.evidenceKey).toMatch(/^verify-baseline:h_[0-9a-f]{24}:/);
+    const v = await g.verify(ctx('v', { worktree: repo.dir, runId }));
+    expect(v).toMatchObject({ outcome: 'refused' });
+    expect(v.exitCode).not.toBe(0);
+    const r = await g.review(ctx('r', { worktree: repo.dir, runId }));
+    expect(r).toMatchObject({ verdict: 'reject', reason: 'incomplete-packet' });
+    for (const res of [base, v, r]) expect(JSON.stringify(res)).not.toContain(KNOWN);
+    expect(spy.written.length).toBe(3);
+    for (const w of spy.written) expect(w.key, w.key).not.toContain(KNOWN);
+  });
+});
+
 describe('claim() and the ignored baseline write through the redactor', () => {
   it('claim metadata is redacted; the winner is still recognised by its nonce', async () => {
     const ledger = LEDGERS[0]![1]();

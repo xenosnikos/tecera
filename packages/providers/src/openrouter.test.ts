@@ -322,6 +322,21 @@ describe('OpenRouterLLM: responses (fail closed)', () => {
     }
   });
 
+  it('a reply whose reported model is another vendor\'s (or names none) is refused: the seat vendor must be the one that answered', async () => {
+    const body = (model: string) => ({ object: 'chat.completion', model, choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: '{"verdict":"approve","findings":[]}' } }], usage: { prompt_tokens: 10, completion_tokens: 10, cost: 0.00001 } });
+    for (const model of ['openai/gpt-5.6-terra', 'claude-sonnet-4.5', 'openrouter/auto', 'anthropic/x/y']) {
+      const llm = or(new FixtureFetch([{ status: 200, body: body(model) }]));
+      const r = await llm.complete(req());
+      expectEnvelope(r);
+      expect(r.error, model).toMatch(/reported model is not a anthropic\/\* model/);
+      expect(llm.provider).toBe('anthropic');
+      // the call was made: its usage is still billed
+      expect(r.usage.inputTokens).toBe(10);
+    }
+    expect((await or(new FixtureFetch([{ status: 200, body: body('anthropic/claude-sonnet-4.5') }])).complete(req())).finishReason).toBe('stop');
+    expect((await or(new FixtureFetch([{ status: 200, body: body('Anthropic/claude-sonnet-4.5-20260101') }])).complete(req())).finishReason).toBe('stop');
+  });
+
   it('malformed 2xx body → unknown usage bounded at the payload, never a confirmed zero', async () => {
     const ff = new FixtureFetch(['openrouter/malformed']);
     const r = await or(ff).complete(req({ maxTokens: 1000 }));

@@ -73,6 +73,14 @@ export function withLedgerMocks(inv: { byId: Record<string, CapabilityRecord> },
 /** Provisioned resource kinds a criterion's own process opens by locator (a git remote serves the PR delivery instead). */
 export const LOCATED_KINDS: ReadonlySet<string> = new Set(['sqlite', 'tmpdir', 'http-stub']);
 
+/**
+ * Located kinds a criterion's process cannot reach: a criterion runs without network (its own network
+ * namespace, loopback down), and an http-stub listens on the host's loopback. Its locator is not handed to
+ * the criterion, and a criterion that requires it never touched it: it counts as mocked (provisional), not
+ * as proven against the stub. Only the worker's brokered tool reaches the stub.
+ */
+export const NETWORK_KINDS: ReadonlySet<string> = new Set(['http-stub']);
+
 /** The environment variable a contained criterion reads a provisioned resource's locator from. */
 export function resourceEnvName(capability: string): string {
   return `TECERA_RESOURCE_${capability.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;

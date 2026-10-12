@@ -203,11 +203,14 @@ Tecera is research-grade. What follows is the state of the code, not a roadmap.
   far: the simplest one (fix a failing test), delivered through verification, foreign review and a
   human-approved pull request. The four harder scenarios did not reach their goal in two attempts each;
   those runs ended without claiming achievement.
-- **Safety findings are open.** An internal review confirmed defects in the host hooks (ways for a host
-  assistant to reach a human decision command, and for a forged ledger event to make the stop hook allow),
-  in the isolation of git at the pull-request gate, in the screens that reject acceptance criteria which
-  cannot fail, and in the loop's limits on re-planning. They are being fixed. Until then, treat the host
-  adapters as advisory and read every acceptance contract and pull request yourself.
+- **The ledger is not a trust anchor against its own user.** An internal review found ways for a host
+  assistant to reach a human decision command, for forged ledger events to make the stop hook allow, and
+  for repository git configuration to influence the pull-request push. Those specific paths are fixed and
+  have adversarial cases. What remains is structural: Tecera, the host assistant and the ledger run as one
+  operating-system user, so the ledger's hash chain shows internal consistency, not who wrote a record. A
+  forged end-of-run event can still hide a run that has no open approval, and a truncated ledger tail is
+  not detected. Treat the host adapters as protection against accidents, not against a determined agent,
+  and read every acceptance contract and pull request yourself.
 - **Approvals are not authenticated.** A decision is a local command and the approver is the name given
   with `--as`. Any local process that can run `tecera` and is not behind the Claude Code hooks can approve
   under any name.

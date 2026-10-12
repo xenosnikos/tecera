@@ -3,7 +3,8 @@ import type { AchievementGoal, BeliefProjection, Binding, Inputs, Json, Plan, St
 /**
  * The BDI context filter: a worker sees the goal, its step, why its previous attempt failed (on a retry), the
  * outputs of the worker steps it depends on, and only the beliefs the plan's context conditions mention (plus
- * any the step explicitly asks for), under a token budget. Nothing else.
+ * any the step explicitly asks for), under a token budget. Nothing else. Trusted beliefs are bound as
+ * `beliefs`, all others as `untrustedBeliefs` (marked untrusted).
  * `__history__` is bound by the worker itself, by reference.
  */
 export interface ContextOptions {
@@ -55,16 +56,31 @@ export function assembleStepContext(goal: AchievementGoal, plan: Plan, step: Ste
   if (opts.dependencies && Object.keys(opts.dependencies).length) put('dependencies', { kind: 'value', value: opts.dependencies, provenance: { src: 'steps', trust: 'untrusted' } }, false);
 
   const keys = new Set<string>([...plan.context.map((c) => c.key), ...(opts.extraKeys ?? [])]);
+  // A belief's own provenance decides the trust of what the worker receives. Only beliefs recorded as
+  // trusted go in `beliefs`; every other one (a worker fact, an external or simulated belief, a missing or
+  // unknown trust) goes in `untrustedBeliefs`, which the worker renders as untrusted data. A key therefore
+  // appears in `beliefs` only while the belief that currently holds it is trusted: an untrusted belief that
+  // replaced a trusted one is never shown under the trusted binding.
   const facts: Record<string, Json> = {};
+  const untrusted: Record<string, Json> = {};
   const provenances: Record<string, string> = {};
+  const untrustedProvenances: Record<string, string> = {};
   for (const k of keys) {
     const b = beliefs.get(k);
     if (!b) continue;
-    facts[k] = b.value;
-    provenances[k] = `${b.provenance.src}:${b.provenance.trust}`;
+    if (b.provenance?.trust === 'trusted') {
+      facts[k] = b.value;
+      provenances[k] = `${b.provenance.src}:trusted`;
+    } else {
+      untrusted[k] = b.value;
+      untrustedProvenances[k] = `${String(b.provenance?.src ?? 'unknown')}:untrusted`;
+    }
   }
   put('beliefs', { kind: 'value', value: facts, provenance: { src: 'beliefs', trust: 'trusted' } }, false);
+  if (Object.keys(untrusted).length) put('untrustedBeliefs', { kind: 'value', value: untrusted, provenance: { src: 'beliefs', trust: 'untrusted' } }, false);
   put('beliefProvenance', { kind: 'value', value: provenances, provenance: { src: 'beliefs', trust: 'trusted' } }, false);
+  // The source of an untrusted belief is chosen by whoever published it, so it is untrusted data too.
+  if (Object.keys(untrusted).length) put('untrustedBeliefProvenance', { kind: 'value', value: untrustedProvenances, provenance: { src: 'beliefs', trust: 'untrusted' } }, false);
 
   return { inputs, tokens, dropped };
 }
