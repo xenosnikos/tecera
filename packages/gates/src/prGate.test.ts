@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import type { GateApproval, Ledger } from '@tecera/contracts';
 import { createGates, type CreateGatesOptions } from './index.js';
 import { findOnPath } from './prGate.js';
-import { ctx, FakeReviewer, FakeRunner, GIT_TEST_ENV, HUMAN, LEDGERS, makeRepo, manifest, NOW, prGrant, WRITERS, type Repo } from './testkit/fixtures.js';
+import { ctx, FakeReviewer, FakeRunner, GIT_TEST_ENV, HUMAN, LEDGERS, makeRepo, manifest, NOW, prGrant, recordVerify, WRITERS, type Repo } from './testkit/fixtures.js';
 
 /**
  * PR gate (owner decision D6) on temp git repositories, with a bare 'origin' remote where a push matters.
@@ -54,6 +54,8 @@ async function committed(o: { ledger?: Ledger; origin?: boolean; extra?: Partial
     createGates({ manifest: manifest(), ledger, verifyRunner: new FakeRunner(), reviewer: new FakeReviewer('openai'), writers: WRITERS, worktree: repo.dir, now: () => NOW, sessionId: 's1', runsDir, gh: null, ...o.extra, ...extra });
   const gates = make();
   const v = await gates.verify(ctx('v', { worktree: repo.dir }));
+  // The loop records the verify as verify.passed: the audited event the PR gate proves achievement with.
+  await recordVerify(ledger, v, { at: NOW - 1 });
   const r = await gates.review(ctx('r', { worktree: repo.dir, candidate: { d1: v.fingerprint } }));
   expect(r.verdict).toBe('approve');
   // D6: the commit to the work branch needs no approval.
@@ -190,13 +192,14 @@ describe('PrGate: bare origin remote', () => {
     expect(existsSync(patchOf(s))).toBe(true);
   });
 
-  it('a transport outside file/ssh/https (ext::) is refused by git, never run', async () => {
+  it('a transport outside file/ssh/https (ext::) is refused before anything is spent, never run', async () => {
     const s = await committed();
     const marker = join(mkdtempSync(join(tmpdir(), 'tecera-ext-')), 'ran');
     s.repo.g('remote', 'add', 'origin', `ext::sh -c touch% ${marker}`);
     const r = await s.gates.pr(s.prCtx(await prGrant(s.ledger, { sha: s.sha })));
-    expect(r).toMatchObject({ exitCode: 9, reason: 'push-failed' });
+    expect(r).toMatchObject({ exitCode: 8, reason: 'transport-refused', terminal: true });
     expect(existsSync(marker)).toBe(false);
+    expect((await s.ledger.getApproval('pr1'))!.state).toBe('granted');
   });
 });
 
@@ -261,8 +264,12 @@ describe.each(LEDGERS)('PrGate approvals (%s) → exit 8, nothing pushed, nothin
     const s = await committed({ ledger: mk() });
     const ap = await prGrant(s.ledger, { sha: s.sha });
     expect((await s.gates.pr(s.prCtx(ap))).exitCode).toBe(0);
-    const other = { ...s.prCtx(ap), intention: { ...s.prCtx(ap).intention, attempt: 1 } };
-    expect(await s.gates.pr(other)).toMatchObject({ exitCode: 8, reason: 'approval' });
+    // Another PR step of the plan over the same commit: the spent grant is refused.
+    const c = s.prCtx(ap);
+    const plan = { ...c.plan, steps: [...c.plan.steps, { id: 'pr2', kind: 'gate.pr' as const, dependsOn: ['c'], inputs: {} }] };
+    expect(await s.gates.pr({ ...c, plan, step: plan.steps.at(-1)! })).toMatchObject({ exitCode: 8, reason: 'approval' });
+    // Another attempt of the intention is not this commit's PR at all: its commit was made under attempt 0.
+    expect(await s.gates.pr({ ...c, intention: { ...c.intention, attempt: 1 } })).toMatchObject({ exitCode: 9, reason: 'commit-of-another-attempt' });
   });
 });
 

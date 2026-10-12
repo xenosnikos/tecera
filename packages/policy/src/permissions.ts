@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ACCEPT_CRITERIA_ACTION, ANSWER_CRITERION_ACTION } from '@tecera/contracts';
 
 /**
  * permissions.json is the authority (the markdown next to it is a rendered view). Humans edit it; the
@@ -31,6 +32,16 @@ export const PR_GATE_ACTIONS: ReadonlySet<string> = new Set(['open_pr', 'git_pus
 /** Actions nobody in Tecera performs (D6: Tecera never merges). */
 export const MERGE_ACTIONS: ReadonlySet<string> = new Set(['merge', 'git_merge', 'gh_merge', 'pr_merge', 'gh_pr_merge']);
 
+/**
+ * Approval-only actions (D8): a human grants them through the ledger's approval rows and nothing else performs
+ * them. Accepting the criteria is the requestor's sign-off before planning; answering a human criterion is the
+ * reviewer's at the PR hold. No worker tool call, plan declaration or `always` entry can grant either.
+ */
+export const APPROVAL_ONLY_ACTIONS: ReadonlySet<string> = new Set([ACCEPT_CRITERIA_ACTION, ANSWER_CRITERION_ACTION]);
+
+/** Approval requirements D6 made obsolete: writes inside allowedChanges on the work branch, and commits, need none. */
+export const OBSOLETE_WRITE_APPROVALS: ReadonlySet<string> = new Set(['edit', 'write', 'edit_write', 'edit_edit', 'write_file', 'commit', 'git_commit']);
+
 export class PermissionsError extends Error {
   constructor(message: string) {
     super(message);
@@ -50,13 +61,33 @@ export function parsePermissions(doc: unknown): PermissionsDoc {
       seen.set(a, cls);
     }
   }
+  for (const a of p.always) if (APPROVAL_ONLY_ACTIONS.has(a)) throw new PermissionsError(`action ${a} is approval-only: it cannot be always allowed`);
   return p;
 }
 
-/** Most restrictive class wins; an unlisted action is undefined (the gate reflex treats it by risk). */
+/**
+ * D6 placement (sprint 5 item 5), for `validate --strict`: commit in always; open_pr and git_push in
+ * requiresApproval; merge in never; no approval requirement on in-bounds writes or commits; approval-only
+ * actions never always allowed. Empty when the document is in order.
+ */
+export function permissionsProblems(doc: PermissionsDoc): string[] {
+  const out: string[] = [];
+  const want: Array<[string, PermissionClass]> = [['commit', 'always'], ['open_pr', 'requiresApproval'], ['git_push', 'requiresApproval'], ['merge', 'never']];
+  for (const [a, cls] of want) {
+    const at = (['always', 'requiresApproval', 'never'] as const).filter((c) => doc[c].includes(a));
+    if (at.length !== 1 || at[0] !== cls) out.push(`${a} must be listed in ${cls} only (found ${at.length ? at.join(', ') : 'nowhere'})`);
+  }
+  for (const a of doc.requiresApproval) {
+    if (OBSOLETE_WRITE_APPROVALS.has(a) && a !== 'commit') out.push(`requiresApproval lists ${a}: obsolete, writes inside allowedChanges on the work branch need no approval (D6)`);
+  }
+  for (const a of doc.always) if (APPROVAL_ONLY_ACTIONS.has(a)) out.push(`${a} is approval-only and may not be always allowed`);
+  return out;
+}
+
+/** Most restrictive class wins; an approval-only action is never 'always'; an unlisted action is undefined (the gate reflex treats it by risk). */
 export function classify(action: string, doc: PermissionsDoc): PermissionClass | undefined {
   if (doc.never.includes(action)) return 'never';
-  if (doc.requiresApproval.includes(action)) return 'requiresApproval';
+  if (doc.requiresApproval.includes(action) || APPROVAL_ONLY_ACTIONS.has(action)) return 'requiresApproval';
   if (doc.always.includes(action)) return 'always';
   return undefined;
 }

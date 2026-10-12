@@ -1,4 +1,5 @@
 import type { Json, JsonObject } from './json.js';
+import { envelopeProblem, type ChangePath, type Criterion, type CriterionProof, type Fidelity } from './acceptance.js';
 
 /**
  * BDI vocabulary. Beliefs are plain facts projected from the log. Goals carry an environmental check.
@@ -20,6 +21,8 @@ export interface Provenance {
   digest?: string;
   path?: string;
   runId?: string;
+  /** Produced by a stand-in (a mock behind the broker), never by the real capability. Always untrusted. */
+  simulated?: true;
 }
 
 export interface Belief {
@@ -51,12 +54,19 @@ export interface AchievementProof {
   fingerprint: string;
   evidenceKey: string;
   verifiedAt: number;
+  /** With an acceptance contract: its hash, one proof per criterion, and the weakest fidelity among them. */
+  contractHash?: string;
+  criteria?: CriterionProof[];
+  fidelity?: Fidelity;
 }
 
 export interface AchievementGoal {
   id: string;
   statement: string;
   check: EnvironmentalCheck;
+  /** The accepted acceptance contract's criteria and hash, when the goal has one. `check` stays the final verify. */
+  criteria?: Criterion[];
+  contractHash?: string;
   commitment: Commitment;
   budget?: Partial<Budget>;
   status: GoalStatus;
@@ -64,10 +74,38 @@ export interface AchievementGoal {
   evidence: string[];
   /** Set while the goal is achieved: what proves it (D4). */
   proof?: AchievementProof;
+  /**
+   * Set (with status still 'open') while every criterion is proven but at least one rests on a mock
+   * (goal.provisional). A provisional goal is never achieved; any status transition clears the marker.
+   */
+  provisional?: true;
 }
 
 /** Why `p` is not a well-formed achievement proof (null when it is). Checks shape only, not the ledger. */
 export function achievementProofProblem(p: unknown, check?: EnvironmentalCheck): string | null {
+  const shape = proofShapeProblem(p, check);
+  if (shape) return shape;
+  // A goal resting on a stand-in is goal.provisional, never achieved.
+  if (restsOnMock(p as Record<string, unknown>)) return 'proof rests on a mocked capability';
+  return null;
+}
+
+/**
+ * Why `p` is not the proof of a provisional goal (null when it is): well formed like an achievement proof,
+ * and resting on at least one mock (otherwise the goal is achieved, not provisional).
+ */
+export function provisionalProofProblem(p: unknown, check?: EnvironmentalCheck): string | null {
+  const shape = proofShapeProblem(p, check);
+  if (shape) return shape;
+  if (!restsOnMock(p as Record<string, unknown>)) return 'proof rests on no mock: the goal is achieved, not provisional';
+  return null;
+}
+
+function restsOnMock(o: Record<string, unknown>): boolean {
+  return o.fidelity === 'mocked' || (Array.isArray(o.criteria) && o.criteria.some((c) => (c as { fidelity?: unknown } | null)?.fidelity === 'mocked'));
+}
+
+function proofShapeProblem(p: unknown, check?: EnvironmentalCheck): string | null {
   if (!p || typeof p !== 'object' || Array.isArray(p)) return 'no proof of achievement';
   const o = p as Record<string, unknown>;
   if (typeof o.command !== 'string' || !o.command) return 'proof names no check command';
@@ -114,6 +152,12 @@ export interface Step {
    * must be in plan.permissions.tools (validatePlanShape). Replaces the old `inputs.tools` convention.
    */
   tools?: string[];
+  /**
+   * The paths this worker step may create, modify or delete: a subset of the accepted contract's envelope
+   * (of repo.allowedChanges when the contract states none). Declared before execution; a plan can narrow the
+   * envelope, never widen it (policy changeEnvelope). Absent = the whole envelope.
+   */
+  changes?: ChangePath[];
 }
 
 /** What a plan reacts to: an event kind plus optional payload constraints. */
@@ -152,6 +196,10 @@ export interface Plan {
   /** Which goal kinds this plan was written for; free-form tags used for matching and review. */
   goalKinds: string[];
   rationale?: string;
+  /** The accepted contract this plan was written for (contractHash); a plan for another hash is stale. */
+  contractHash?: string;
+  /** Capability ids the plan uses (inventory ids). A plan naming one the inventory cannot serve is refused. */
+  capabilities?: string[];
 }
 
 export type IntentionStatus = 'committed' | 'running' | 'held' | 'done' | 'dropped' | 'failed';
@@ -236,9 +284,24 @@ export function transitionGoal(g: AchievementGoal, to: GoalStatus, evidence: str
       if (why) throw new IllegalTransition('goal', g.status, to, why);
     }
   }
+  const { proof: _old, provisional: _prov, ...rest } = g;
+  void _old;
+  void _prov;
+  return { ...rest, status: to, evidence: [...g.evidence, ...evidence], ...(to === 'achieved' && proof ? { proof } : {}) };
+}
+
+/**
+ * Mark an open (or demoted) goal provisional (goal.provisional): status is unchanged, `provisional` is set.
+ * The proof must be well formed and rest on a mock (provisionalProofProblem); an achieved or dropped goal
+ * cannot become provisional.
+ */
+export function markProvisional(g: AchievementGoal, proof: AchievementProof): AchievementGoal {
+  if (g.status !== 'open' && g.status !== 'demoted') throw new IllegalTransition('goal', g.status, 'provisional');
+  const why = provisionalProofProblem(proof, g.check);
+  if (why) throw new IllegalTransition('goal', g.status, 'provisional', why);
   const { proof: _old, ...rest } = g;
   void _old;
-  return { ...rest, status: to, evidence: [...g.evidence, ...evidence], ...(to === 'achieved' && proof ? { proof } : {}) };
+  return { ...rest, provisional: true };
 }
 
 export function transitionIntention(i: Intention, to: IntentionStatus): Intention {
@@ -284,6 +347,12 @@ export function validatePlanShape(plan: Plan): string[] {
       continue;
     }
     for (const t of s.tools) if (!allowedTools.has(t)) errors.push(`step ${s.id} tool ${t} is not in plan.permissions.tools`);
+  }
+  for (const s of plan.steps) {
+    if (s.changes === undefined) continue;
+    if (s.kind !== 'worker') errors.push(`step ${s.id} declares changes but is not a worker step`);
+    const why = envelopeProblem(s.changes);
+    if (why) errors.push(`step ${s.id} changes: ${why}`);
   }
   // cycle check (Kahn)
   const indeg = new Map<string, number>();
@@ -335,6 +404,51 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set(['read', 'readFile',
 /** A worker step that may change the worktree: any effective tool outside READ_ONLY_TOOLS. */
 export function isWritingStep(plan: Plan, step: Step): boolean {
   return step.kind === 'worker' && effectiveStepTools(plan, step).some((t) => !READ_ONLY_TOOLS.has(t));
+}
+
+/**
+ * Why the previous attempt of a retried worker step failed, handed to it as the input `failureContext`
+ * (untrusted provenance). Built by the loop from ledger evidence, redacted and bounded: output tails only,
+ * never file contents. `kind` names the gate that refused the candidate.
+ */
+export interface FailureContext {
+  kind: 'verify' | 'review' | 'envelope';
+  /** The attempt whose candidate was refused. */
+  attempt: number;
+  /**
+   * envelope (and a verify refused for it): paths the host found changed outside what the step or the
+   * accepted contract allows, each with the operation it amounts to against the base.
+   */
+  unexpected?: UnexpectedPathContext[];
+  /** verify: the criteria (or the goal check, id 'check') that did not pass. */
+  criteria?: FailedCriterionContext[];
+  /** review: the reviewer's findings. */
+  findings?: ReviewFindingContext[];
+  /** The gate's own reason line, when it gave one. */
+  reason?: string;
+  instruction: string;
+  untrusted: true;
+}
+
+export interface UnexpectedPathContext {
+  path: string;
+  op: string;
+}
+
+export interface FailedCriterionContext {
+  id: string;
+  statement?: string;
+  command?: string;
+  exitCode?: number | null;
+  /** The end of the redacted stdout and stderr of the run that failed. */
+  outputTail?: string;
+}
+
+export interface ReviewFindingContext {
+  file?: string;
+  line?: number;
+  severity?: string;
+  text: string;
 }
 
 /**

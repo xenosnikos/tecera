@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DecisionRecord, Reflex, ReflexAskOptions, ReflexQuestions, ReflexResult, ReflexSeam } from '@tecera/contracts';
-import { RulesReflex, asState, type GateState } from './rules.js';
+import { RulesReflex, UNCHECKED_CHANGE_CONFIDENCE, asState, type GateState } from './rules.js';
 import { ReflexRouter, type Frontier } from './router.js';
 
 const rules = new RulesReflex();
@@ -55,6 +55,44 @@ describe('RulesReflex', () => {
     expect(await ask('single-minded', false, true)).toBe(false);
     expect(await ask('open-minded', false, true)).toBe(true);
     expect(await ask('open-minded', false, false)).toBe(false);
+  });
+
+  it('reconsider: an amended acceptance contract interrupts under every commitment, blind included', async () => {
+    for (const commitment of ['blind', 'single-minded', 'open-minded'] as const) {
+      const r = await rules.ask('reconsider', { state: asState({ commitment, eventKind: 'criteria.amended', invalidatesContext: false, goalChanged: false, contractChanged: true }) });
+      expect(r.answer.interrupt).toBe(true);
+    }
+  });
+
+  it('closeOut (L5-F2): a worker return reporting an error, or a writing step that changed nothing, is never accepted', async () => {
+    const c = (s: Record<string, unknown>) => rules.ask('closeOut', { state: asState({ stepKind: 'worker', returnValid: true, policyAborts: 0, ...s }) });
+    expect((await c({ reportsError: true })).answer.achieved).toBe(false);
+    expect((await c({ reportsError: true, expectsChange: true, changed: true })).answer.achieved).toBe(false);
+    expect((await c({ expectsChange: true, changed: false })).answer).toEqual({ achieved: false });
+    expect((await c({ expectsChange: true, changed: false })).confidence).toBe(1);
+    expect(await c({ expectsChange: true, changed: true })).toMatchObject({ answer: { achieved: true }, confidence: 1 });
+    // a read-only step need not change anything
+    expect(await c({ expectsChange: false, changed: false })).toMatchObject({ answer: { achieved: true }, confidence: 1 });
+    // a writing step whose change could not be checked is accepted below the default threshold (it escalates)
+    const unchecked = await c({ expectsChange: true, changed: null });
+    expect(unchecked).toMatchObject({ answer: { achieved: true }, confidence: UNCHECKED_CHANGE_CONFIDENCE, abstained: false });
+    expect(unchecked.confidence).toBeLessThan(0.6);
+    // no snapshot port at all: the old rule (valid return, no aborts)
+    expect(await c({ expectsChange: true })).toMatchObject({ answer: { achieved: true }, confidence: 1 });
+  });
+
+  it('closeOut decides on the facts, never on the evidence a model decider reads (a worker summary is a claim)', async () => {
+    const c = (s: Record<string, unknown>) => rules.ask('closeOut', { state: asState({ stepKind: 'worker', returnValid: true, policyAborts: 0, reportsError: false, expectsChange: true, ...s }) });
+    const evidence = { instruction: 'fix slugify', outputSchema: 'satisfied', workerSummary: 'done, all tests pass', verify: { exitCode: 0, passed: true, attempt: 1 } };
+    // the first writing step, checked against its baseline: certain, so it never escalates
+    expect(await c({ ...evidence, changed: true, change: { files: 1, added: 1, removed: 1, paths: [{ path: 'src/slugify.js', added: 1, removed: 1 }] } })).toMatchObject({ answer: { achieved: true }, confidence: 1, abstained: false });
+    // a summary claiming success does not rescue a step that changed nothing, nor one that reported an error
+    expect(await c({ ...evidence, changed: false, change: { files: 0, added: 0, removed: 0, paths: [] } })).toMatchObject({ answer: { achieved: false }, confidence: 1 });
+    expect((await c({ ...evidence, changed: true, reportsError: true })).answer.achieved).toBe(false);
+    // an unknown change state escalates (below threshold) instead of deciding with confidence 0
+    const unknown = await c({ ...evidence, changed: null, change: { files: null } });
+    expect(unknown.answer.achieved).toBe(true);
+    expect(unknown.confidence).toBe(UNCHECKED_CHANGE_CONFIDENCE);
   });
 
   it('closeOut never trusts a model opinion', async () => {
@@ -151,6 +189,38 @@ describe('ReflexRouter', () => {
     expect((await yes.route('closeOut', { state: asState({ stepKind: 'gate.verify', exitCode: 1 }) })).result.answer.achieved).toBe(false);
     const stop = new ReflexRouter({ settings: { ...allRule, reconsider: 'model' }, threshold: 0.6 }, { sink, runId: 'r', model: new FakeModel(0.95, false, { interrupt: false }) });
     expect((await stop.route('reconsider', { state: asState({ commitment: 'single-minded', eventKind: 'belief.added', invalidatesContext: true, goalChanged: false }) })).result.answer.interrupt).toBe(true);
+  });
+
+  it('an answer that labels itself provider rules is clamped like any model answer: the label never skips the no-less-safe rule', async () => {
+    const sink = new RecordingSink();
+    const mislabelled = (answer: unknown): Reflex => ({ ask: async (seam: ReflexSeam) => ({ seam, answer: answer as never, confidence: 0.99, provider: 'rules', abstained: false }) }) as unknown as Reflex;
+    const irreversible = { state: asState({ tool: 'gate.pr', risk: 'irreversible', permission: 'requiresApproval' }), options: [{ decision: 'allow' as const }, { decision: 'hold' as const }, { decision: 'block' as const }] };
+    const gate = new ReflexRouter({ settings: { ...allRule, gate: 'model' }, threshold: 0.6 }, { sink, runId: 'r', model: mislabelled({ decision: 'allow' }) });
+    expect((await gate.route('gate', irreversible)).result.answer.decision).toBe('hold');
+    const close = new ReflexRouter({ settings: { ...allRule, closeOut: 'model' }, threshold: 0.6 }, { sink, runId: 'r', model: mislabelled({ achieved: true }) });
+    expect((await close.route('closeOut', { state: asState({ stepKind: 'gate.verify', exitCode: 1 }) })).result.answer.achieved).toBe(false);
+    const keep = new ReflexRouter({ settings: { ...allRule, reconsider: 'model' }, threshold: 0.6 }, { sink, runId: 'r', model: mislabelled({ interrupt: false }) });
+    expect((await keep.route('reconsider', { state: asState({ commitment: 'single-minded', eventKind: 'belief.added', invalidatesContext: true, goalChanged: false }) })).result.answer.interrupt).toBe(true);
+  });
+
+  it('D2/L5-F2: a rule closeOut below threshold (unchecked change) escalates to the frontier, which may only refuse it', async () => {
+    const sink = new RecordingSink();
+    const asked: string[] = [];
+    const refuse: Frontier = { decide: async (seam) => (asked.push(seam), { seam, answer: { achieved: false } as never, confidence: 0.9, provider: 'frontier', abstained: false }) };
+    const accept: Frontier = { decide: async (seam) => (asked.push(seam), { seam, answer: { achieved: true } as never, confidence: 0.9, provider: 'frontier', abstained: false }) };
+    const unchecked = { state: asState({ stepKind: 'worker', returnValid: true, policyAborts: 0, expectsChange: true, changed: null }) };
+    const r = new ReflexRouter({ settings: allRule, threshold: 0.6 }, { sink, runId: 'r', frontier: refuse });
+    expect(await r.route('closeOut', unchecked)).toMatchObject({ outcome: 'escalated', setting: 'rule', result: { provider: 'frontier', answer: { achieved: false } } });
+    expect(sink.records.at(-1)).toMatchObject({ seam: 'closeOut', provider: 'frontier', outcome: 'escalated', setting: 'rule' });
+    const ok = new ReflexRouter({ settings: allRule, threshold: 0.6 }, { sink, runId: 'r', frontier: accept });
+    expect((await ok.route('closeOut', unchecked)).result.answer.achieved).toBe(true);
+    // a frontier can never accept what the rule refused (a reported error), and a certain rule answer does not escalate
+    const err = { state: asState({ stepKind: 'worker', returnValid: true, policyAborts: 0, reportsError: true }) };
+    expect(await ok.route('closeOut', err)).toMatchObject({ outcome: 'acted', result: { provider: 'rules', answer: { achieved: false } } });
+    expect(asked).toEqual(['closeOut', 'closeOut']);
+    // without a frontier the shaky answer stands and is recorded as fallback
+    const none = new ReflexRouter({ settings: allRule, threshold: 0.6 }, { sink, runId: 'r' });
+    expect(await none.route('closeOut', unchecked)).toMatchObject({ outcome: 'fallback', result: { provider: 'rules', answer: { achieved: true } } });
   });
 
   it("D2: 'off' is gone: a router configured with it (or any unknown setting) refuses to start", () => {

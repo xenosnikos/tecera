@@ -239,7 +239,8 @@ describe('recover (security.md §6, §4 recovery matrix)', () => {
         }
       };
       const r = await flow.segment({
-        leaseTtlMs: 900,
+        // the renewals are stalled on purpose below; the TTL only has to be short enough for the thief's 10 s of tries
+        leaseTtlMs: 3_000,
         editToolSeams: { [seam]: pause },
         wrap: (inner) => async (ctx) => {
           const l = ctx.ledger as Ledger;
@@ -387,33 +388,35 @@ describe('recover (security.md §6, §4 recovery matrix)', () => {
     expect(kinds(await flow.events())).not.toContain('pr.requested');
   }, 300_000);
 
-  it('recover.noop_twice: two worker EXECUTIONS of a no-op program produce equal candidate digests → the run stops for a human with a no-progress reason (no third exec, no commit)', async () => {
+  it('recover.noop_twice: a worker that makes no progress cannot loop: the edit step re-runs after the failing verify, its second execution leaves the candidate exactly where the first did, re-runs once in the same attempt (unchanged again), and the run stops there (closeOut: no change; no fourth exec, no commit, no approval)', async () => {
     const { dir, wt } = await sampleRepo();
     const r = fixtureReplies();
-    const noop = { text: js("console.log('nothing to change');\nreturn { facts: [{ key: 'changedFiles', value: [] }] };") };
-    r.worker = [r.worker[0]!, noop, noop, noop, noop, noop, noop];
+    // each exec writes the SAME non-fixing content (the unfixed implementation plus one comment line): the first
+    // is a change that fails verify, the second leaves the candidate digest unchanged
+    const same = { text: js("const s = await readFile('src/slugify.js');\nawait writeFile('src/slugify.js', '// attempt: no real change\\n' + String(s.content).replace(/^\\/\\/ attempt: no real change\\n/, ''));\nconsole.log('nothing fixed');\nreturn { facts: [{ key: 'changedFiles', value: [] }] };") };
+    r.worker = [r.worker[0]!, same, same, same, same, same, same];
     const flow = new Flow(dir, wt, r);
     const res = await flow.drive();
     const evs = await flow.events();
-    // the attack really ran: the no-op program executed (it reported no change) and the tree never changed
+    // the attack really ran: the program executed (it reported no fix) and the tree holds only its comment line
     expect(evs.find((e) => e.kind === 'belief.added' && (e.payload as { key?: string }).key === 'changedFiles')?.payload, await dump(dir)).toMatchObject({ value: [] });
-    expect(readFileSync(join(wt, flow.runId, SRC), 'utf8')).toBe(readFileSync(join(dir, SRC), 'utf8'));
-    // two worker executions of the edit step (the verify failure re-ran the closest upstream worker step)
-    const edits = evs.filter((e) => e.kind === 'step.completed' && e.trace.stepId === 'edit');
-    expect(edits.length, `worker executions of edit\n${await dump(dir)}`).toBe(2);
-    expect(flow.segments.reduce((n, x) => n + (x.asked.worker ?? 0), 0), 'the worker seat was asked once per exec (plus analyze)').toBe(3);
+    expect(readFileSync(join(wt, flow.runId, SRC), 'utf8')).toBe(`// attempt: no real change\n${readFileSync(join(dir, SRC), 'utf8')}`);
+    // three worker executions of the edit step, no fourth: attempt 1 changed the tree and failed verify; attempt 2
+    // changed nothing, was refused, and re-ran once in the same attempt (its only same-attempt retry), unchanged again
+    const started = evs.filter((e) => e.kind === 'step.started' && e.trace.stepId === 'edit');
+    expect(started.length, `worker executions of edit\n${await dump(dir)}`).toBe(3);
+    expect(flow.segments.reduce((n, x) => n + (x.asked.worker ?? 0), 0), 'the worker seat was asked once per exec (plus analyze)').toBe(4);
+    const sameAttempt = evs.filter((e) => e.kind === 'intention.advanced' && (e.payload as { sameAttempt?: boolean }).sameAttempt === true);
+    expect(sameAttempt.length, 'one same-attempt retry, in attempt 2').toBe(1);
     const verifies = evs.filter((e) => (e.kind === 'verify.failed' || e.kind === 'verify.passed') && e.trace.stepId === 'verify');
-    expect(verifies.length, 'one verify per exec, no third').toBe(2);
-    const fps = verifies.map((e) => (e.payload as { fingerprint?: string }).fingerprint);
-    expect(new Set(fps).size, 'equal candidate digests').toBe(1);
-    const execs = verifies.map((e) => (e.payload as { workerExec?: unknown }).workerExec);
-    expect(execs.every((x) => x !== undefined), JSON.stringify(verifies.map((v) => v.payload))).toBe(true);
-    expect(new Set(execs.map(String)).size, 'the two verifies belong to two different worker executions').toBe(2);
-    const stops = evs.filter((e) => ['verify.failed', 'step.failed', 'intention.failed', 'goal.dropped'].includes(e.kind)).map((e) => JSON.stringify(e.payload));
-    expect(stops.join('\n'), `exit ${res.code}\n${await dump(dir)}`).toMatch(/no[- ]?progress/i);
-    expect(verifies.at(-1)!.payload).toMatchObject({ noProgress: true });
-    expect(evs.some((e) => e.kind === 'step.failed' && (e.payload as { failure?: string }).failure === 'human')).toBe(true);
-    expect(res.code, res.err + res.out).toBe(9);
+    expect(verifies.length, 'one verify, for the only exec that changed the candidate').toBe(1);
+    expect(verifies[0]!.kind).toBe('verify.failed');
+    // the later execs changed nothing: closeOut refuses them, the run stops
+    const stops = evs.filter((e) => ['step.failed', 'intention.failed', 'goal.dropped'].includes(e.kind) && e.trace.stepId !== 'verify').map((e) => JSON.stringify(e.payload));
+    expect(stops.join('\n'), `exit ${res.code}\n${await dump(dir)}`).toMatch(/without changing the worktree/);
+    expect(kinds(evs)).toContain('goal.dropped');
+    expect(res.code, res.err + res.out).not.toBe(0);
+    expect(res.code).not.toBe(4);
     expect(kinds(evs)).not.toContain('commit.recorded');
     expect(kinds(evs)).not.toContain('approval.requested');
   }, 300_000);

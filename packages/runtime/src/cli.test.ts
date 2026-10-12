@@ -55,6 +55,15 @@ function gitRepo(dir: string): void {
   g('commit', '-q', '-m', 'base');
 }
 
+/**
+ * The human decision commands refuse without a terminal (decisionGuard.ts). This suite makes them as the local
+ * human from a test process: the explicit opt-out, on those commands only, never on `tecera run`.
+ */
+const humanEnv = (argv: readonly string[]): Record<string, string> =>
+  argv[0] === 'approve' || argv[0] === 'deny' || (argv[0] === 'criteria' && (argv[1] === 'accept' || argv[1] === 'amend')) || (argv[0] === 'resources' && (argv[1] === 'release' || argv[1] === 'transfer')) || ((argv[0] === 'plans' || argv[0] === 'memory') && ['graduate', 'reject', 'retract'].includes(argv[1] ?? ''))
+    ? { TECERA_DECISION_NONINTERACTIVE: '1' }
+    : {};
+
 let idn = 0;
 async function cli(cwd: string, argv: string[], opts: MainOptions = {}): Promise<{ code: number; out: string; err: string }> {
   let out = '';
@@ -62,7 +71,7 @@ async function cli(cwd: string, argv: string[], opts: MainOptions = {}): Promise
   const { env: extraEnv, ...rest } = opts;
   const code = await main(argv, {
     cwd,
-    env: { ...ENV, ...(extraEnv ?? {}) },
+    env: { ...ENV, ...humanEnv(argv), ...(extraEnv ?? {}) },
     stdout: (s) => (out += s),
     stderr: (s) => (err += s),
     isTTY: false,
@@ -119,7 +128,7 @@ const fixPlan = (): Plan => ({
     { id: 'pr', kind: 'gate.pr', dependsOn: ['commit'], inputs: {} },
   ],
   allowedModels: { analyze: ['worker'], edit: ['worker'] },
-  permissions: { tools: ['read', 'edit', 'runVerify'], write: ['src/**'], approvals: ['open_pr'] },
+  permissions: { tools: ['read', 'edit', 'runVerify'], write: ['src/**'], approvals: ['open_pr', 'git_push'] },
   budget: {},
   origin: 'generated',
   status: 'candidate',
@@ -445,7 +454,7 @@ describe('preflight', () => {
     expect(r.code, r.out).toBe(0);
     const evs = await events(dir);
     const pf = evs.find((e) => e.kind === 'preflight.ran')!;
-    expect(pf.trace.goalId).toBe('g_fix-failing-test');
+    expect(pf.trace.goalId).toBe('fix-failing-test');
     expect((pf.payload as { baseline: { state: string; exitCode: number } }).baseline).toMatchObject({ state: 'failing', exitCode: 1 });
     const l = new SqliteLedger(join(dir, '.tecera/ledger.sqlite'));
     const ev = await l.getEvidence((pf.payload as { evidenceKey: string }).evidenceKey);
@@ -501,7 +510,7 @@ describe('run', () => {
     const r = await cli(dir, ['run', 'fix-failing-test', '--dry-run', '--budget-usd', '1.5'], { wire: w.wire, probe: async () => { throw new Error('no model calls'); } });
     expect(r.code, r.err).toBe(0);
     expect(w.calls).toBe(0);
-    expect(r.out).toContain('goal       g_fix-failing-test');
+    expect(r.out).toContain('goal       fix-failing-test');
     expect(r.out).toContain('budget     $1.5');
     expect(r.out).toContain('planner openrouter/anthropic/claude-sonnet-4.5');
     expect(r.out).toContain('reviewer openai/gpt-5.6-terra (foreign)');
@@ -611,7 +620,7 @@ describe('why and evidence', () => {
     expect(lines[1]).toMatch(/^step\s+verify2\s+step.requested → step.started → verify.started → verify.passed/);
     expect(lines[2]).toMatch(/^intention\s+\S+\s+intention.pushed/);
     expect(lines[3]).toMatch(/^plan\s+p_fix\s+plan.generated$/);
-    expect(lines[4]).toMatch(/^goal\s+g_fix-failing-test\s+goal.adopted/);
+    expect(lines[4]).toMatch(/^goal\s+fix-failing-test\s+goal.adopted/);
     expect(lines[5]).toMatch(/^event\s+goal.adopted .*Make the failing test/);
     const j = JSON.parse((await cli(dir, ['why', verify.id, '--json'])).out);
     expect(j.origin.kind).toBe('goal.adopted');
@@ -793,7 +802,7 @@ describe('gate, migrate, help', () => {
     const fail = await cli(dir, ['gate', 'fix-failing-test'], { verifyRunner: new FakeVerify([1]) });
     expect(fail.code).toBe(5);
     const demoted = (await events(dir)).find((e) => e.kind === 'goal.demoted')!;
-    expect(demoted.trace.goalId).toBe('g_fix-failing-test');
+    expect(demoted.trace.goalId).toBe('fix-failing-test');
     expect((demoted.payload as { goal: { status: string } }).goal.status).toBe('demoted');
   });
 
@@ -1545,7 +1554,7 @@ describe('D4: the Stop hook requires a proof of achievement', () => {
     const { runId, requestId } = await heldRun(dir, w);
     const before = await cli(dir, ['hook', 'stop'], { stdin: stopPayload(dir) });
     expect(before.code).toBe(2);
-    expect(before.err).toMatch(new RegExp(`goal not achieved: run ${runId} \\(goal g_fix-failing-test\\) is held for a human decision and has no goal.achieved proof`));
+    expect(before.err).toMatch(new RegExp(`goal not achieved: run ${runId} \\(goal fix-failing-test\\) is held for a human decision and has no goal.achieved proof`));
     expect((await cli(dir, ['approve', requestId, '--as', 'bob'])).code).toBe(0);
     // granted but not yet resumed: still no proof
     expect((await cli(dir, ['hook', 'stop'], { stdin: stopPayload(dir, { stop_hook_active: true }) })).code).toBe(2);
@@ -1571,6 +1580,19 @@ describe('D4: the Stop hook requires a proof of achievement', () => {
     expect((await cli(outside, ['hook', 'stop'], { stdin: stopPayload(outside) })).code).toBe(0);
     const fresh = sampleCopy();
     expect((await cli(fresh, ['hook', 'stop'], { stdin: stopPayload(fresh) })).code).toBe(0); // no ledger yet
+    // a manifest that exists but is unreadable or invalid is a business case the hook cannot judge: it blocks
+    const malformed = sampleCopy();
+    writeFileSync(join(malformed, 'tecera.json'), '{ not json');
+    const bad = await cli(malformed, ['hook', 'stop'], { stdin: stopPayload(malformed) });
+    expect(bad.code).toBe(2);
+    expect(bad.err).toMatch(/stop hook failed closed/);
+    const invalid = sampleCopy();
+    writeFileSync(join(invalid, 'tecera.json'), JSON.stringify({ version: 999 }));
+    expect((await cli(invalid, ['hook', 'stop'], { stdin: stopPayload(invalid) })).code).toBe(2);
+    // a manifest named with --manifest that is missing blocks too (a broken hook, not "no business case")
+    const named = await cli(outside, ['hook', 'stop', '--manifest', 'gone/tecera.json'], { stdin: stopPayload(outside) });
+    expect(named.code).toBe(2);
+    expect(named.err).toMatch(/manifest not found/);
 
     const dir = await initialised();
     const ac = new AbortController();

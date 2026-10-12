@@ -315,6 +315,11 @@ export class OpenRouterLLM implements LLM {
       structured = parseStructured(content);
       if (!structured) return fail('structured output was not valid JSON');
     }
-    return finalize({ content, model: r.model, finishReason, usage, raw, ...(structured ? { extraCheck: structured.value } : {}) }, this.#san);
+    const out = finalize({ content, model: r.model, finishReason, usage, raw, ...(structured ? { extraCheck: structured.value } : {}) }, this.#san);
+    // The seat's vendor identity (foreign review compares it) holds only when that vendor answered: a reply
+    // whose reported model is another vendor's, or names none, is refused whatever it says. Checked after
+    // finalize so a secret-bearing reply is still refused as one.
+    if (out.finishReason !== 'error' && openRouterVendor(r.model) !== this.provider) return fail(`reported model is not a ${this.provider}/* model: the vendor that answered differs from the seat vendor`);
+    return out;
   }
 }

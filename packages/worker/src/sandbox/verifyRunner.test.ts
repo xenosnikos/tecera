@@ -276,6 +276,8 @@ describe.skipIf(!canDrop)('ProcessVerifyRunner (dropped identity)', () => {
       expect(r.stdout).not.toContain(value);
       expect(r.stdout).not.toContain('SOME_OTHER_VAR');
       expect(r.stdout).toContain('PATH=');
+      // the supervisor's own marker (env.ts): commands that must not run inside the sandbox can tell where they are
+      expect(r.stdout).toMatch(/^TECERA_SANDBOX=verify$/m);
       expect(r.stdout).not.toContain('TECERA_CANARY_PRINTED_xyz');
       expect(r.envDropped.sort()).toEqual(['SOME_OTHER_VAR', 'TECERA_CANARY_VERIFY']);
     } finally {

@@ -1,8 +1,9 @@
 import { realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { Manifest } from '@tecera/contracts';
-import { matchesAny, normalizePath, pathProblem, type PermissionsDoc } from '@tecera/policy';
+import { matchesAny, matchesProtected, normalizePath, pathProblem, type PermissionsDoc } from '@tecera/policy';
 import { EDIT_TOOLS } from './adapters/render.js';
+import { parseArgs, type BoolFlag, type ParsedArgs, type ValueFlag } from './cli/args.js';
 import { HOST_GIT_PAGER_CONFIG } from './util/proc.js';
 import { inspectPath, UnsafePathError } from './util/safefs.js';
 
@@ -15,8 +16,11 @@ import { inspectPath, UnsafePathError } from './util/safefs.js';
  *   block, then `policy.protectedPaths`, then anything outside `repo.allowedChanges`.
  * - Bash is mediated, not trusted: only the manifest's verify command or a goal's check command (exact
  *   text), a small set of read-only commands, and `tecera gate|status|why|validate` run. Redirection, pipes,
- *   chaining, substitution, subshells and escapes are refused outright, so a shell command cannot write a
- *   protected file, delete a test, edit configuration or call `tecera approve`.
+ *   chaining, substitution, subshells and escapes are refused outright, and the command word must itself be
+ *   on the list (no environment prefix, no path, no interpreter), so a shell command cannot write a protected
+ *   file, delete a test, edit configuration or call `tecera approve`. A `tecera` command line is read with the
+ *   CLI's own argument parser (decideTecera): default deny, the subcommand first, and only the flags each
+ *   read-only subcommand is listed with.
  * - Read-only host tools are allowed; any other tool (including MCP tools) is refused.
  */
 
@@ -76,7 +80,19 @@ const GIT_DANGEROUS_LONG = ['output', 'output-directory', 'ext-diff', 'textconv'
 /** Short options after a git subcommand that are refused in any cluster or attached form (grep -O<pager>). */
 const GIT_DANGEROUS_SHORT = new Set(['O']);
 const FIND_FORBIDDEN = /^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/;
-const TECERA_READ = new Set(['gate', 'status', 'why', 'validate']);
+/**
+ * The `tecera` subcommands an agent may run, each with the only flags it may carry and how many arguments
+ * it takes. Everything else is refused: approvals, sign-off, learning, resources, runs, hooks, adapters,
+ * init, doctor, evidence export, and every flag that names a principal, a reason, a file or a manifest.
+ */
+const TECERA_READ: Readonly<Record<string, { bools: readonly BoolFlag[]; values: readonly ValueFlag[]; positionals: number }>> = {
+  gate: { bools: ['json', 'quiet', 'no-color'], values: [], positionals: 1 },
+  status: { bools: ['json', 'quiet', 'no-color'], values: ['run'], positionals: 0 },
+  why: { bools: ['json', 'quiet', 'no-color'], values: [], positionals: 1 },
+  validate: { bools: ['json', 'quiet', 'no-color', 'strict'], values: [], positionals: 0 },
+};
+/** Characters the shell expands into other words (globs, tilde, history): never part of a tecera argument. */
+const TECERA_EXPANDING = /[*?[\]~^#]/;
 /** sort long options that write (`--output`) or run a program (`--compress-program`), as GNU prefixes. */
 const SORT_DANGEROUS_LONG = ['output', 'compress-program', 'temporary-directory'];
 /** sort short options taking an argument that writes (`-o FILE`, `-oFILE`, `-uoFILE`) or picks a temp dir. */
@@ -202,11 +218,42 @@ export function decideBash(cmdRaw: unknown, ctx: HookContext): HookDecision {
     }
   }
   if (bin === 'tecera') {
-    const sub = args.find((a) => !a.startsWith('-'));
-    if (!sub || !TECERA_READ.has(sub)) return deny(`${BASH_HELP} (\`tecera ${sub ?? ''}\` is not available to agents; approvals and learning are human decisions)`);
-    if (args.some((a) => /^--(manifest|fix|export)(=|$)/.test(a))) return deny(`${BASH_HELP} (tecera flag refused)`);
+    const why = teceraProblem(args);
+    if (why) return deny(`${BASH_HELP} (${why})`);
   }
   return { allow: true };
+}
+
+/**
+ * Why a `tecera` argument list (the words after the command) is not one an agent may run, or null. Default
+ * deny, decided on what the CLI itself would do with these words:
+ *
+ * - the first word is the subcommand, spelled out, and it is on TECERA_READ. The CLI lets a value flag take
+ *   the next word wherever it stands (`tecera --reason gate approve <id>` runs `approve`), so nothing may
+ *   come before the subcommand, and the words are then read with the CLI's parser (parseArgs) to check that
+ *   the subcommand it would dispatch is the same one;
+ * - every flag is one the subcommand is listed with; a flag the parser does not know, or a list it rejects,
+ *   is refused;
+ * - the number of arguments is the subcommand's, and no word carries a character the shell would expand
+ *   into other words.
+ */
+export function teceraProblem(args: readonly string[]): string | null {
+  const refused = (what: string): string => `\`tecera ${what}\` is not available to agents; approvals, sign-off and learning are human decisions`;
+  const sub = args[0];
+  if (sub === undefined || !Object.prototype.hasOwnProperty.call(TECERA_READ, sub)) return refused(sub === undefined || sub.startsWith('-') ? '<flag first>' : sub.slice(0, 40));
+  const allowed = TECERA_READ[sub]!;
+  if (args.some((a) => TECERA_EXPANDING.test(a))) return 'a tecera argument carries a character the shell expands';
+  let parsed: ParsedArgs;
+  try {
+    parsed = parseArgs(args);
+  } catch (e) {
+    return `tecera arguments refused: ${(e as Error).message}`;
+  }
+  if (parsed.positionals[0] !== sub) return refused(String(parsed.positionals[0] ?? '').slice(0, 40));
+  if (parsed.positionals.length !== 1 + allowed.positionals) return `\`tecera ${sub}\` takes ${allowed.positionals} argument(s) here`;
+  for (const f of Object.keys(parsed.bools)) if (!(allowed.bools as readonly string[]).includes(f)) return `tecera flag --${f} is refused with ${sub}`;
+  for (const f of Object.keys(parsed.values)) if (!(allowed.values as readonly string[]).includes(f)) return `tecera flag --${f} is refused with ${sub}`;
+  return null;
 }
 
 /** Repo-relative path of `abs` against the root (lexical or real), or null when outside both. */
@@ -255,7 +302,7 @@ export function decidePreTool(input: HookInput, ctx: HookContext): HookDecision 
   }
   const host = matchesAny(relPath, HOST_PROTECTED);
   if (host) return deny(`${relPath} is tecera/host configuration (${host}); agents never edit it`);
-  const prot = matchesAny(relPath, ctx.manifest.policy.protectedPaths);
+  const prot = matchesProtected(relPath, ctx.manifest.policy.protectedPaths);
   if (prot) return deny(`${relPath} is a protected path (${prot}); tests, configs and tecera files are not edited by agents`);
   if (!matchesAny(relPath, ctx.manifest.repo.allowedChanges)) return deny(`${relPath} is outside repo.allowedChanges (${ctx.manifest.repo.allowedChanges.join(', ') || 'none'})`);
   return { allow: true };

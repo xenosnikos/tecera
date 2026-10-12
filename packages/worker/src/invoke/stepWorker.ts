@@ -2,21 +2,26 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
+  capabilityInventoryOf,
   effectiveStepTools,
   narrow,
   requireListEvidence,
   RESERVED_BINDINGS,
   type ApprovalGrant,
+  type CapabilityMockedPayload,
+  type CapabilityRecord,
   type CapabilitySet,
   type Hook,
   type Inputs,
   type JsonObject,
   type Ledger,
   type LLM,
+  type MockToolDeclaration,
   type Outcome,
   type Repl,
   type RunRef,
   type SecretInput,
+  type TeceraEvent,
   type Tool,
   type VerifyRunner,
   type Worker,
@@ -24,7 +29,9 @@ import {
   type WriteGuard,
 } from '@tecera/contracts';
 import type { ConfigOverride } from '../config.js';
-import { Broker } from '../broker/broker.js';
+import { Broker, type SimulatedUse } from '../broker/broker.js';
+import { MockRegistrationError, type StandIn } from '../mocks/admit.js';
+import { standInFor } from '../mocks/standins.js';
 import { redactorFor } from '../protocol/serializer.js';
 import { createRunVerifyTool } from '../tools/runVerify.js';
 import { worktreeTaint } from '../tools/paths.js';
@@ -58,6 +65,14 @@ export type { ReplContext, ReplFactory } from './invoke.js';
  *
  * Write fence: WorkerStepRequest.guard (run) and resume()'s guard are handed to the broker, which gives
  * every tool call an exec guard and ToolContext.fence. No guard = every write refused.
+ *
+ * Stand-ins (WorkerStepRequest.mocks): each declaration gets a host-side stand-in (options.standIns, default
+ * the generic store / message sink of mocks/standins.ts), admitted by the broker against the capability
+ * inventory (options.inventory, else capabilityInventoryOf over the ledger's events; neither → refused).
+ * A refused stand-in aborts the step (code 'policy') before anything runs. A stand-in serves only when its
+ * tool is in the step's capabilities, like any tool. The declarations are checkpointed so resume() serves
+ * the same stand-ins (the same in-memory instance within this process). An outcome whose tree used a
+ * stand-in carries `simulated` (SimulatedOutcome): whatever it returns may rest on simulated data.
  */
 
 export interface StepWorkerOptions {
@@ -83,6 +98,32 @@ export interface StepWorkerOptions {
   now?: () => number;
   ids?: () => string;
   trace?: TraceEntry[];
+  /** Host-side stand-in for a mock declaration (default standInFor). Throw to refuse one. */
+  standIns?: (decl: MockToolDeclaration) => Tool;
+  /** The run's capability inventory the stand-ins are admitted against (default: projected from the ledger). */
+  inventory?: (runId: string) => readonly CapabilityRecord[] | Promise<readonly CapabilityRecord[]>;
+  /** Manifest connections by capability id (`mockable: false` refuses a stand-in). */
+  connections?: Readonly<Record<string, { mockable?: boolean }>>;
+  /** The host's record of a stand-in's first use (it appends the `capability.mocked` event). A throw refuses the call. */
+  onMocked?: (runId: string, p: CapabilityMockedPayload) => void | Promise<void>;
+}
+
+/** An outcome of a step whose invoke tree used a stand-in: everything it returns may rest on simulated data. */
+export type SimulatedOutcome = Outcome & { simulated?: SimulatedUse };
+
+/** What stand-ins a step's outcome rests on, or null when none served it. */
+export function simulationOf(o: Outcome | null | undefined): SimulatedUse | null {
+  const s = (o as SimulatedOutcome | null | undefined)?.simulated;
+  return s && Array.isArray(s.mockIds) && s.mockIds.length > 0 ? s : null;
+}
+
+interface BrokerArgs {
+  runId: string;
+  capabilities: CapabilitySet;
+  worktree: string;
+  fencingToken: number | undefined;
+  check: { command: string; timeoutSec: number } | undefined;
+  guard: WriteGuard | undefined;
 }
 
 interface StepExtra {
@@ -95,10 +136,45 @@ interface StepExtra {
   planId: string;
   intentionId: string;
   attempt: number;
+  mocks?: MockToolDeclaration[];
 }
 
 export class StepWorker implements Worker {
+  /** Stand-in instances by run and mock id, so a resumed step is served by the same in-memory state. */
+  private readonly standInCache = new Map<string, Tool>();
+
   constructor(private readonly o: StepWorkerOptions) {}
+
+  /** Stand-ins and the inventory to admit them against; a factory refusal is returned as a problem. */
+  private async standIns(runId: string, mocks: readonly MockToolDeclaration[] | undefined): Promise<{ standIns: StandIn[]; inventory?: readonly CapabilityRecord[] } | { problem: string }> {
+    if (!mocks || mocks.length === 0) return { standIns: [] };
+    let inventory: readonly CapabilityRecord[] | undefined;
+    try {
+      if (this.o.inventory) inventory = await this.o.inventory(runId);
+      else if (this.o.ledger) {
+        const events: TeceraEvent[] = [];
+        for await (const e of this.o.ledger.events()) events.push(e);
+        inventory = capabilityInventoryOf(events).records;
+      }
+    } catch (e) {
+      return { problem: `the capability inventory cannot be read (${(e as Error)?.message ?? 'error'}); stand-ins are refused` };
+    }
+    const standIns: StandIn[] = [];
+    for (const d of mocks) {
+      const key = `${runId}\0${String(d?.mockId)}`;
+      let tool = this.standInCache.get(key);
+      if (!tool) {
+        try {
+          tool = (this.o.standIns ?? standInFor)(d);
+        } catch (e) {
+          return { problem: `no stand-in for ${String(d?.capability)}: ${(e as Error)?.message ?? 'refused'}` };
+        }
+        this.standInCache.set(key, tool);
+      }
+      standIns.push({ declaration: d, tool });
+    }
+    return { standIns, ...(inventory ? { inventory } : {}) };
+  }
 
   private toolsFor(check: { command: string; timeoutSec: number } | undefined): Tool[] {
     const tools = [...this.o.tools];
@@ -108,8 +184,33 @@ export class StepWorker implements Worker {
     return tools;
   }
 
-  private broker(runId: string, capabilities: CapabilitySet, worktree: string, fencingToken: number | undefined, check: { command: string; timeoutSec: number } | undefined, guard: WriteGuard | undefined): Broker {
-    return new Broker({ tools: this.toolsFor(check), runId, worktree, capabilities, redactor: redactorFor(this.o.secrets ?? []), ...(typeof fencingToken === 'number' && Number.isFinite(fencingToken) ? { fencingToken } : {}), ...(guard ? { guard } : {}) });
+  private broker({ runId, capabilities, worktree, fencingToken, check, guard }: BrokerArgs, mocks: { standIns: StandIn[]; inventory?: readonly CapabilityRecord[] }): Broker {
+    const onMocked = this.o.onMocked;
+    return new Broker({
+      tools: this.toolsFor(check),
+      runId,
+      worktree,
+      capabilities,
+      redactor: redactorFor(this.o.secrets ?? []),
+      ...(typeof fencingToken === 'number' && Number.isFinite(fencingToken) ? { fencingToken } : {}),
+      ...(guard ? { guard } : {}),
+      ...(mocks.standIns.length ? { standIns: mocks.standIns } : {}),
+      ...(mocks.inventory ? { inventory: mocks.inventory } : {}),
+      ...(this.o.connections ? { connections: this.o.connections } : {}),
+      ...(onMocked ? { onMocked: (p: CapabilityMockedPayload) => onMocked(runId, p) } : {}),
+    });
+  }
+
+  /** The broker, or the step's refusal when a stand-in is not admitted. */
+  private async brokerOrRefusal(run: RunRef, b: BrokerArgs, mocks: readonly MockToolDeclaration[] | undefined): Promise<Broker | Outcome> {
+    const m = await this.standIns(b.runId, mocks);
+    if ('problem' in m) return { kind: 'aborted', reasons: [{ code: 'policy', reason: m.problem, hookId: 'stepWorker' }], run };
+    try {
+      return this.broker(b, m);
+    } catch (e) {
+      if (e instanceof MockRegistrationError) return { kind: 'aborted', reasons: [{ code: 'policy', reason: e.message, hookId: 'stepWorker' }], run };
+      throw e;
+    }
   }
 
   /**
@@ -166,8 +267,10 @@ export class StepWorker implements Worker {
     const output: JsonObject = req.step.output ?? { type: 'object' };
     const check = { command: req.goal.check.command, timeoutSec: req.goal.check.timeoutSec };
     const worktree = typeof req.worktree === 'string' ? req.worktree : '';
-    const extra: StepExtra = { seatId: req.seatId, capabilities, runId: req.runId, worktree, check, stepId: req.step.id, planId: req.plan.id, intentionId: req.intention.id, attempt: req.intention.attempt };
-    const broker = this.broker(req.runId, capabilities, worktree, req.fencingToken, check, req.guard);
+    const mocks = Array.isArray(req.mocks) && req.mocks.length ? structuredClone([...req.mocks]) : undefined;
+    const extra: StepExtra = { seatId: req.seatId, capabilities, runId: req.runId, worktree, check, stepId: req.step.id, planId: req.plan.id, intentionId: req.intention.id, attempt: req.intention.attempt, ...(mocks ? { mocks } : {}) };
+    const broker = await this.brokerOrRefusal(run, { runId: req.runId, capabilities, worktree, fencingToken: req.fencingToken, check, guard: req.guard }, mocks);
+    if (!(broker instanceof Broker)) return sanitizeOutcome(broker, red);
     const out = await invoke(inputs, {
       output,
       hooks: this.o.hooks,
@@ -186,7 +289,7 @@ export class StepWorker implements Worker {
       config: { ...(this.o.config ?? {}), seatId: req.seatId },
       checkpointExtra: extra as unknown as JsonObject,
     });
-    return sanitizeOutcome(out, red);
+    return withSimulation(sanitizeOutcome(out, red), broker);
   }
 
   /** A held step dispatched again: answer with its existing suspension, never start it a second time. */
@@ -222,7 +325,8 @@ export class StepWorker implements Worker {
     const worktree = lease ? lease.worktree : (extra.worktree ?? '');
     const taint = await this.quarantineOf(extra.runId, worktree);
     if (taint !== null) return sanitizeOutcome(quarantined(fallback, worktree, taint), red);
-    const broker = this.broker(extra.runId, extra.capabilities, worktree, lease?.fencingToken, extra.check, guard);
+    const broker = await this.brokerOrRefusal(fallback, { runId: extra.runId, capabilities: extra.capabilities, worktree, fencingToken: lease?.fencingToken, check: extra.check, guard }, extra.mocks);
+    if (!(broker instanceof Broker)) return sanitizeOutcome(broker, red);
     const out = await resume(resumeToken, grant, {
       hooks: this.o.hooks,
       llm,
@@ -238,8 +342,14 @@ export class StepWorker implements Worker {
       ...(this.o.trace ? { trace: this.o.trace } : {}),
       consume: this.o.consumeGrants !== false,
     });
-    return sanitizeOutcome(out, red);
+    return withSimulation(sanitizeOutcome(out, red), broker);
   }
+}
+
+/** The outcome, marked `simulated` when its invoke tree used a stand-in. */
+function withSimulation(o: Outcome, broker: Broker): Outcome {
+  const uses = broker.simulatedUses();
+  return uses.mockIds.length ? ({ ...o, simulated: uses } as SimulatedOutcome) : o;
 }
 
 /** Lexical and real path of a worktree (the real one may be gone). */

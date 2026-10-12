@@ -1,0 +1,12 @@
+diff --git a/src/signup.js b/src/signup.js
+index f0a456b..7eb3eb2 100755
+--- a/src/signup.js
++++ b/src/signup.js
+@@ -6,6 +6,6 @@ export async function signup(user, deps = {}) {
+   if (!user || typeof user.email !== 'string' || !/^[^@\s]+@[^@\s]+$/.test(user.email)) throw new Error('a valid email is required');
+   const record = { id: users.length + 1, email: user.email, name: user.name ?? '' };
+   users.push(record);
+-  void deps;
++  if (deps.mailer) await deps.mailer.send({ to: record.email, subject: 'Welcome to the club', text: `Hello ${record.name || record.email}, welcome aboard.` });
+   return record;
+ }

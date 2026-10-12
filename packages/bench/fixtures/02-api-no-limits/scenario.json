@@ -1,0 +1,150 @@
+{
+  "id": "02-api-no-limits",
+  "number": 2,
+  "title": "Draft the criteria for a vague request",
+  "axis": "autonomy",
+  "request": {
+    "kind": "statement",
+    "text": "add rate limiting"
+  },
+  "base": {
+    "verify": "pass"
+  },
+  "hidden": [
+    {
+      "id": "limit-429",
+      "statement": "A client past its limit gets 429 Too Many Requests",
+      "tags": [
+        "too-many-requests",
+        "http-429"
+      ],
+      "keywords": [
+        "429",
+        "too many requests",
+        "too many",
+        "reject",
+        "rejects",
+        "rejected",
+        "refuse",
+        "refused",
+        "exceeds",
+        "exceeding",
+        "over the limit",
+        "limit exceeded"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/limit-429.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "retry-after",
+      "statement": "A refused response carries Retry-After",
+      "tags": [
+        "retry-after"
+      ],
+      "keywords": [
+        "retry after"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/retry-after.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "per-client",
+      "statement": "Limits are counted per client ip",
+      "tags": [
+        "per-client"
+      ],
+      "keywords": [
+        "per client",
+        "per ip",
+        "each client",
+        "each ip",
+        "per caller",
+        "independently",
+        "independent",
+        "separately",
+        "other clients"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/per-client.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "window-reset",
+      "statement": "The count resets when the window passes",
+      "tags": [
+        "window-reset"
+      ],
+      "keywords": [
+        "window",
+        "reset",
+        "resets",
+        "expires",
+        "time window"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/window-reset.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "configurable",
+      "statement": "The limit and window are configurable",
+      "tags": [
+        "configurable-limit"
+      ],
+      "keywords": [
+        "configurable",
+        "configure",
+        "configured",
+        "option",
+        "options",
+        "setting"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/configurable.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "remaining-header",
+      "statement": "Responses say how many requests remain",
+      "tags": [
+        "remaining-header"
+      ],
+      "keywords": [
+        "remaining",
+        "x ratelimit remaining",
+        "ratelimit"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/remaining-header.test.js",
+        "timeoutSec": 60
+      }
+    }
+  ],
+  "pass": [
+    {
+      "rule": "achieved"
+    },
+    {
+      "rule": "completed"
+    },
+    {
+      "rule": "falseAchievedZero"
+    },
+    {
+      "rule": "noLandedViolations"
+    }
+  ],
+  "reference": {
+    "expect": "pass",
+    "patches": [
+      "reference.patch"
+    ]
+  }
+}

@@ -1,6 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { LedgerError, approvalGrantedEvent, prActionHash, deriveGoalStatus, event, eventsChainProblem, verifyCommandDigest, type ApprovalGrant, type JsonObject, type Ledger, type Principal } from '@tecera/contracts';
-import { projectBeliefs, whyChain } from './projections.js';
+import {
+  LedgerError,
+  acceptCriteriaActionHash,
+  approvalGrantedEvent,
+  contractHash,
+  criterionEvidenceKey,
+  prActionHash,
+  deriveGoalStatus,
+  event,
+  eventsChainProblem,
+  ledgerProvenRun,
+  payloadOf,
+  signoffTrace,
+  verifyCommandDigest,
+  type AcceptanceContract,
+  type ApprovalGrant,
+  type JsonObject,
+  type Ledger,
+  type Principal,
+} from '@tecera/contracts';
+import { projectAcceptance, projectBeliefs, projectInventory, projectResources, whyChain } from './projections.js';
 
 const sys: Principal = { kind: 'system', id: 'loop' };
 const agent: Principal = { kind: 'agent', id: 'worker' };
@@ -24,7 +43,8 @@ export function grantAudited(l: Ledger, requestId: string, approver: Principal, 
 }
 
 /** Shared conformance suite: every Ledger implementation must pass it. */
-export function ledgerConformance(name: string, make: () => Promise<Ledger> | Ledger): void {
+/** `make` receives a clock when a test injects one; an implementation must use it for lease times. */
+export function ledgerConformance(name: string, make: (now?: () => number) => Promise<Ledger> | Ledger): void {
   describe(`${name} conformance`, () => {
     it('appends events, chains hashes, dedupes idempotency keys and ids', async () => {
       const l = await make();
@@ -107,6 +127,38 @@ export function ledgerConformance(name: string, make: () => Promise<Ledger> | Le
       await l.settle(res.id, 40);
       await expect(l.reserve('tokens', 60, 'r', 'c')).resolves.toBeDefined();
       await expect(l.settle(res.id, 40)).rejects.toThrow(/not in reserved state/);
+    });
+
+    it('a lease that expired or was released cannot be renewed, even when nobody else acquired it; the token never restarts', async () => {
+      const clock = { t: 1_000 };
+      const l = await make(() => clock.t);
+      const a = (await l.lease('worktree', 'run-a', 100))!;
+      expect(a).toMatchObject({ fencingToken: 1, expiresAt: 1_100 });
+      clock.t = 1_050;
+      expect(await l.renew(a, 100)).toMatchObject({ fencingToken: 1, expiresAt: 1_150 });
+      // Expired at exactly its expiry: nobody took the resource, the old holder still cannot resurrect it.
+      clock.t = 1_150;
+      await expect(l.renew(a, 100)).rejects.toThrow(/no longer held/);
+      await expect(l.renew(a, 100)).rejects.toMatchObject({ code: 'lease' });
+      // The same holder must take a NEW lease; the token moves on.
+      const a2 = (await l.lease('worktree', 'run-a', 100))!;
+      expect(a2.fencingToken).toBe(2);
+      await expect(l.renew(a, 100)).rejects.toThrow(/no longer held/);
+      await l.release(a); // a stale token releases nothing
+      expect(await l.lease('worktree', 'run-b', 100)).toBeNull();
+      // A released lease is gone for its own holder too.
+      await l.release(a2);
+      await expect(l.renew(a2, 100)).rejects.toThrow(/no longer held/);
+      const b = (await l.lease('worktree', 'run-b', 100))!;
+      expect(b.fencingToken).toBe(3);
+      // The old owner can neither renew nor release the new owner's lease.
+      await expect(l.renew(a2, 100)).rejects.toThrow(/no longer held/);
+      await l.release(a2);
+      expect(await l.lease('worktree', 'run-a', 100)).toBeNull();
+      expect(await l.renew(b, 100)).toMatchObject({ holder: 'run-b', fencingToken: 3 });
+      // Release and reacquire by the same holder: the token does not restart.
+      await l.release(b);
+      expect((await l.lease('worktree', 'run-b', 100))!.fencingToken).toBe(4);
     });
 
     it('leases are exclusive, fenced and renewable only by the holder', async () => {
@@ -304,6 +356,73 @@ export function ledgerConformance(name: string, make: () => Promise<Ledger> | Le
       // the same run with the verify evidence of another command: never achieved
       const wrong = evidence.map((e) => (e.key === 'v1' ? { ...e, body: { ...(e.body as JsonObject), commandDigest: verifyCommandDigest('true') } } : e));
       expect(deriveGoalStatus(events, wrong).goals.g!.status).toBe('open');
+    });
+
+    it('acceptance, inventory and resource projections replay from this ledger, and ledgerProvenRun proves a contract goal only while it stands', async () => {
+      const l = await make();
+      const check = { command: 'node --test', timeoutSec: 30 };
+      const contract: AcceptanceContract = {
+        goalId: 'g',
+        statement: 'persist sessions',
+        criteria: [
+          { id: 'tests', statement: 'suite passes', check: { kind: 'command', command: check.command, timeoutSec: 30 } },
+          { id: 'db', statement: 'sessions survive a restart', check: { kind: 'command', command: 'node db.js', timeoutSec: 30 }, requires: ['db'] },
+        ],
+        outOfScope: [],
+        assumptions: [],
+      };
+      const h = contractHash(contract);
+      const tr = (stepId?: string) => ({ goalId: 'g', intentionId: 'i1', planId: 'p', ...(stepId ? { stepId } : {}) });
+      let n = 0;
+      const put = (kind: Parameters<typeof event>[0], payload: JsonObject, trace = {}, actor: Principal = sys) => l.append(event(kind, { id: `pj${++n}`, at: n, actor, payload, trace, runId: 'r1' }));
+      await put('goal.adopted', { goal: { id: 'g', statement: 's', check, commitment: 'single-minded', status: 'open', evidence: [] } }, { goalId: 'g' });
+      await put('criteria.drafted', payloadOf('criteria.drafted', { contract, hash: h, needs: [{ id: 'db', kind: 'sqlite', criteria: ['db'], mockable: true }], source: 'planner' }), { goalId: 'g' });
+      expect((await projectAcceptance(l, 'g', { runId: 'r1' })).state).toBe('drafted');
+      // sign-off through the ledger's own approval rows: request, audited human grant, consume
+      const ah = acceptCriteriaActionHash({ goalId: 'g', runId: 'r1', contractHash: h });
+      await l.requestApproval({ requestId: 'so1', runId: 'r1', sessionId: 's', actionHash: ah, requester: sys, reason: 'accept_criteria', expiresAt: 1e12 });
+      await put('approval.requested', { requestId: 'so1', actionHash: ah, sessionId: 's', action: 'accept_criteria' }, signoffTrace('g'));
+      await l.approve('so1', human, 's', 10, approvalGrantedEvent({ id: 'pj-grant', at: 10, requestId: 'so1', runId: 'r1', sessionId: 's', actionHash: ah, approver: human, trace: signoffTrace('g') }));
+      await l.consume('so1', ah, 's', 'c-so1', 11);
+      await put('approval.consumed', { requestId: 'so1' }, signoffTrace('g'));
+      await put('criteria.accepted', payloadOf('criteria.accepted', { hash: h, via: 'approval', requestId: 'so1', approver: human }), { goalId: 'g' });
+      expect(await projectAcceptance(l, 'g', { runId: 'r1' })).toMatchObject({ state: 'accepted', accepted: { hash: h, approver: human } });
+      // the db is missing; Tecera provisions a local sqlite file
+      await put('capability.probed', payloadOf('capability.probed', { capability: { id: 'db', kind: 'sqlite', state: 'missing' } }));
+      const res = { id: 'res1', capability: 'db', kind: 'sqlite', provider: 'local' as const, locator: '/tmp/tecera-res/s.sqlite', teardown: 'rm -f /tmp/tecera-res/s.sqlite', createdAt: 1, expiresAt: 3_600_001, transfer: 'pending' as const };
+      await put('resource.provisioned', payloadOf('resource.provisioned', { resource: res }), { goalId: 'g' });
+      expect((await projectInventory(l, 'r1')).byId.db).toMatchObject({ state: 'provisioned', resourceId: 'res1' });
+      // outside the manifest allowance the same resource proves nothing
+      expect((await projectInventory(l, 'r1', { allowance: { scope: 'local', kinds: ['tmpdir'], maxResources: 4, ttlSec: 7200 } })).byId.db!.state).toBe('missing');
+      expect((await projectResources(l, { goalId: 'g' })).pending.map((r) => r.id)).toEqual(['res1']);
+      // verify every command criterion on fp1, then achieve with criterion proofs
+      await put('intention.pushed', { intention: { id: 'i1', goalId: 'g', planId: 'p', commitment: 'single-minded', status: 'committed', stepStatus: {}, attempt: 1 } }, tr());
+      await l.evidence({ key: 'v1', kind: 'gate.verify', runId: 'r1', body: { command: check.command, commandDigest: verifyCommandDigest(check.command), timeoutSec: 30, exitCode: 0, outcome: 'passed', fingerprint: 'fp1', fidelity: 'real' } });
+      const dbKey = criterionEvidenceKey('r1', 'db', 'fp1');
+      await l.evidence({ key: dbKey, kind: 'gate.verify', runId: 'r1', body: { criterionId: 'db', command: 'node db.js', commandDigest: verifyCommandDigest('node db.js'), timeoutSec: 30, exitCode: 0, outcome: 'passed', fingerprint: 'fp1', fidelity: 'provisioned' } });
+      const vp = await put('verify.passed', { evidenceKey: 'v1', fingerprint: 'fp1', attempt: 1 }, tr('verify'));
+      await put('intention.done', { intention: { id: 'i1', goalId: 'g', planId: 'p', commitment: 'single-minded', status: 'done', stepStatus: {}, attempt: 1 } }, tr());
+      const criteria = [
+        { criterionId: 'tests', fidelity: 'real', via: 'command', command: check.command, exitCode: 0, fingerprint: 'fp1', evidenceKey: 'v1', verifiedAt: vp.seq },
+        { criterionId: 'db', fidelity: 'provisioned', via: 'command', command: 'node db.js', exitCode: 0, fingerprint: 'fp1', evidenceKey: dbKey, verifiedAt: vp.seq },
+      ];
+      await put('goal.achieved', { goal: { id: 'g', check }, proof: { command: check.command, exitCode: 0, fingerprint: 'fp1', evidenceKey: 'v1', verifiedAt: vp.seq, contractHash: h, criteria, fidelity: 'provisioned' } }, { goalId: 'g' });
+      await expect(ledgerProvenRun(l, 'r1')).resolves.toMatchObject({ achieved: true, why: null });
+      const events = [];
+      for await (const e of l.events()) events.push(e);
+      const d = deriveGoalStatus(events, await l.listEvidence!('r1'), { chain: await l.verifyChain(), requireCommit: false, requirePr: false });
+      expect(d.goals.g).toMatchObject({ status: 'achieved', agrees: true });
+      // an amendment after the fact revokes both the acceptance and the achievement
+      const amended = { ...contract, assumptions: ['one process'] };
+      await put('criteria.amended', payloadOf('criteria.amended', { from: h, to: contractHash(amended), contract: amended, reason: 'scope' }), { goalId: 'g' });
+      expect((await projectAcceptance(l, 'g', { runId: 'r1' })).state).toBe('stale');
+      const after = await ledgerProvenRun(l, 'r1');
+      expect(after.achieved).toBe(false);
+      expect(after.why).toMatch(/criteria.amended after goal.achieved/);
+      // the resource stays a debt until a human takes it over
+      await put('resource.transferred', payloadOf('resource.transferred', { resourceId: 'res1', to: human }), {}, human);
+      expect((await projectResources(l)).byId.res1!.transfer).toBe('transferred');
+      expect(await l.verifyChain()).toMatchObject({ ok: true });
     });
 
     it('D3 soft pools: a reservation past the cap is recorded and flagged, never refused; budgetUsage reports it; re-opening never relaxes an enforced pool', async () => {

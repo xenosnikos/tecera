@@ -1,0 +1,22 @@
+[
+  {
+    "region": "North",
+    "amount": 100.5
+  },
+  {
+    "region": "South",
+    "amount": 75.25
+  },
+  {
+    "region": "North",
+    "amount": 20
+  },
+  {
+    "region": "North, East",
+    "amount": 10
+  },
+  {
+    "region": "Rivers \"Delta\"",
+    "amount": 5
+  }
+]

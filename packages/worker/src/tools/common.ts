@@ -85,6 +85,13 @@ export async function authorizeWriteVia(guard: WriteGuard, _ctx: ToolContext, w:
   }
 }
 
+/**
+ * An extra, host-supplied check on one repository mutation (a write or a deletion of the resolved
+ * worktree-relative path), on top of the capability allowlist and the protected paths: the runtime uses it
+ * to hold the step to its declared change paths. Throw to refuse; nothing has been changed yet.
+ */
+export type ChangeAuthorizer = (rel: string, kind: 'write' | 'delete', ctx: ToolContext) => void;
+
 export const redactorOf = (ctx: ToolContext): Redactor | undefined => (ctx as WorkerToolContext).redactor;
 export const signalOf = (ctx: ToolContext): AbortSignal | undefined => (ctx as WorkerToolContext).signal;
 
@@ -94,7 +101,10 @@ export function combinedSignal(ctx: ToolContext, guard: WriteGuard): AbortSignal
   return s ? AbortSignal.any([s, guard.signal]) : guard.signal;
 }
 
-/** Refuse when the step has no worktree (contract: '' = refuse every file and verify tool) or it is quarantined. */
+/**
+ * Refuse when the step has no worktree (contract: '' = refuse every file and verify tool) or it is
+ * quarantined, by whoever recorded it (file tools, broker, REPL or verify run: one registry).
+ */
 export function assertWorktree(ctx: ToolContext): void {
   if (typeof ctx.worktree !== 'string' || ctx.worktree.length === 0) throw new ToolInputError('no worktree is configured for this step; file and verify tools are refused');
   const t = worktreeTaint(ctx.worktree);

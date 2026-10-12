@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MANDATORY_HOOKS, parseManifest, type Manifest, type Plan, type SpanEvent } from '@tecera/contracts';
 import { BoundaryViolation, enforceChanges, writesWithin } from './diffBoundary.js';
-import { globWithin, matchesGlob, pathProblem } from './glob.js';
+import { globWithin, matchesAny, matchesGlob, matchesProtected, pathProblem } from './glob.js';
 import { DEFAULT_PERMISSIONS, PermissionsError, classify, parsePermissions } from './permissions.js';
 import { snapshotWorktree } from './snapshot.js';
 import { DEFAULT_CONFIG_GLOBS, DEFAULT_TEST_GLOBS, tamperFindings } from './tamper.js';
@@ -138,6 +138,13 @@ describe('tamperFindings', () => {
     );
     const codes = f.map((x) => x.code);
     for (const c of ['deleted-test', 'modified-test', 'config-edit', 'hooks-dir', 'symlink', 'mode-change', 'binary', 'focus-or-skip', 'scripts-edit']) expect(codes).toContain(c);
+    // every way of switching a test off or narrowing the run is a finding, one line each
+    const skips = ['it.skipIf(true)("x", () => {})', 'describe.skipIf(1)("s", () => {})', 'it.concurrent.skip("x", () => {})', 'test.runIf(false)("x", () => {})', 'test.fails("x", () => {})', 'describe["skip"]("s", () => {})', "it['only']('x', () => {})", 'test("x", { skip: true }, () => {})', "test('x', { todo: 'later' }, () => {})", '  this.skip();', '  t.skip("not now");', 'suite.only("s", () => {})', 'describe.skip.each([1])("s", () => {})'];
+    for (const line of skips) expect(tamperFindings([], [{ path: 'src/a.test.ts', added: [line] }], { ...opts, testsReadOnly: false }).map((x) => x.code), line).toEqual(['focus-or-skip']);
+    // ordinary code is not a finding: an option named skip outside a test file, a plain test, a skip count
+    for (const [path, line] of [['src/page.ts', 'const q = { skip: true };'], ['src/a.test.ts', 'it("skips nothing", () => {})'], ['src/a.test.ts', 'const page = { skip: 10 };'], ['src/a.ts', 'git.only = 1;']] as const) {
+      expect(tamperFindings([], [{ path, added: [line] }], { ...opts, testsReadOnly: false }), line).toEqual([]);
+    }
   });
   it('an added test is fine when tests are not read-only; clean changes have no findings', () => {
     expect(tamperFindings([{ path: 'test/new.test.ts', status: 'A' }], [], { ...opts, testsReadOnly: false })).toEqual([]);
@@ -184,7 +191,8 @@ describe('validatePlan', () => {
       { id: 'pr', kind: 'gate.pr', dependsOn: ['c'], inputs: {} },
     ],
     allowedModels: { edit: ['worker'] },
-    permissions: { tools: ['read', 'edit'], write: ['src/**'], approvals: ['open_pr'] },
+    // sprint 5 item 5: a gate.pr plan declares both actions the one commit-bound grant covers
+    permissions: { tools: ['read', 'edit'], write: ['src/**'], approvals: ['open_pr', 'git_push'] },
     budget: { usd: 1 },
   });
   const opts = { toolCatalog: ['read', 'edit', 'runVerify', 'merge'], permissions: DEFAULT_PERMISSIONS, goalHasCheck: true };
@@ -253,7 +261,11 @@ describe('stopDecision (D4 Stop hook)', () => {
     for (const bad of [{ ...proof, exitCode: 1 }, { ...proof, evidenceKey: '' }, { ...proof, fingerprint: undefined }]) {
       expect(stopDecision({ activeRun: { runId: 'r1' }, achievedProof: bad as never }).decision).toBe('block');
     }
-    expect(stopDecision({ activeRun: { runId: 'r1', state: 'budget exhausted' }, achievedProof: proof })).toMatchObject({ decision: 'allow', exitCode: 0 });
+    // sprint 5 item 1: a proof alone is shape only (a forged goal.achieved carries one); only a provenRun
+    // verdict for the run allows, and budget state never matters
+    expect(stopDecision({ activeRun: { runId: 'r1', state: 'budget exhausted' }, achievedProof: proof })).toMatchObject({ decision: 'block', exitCode: 2 });
+    const verdict = { runId: 'r1', achieved: true, provisional: false, why: null, goals: { g_fix: { goalId: 'g_fix', runId: 'r1', achieved: true, provisional: false, why: null, proof } } };
+    expect(stopDecision({ activeRun: { runId: 'r1', state: 'budget exhausted' }, achievedProof: proof, verdict })).toMatchObject({ decision: 'allow', exitCode: 0 });
     expect(stopDecision({ activeRun: { runId: '' }, achievedProof: null }).decision).toBe('allow');
   });
 });
@@ -362,6 +374,50 @@ describe('limit hooks and mandatory set', () => {
     expect(byId.secretCanary!.handle(ev('LLMQuery', 'Enter', { input: { prompt: 'key is sk-ant-api03-verysecretvalue' } }), view)).toMatchObject([{ code: 'policy' }]);
     expect(byId.secretCanary!.handle(ev('LLMQuery', 'Enter', { input: { prompt: 'AKIAABCDEFGHIJKLMNOP leaked' } }), view)).toMatchObject([{ code: 'policy' }]);
     expect(byId.evidenceRecorder!.handle(ev('Invoke', 'Enter'), view)).toMatchObject([{ type: 'AppendEvidence', kind: 'governance' }]);
+  });
+
+  it('a `never` permission refuses the call under every name it can carry: the tool, the method, tool_method', () => {
+    const view = { capabilities: { tools: ['read', 'edit', 'http', 'fs'], paths: { read: ['**'], write: ['src/**'], protected: [] }, network: 'none' as const, limits: { usd: 1, tokens: 1, calls: 1, wallMs: 1, depth: 1, iterations: 1 } }, blackboard: {}, hooks: [] };
+    const hooks = mandatoryHooks(manifest(), { permissions: { always: ['http_get'], requiresApproval: [], never: ['http_delete', 'reset', 'fs'] } });
+    const byId = Object.fromEntries(hooks.map((h) => [h.id, h]));
+    const never = [{ type: 'Abort', code: 'policy', reason: expect.stringMatching(/is never allowed/) }];
+    // a tool that IS in the capability set and listed in never is refused at Enter
+    expect(byId.toolAllowlist!.handle(ev('ToolCall', 'Enter', { input: { tool: 'fs' } }), view)).toMatchObject(never);
+    expect(byId.toolAllowlist!.handle(ev('ToolCall', 'Enter', { input: { tool: 'http' } }), view)).toEqual([]);
+    // tool_method and a bare method listed in never are refused at Send, whatever the method is called
+    expect(byId.approvalGate!.handle(ev('ToolCall', 'Send', { input: { tool: 'http', method: 'delete' } }), view)).toMatchObject(never);
+    expect(byId.approvalGate!.handle(ev('ToolCall', 'Send', { input: { tool: 'git', method: 'reset' } }), view)).toMatchObject(never);
+    expect(byId.approvalGate!.handle(ev('ToolCall', 'Send', { input: { tool: 'fs', method: 'write' } }), view)).toMatchObject(never);
+    expect(byId.approvalGate!.handle(ev('ToolCall', 'Send', { input: { tool: 'http', method: 'get' } }), view)).toEqual([]);
+    const noEdit = mandatoryHooks(manifest(), { permissions: { always: [], requiresApproval: [], never: ['edit_write'] } }).find((h) => h.id === 'approvalGate')!;
+    expect(noEdit.handle(ev('ToolCall', 'Send', { input: { tool: 'edit', method: 'write', path: 'src/a.ts' } }), view)).toMatchObject(never);
+  });
+
+  it('a required approval is held whatever the method is called: only the repository write tool is exempt (D6)', () => {
+    const view = { capabilities: { tools: ['edit', 'externalWrite'], paths: { read: ['**'], write: ['src/**'], protected: [] }, network: 'none' as const, limits: { usd: 1, tokens: 1, calls: 1, wallMs: 1, depth: 1, iterations: 1 } }, blackboard: {}, hooks: [] };
+    const gate = mandatoryHooks(manifest(), { permissions: DEFAULT_PERMISSIONS }).find((h) => h.id === 'approvalGate')!;
+    for (const method of [undefined, 'call', 'write', 'edit']) {
+      expect(gate.handle(ev('ToolCall', 'Send', { input: { tool: 'externalWrite', ...(method ? { method } : {}) } }), view), String(method)).toMatchObject([{ type: 'Suspend', request: { requester: 'worker' } }]);
+    }
+    expect(gate.handle(ev('ToolCall', 'Send', { input: { tool: 'edit', method: 'write', path: 'src/a.ts' } }), view)).toEqual([]);
+  });
+
+  it('the secret canary aborts on a secret in an output (Complete), and the protectedPaths hook covers directory-style patterns', () => {
+    const hooks = mandatoryHooks(manifest(), { permissions: DEFAULT_PERMISSIONS, secretValues: ['sk-ant-api03-verysecretvalue'] });
+    const byId = Object.fromEntries(hooks.map((h) => [h.id, h]));
+    const view = { capabilities: { tools: ['read', 'edit'], paths: { read: ['**'], write: ['**'], protected: ['tests/', 'fixtures', '.github', 'conf/locked/'] }, network: 'none' as const, limits: { usd: 1, tokens: 1, calls: 1, wallMs: 1, depth: 1, iterations: 1 } }, blackboard: {}, hooks: [] };
+    for (const span of ['LLMQuery', 'ToolCall', 'Invoke'] as const) {
+      expect(byId.secretCanary!.handle(ev(span, 'Complete', { input: {}, output: { text: 'the key is sk-ant-api03-verysecretvalue' } }), view), span).toMatchObject([{ type: 'Abort', code: 'policy', reason: expect.stringMatching(/secret canary tripped on output/) }]);
+      expect(byId.secretCanary!.handle(ev(span, 'Complete', { input: {}, output: { text: 'nothing here' } }), view), span).toEqual([]);
+    }
+    for (const path of ['tests/a.ts', 'tests/deep/b.ts', 'pkg/tests/a.ts', 'fixtures/x.json', '.github/workflows/ci.yml', 'conf/locked/a.yml', 'tests']) {
+      expect(byId.protectedPaths!.handle(ev('ToolCall', 'Enter', { input: { tool: 'edit', method: 'write', path } }), view), path).toMatchObject([{ type: 'Abort', code: 'protected' }]);
+    }
+    for (const path of ['src/a.ts', 'testsuite/a.ts', 'conf/open/a.yml']) expect(byId.protectedPaths!.handle(ev('ToolCall', 'Enter', { input: { tool: 'edit', method: 'write', path } }), view), path).toEqual([]);
+    expect(matchesProtected('tests/a.ts', ['tests/'])).toBe('tests/');
+    expect(matchesProtected('src/tests.ts', ['tests'])).toBeNull();
+    // an allow list keeps the exact rule: a directory name grants nothing below it
+    expect(matchesAny('src/a.ts', ['src'])).toBeNull();
   });
 });
 

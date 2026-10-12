@@ -1,19 +1,25 @@
-import { requireApproval, type Json, type TeceraEvent } from '@tecera/contracts';
+import { acceptedContractOf, requireApproval, resourceRegistryOf, type Json, type TeceraEvent } from '@tecera/contracts';
 import { BoardProjection } from '@tecera/ledger';
 import type { Command } from '../cli/context.js';
 import { EXIT } from '../errors.js';
 import { PlanRegistry } from '../plans.js';
+import { provenOptionsOf } from '../proof.js';
+import { runVerdict } from './run.js';
 
 /**
  * `tecera status [--run id]`: the last run (or the one named), open goals and live intentions from the
- * ledger's BoardProjection, held approvals still pending, and the review queues (plan candidates). Reads
- * only.
+ * ledger's BoardProjection, held approvals still pending (and what each waits for: a criteria sign-off, a
+ * capability, a human criterion, the PR), the run's acceptance contract (state, criteria and the fidelity
+ * each was proven at; provisional when one rests on a mock), the resources pending transfer, and the
+ * review queues (plan candidates). Reads only.
  */
 
 export interface PendingApproval {
   requestId: string;
   runId?: string;
   stepId?: string;
+  /** The approval action when the request names one (accept_criteria, provide_capability, answer_criterion). */
+  action?: string;
   eventId: string;
   /** Ledger state of the approval (getApproval), when known. */
   state?: string;
@@ -25,7 +31,8 @@ export function pendingApprovals(events: ReadonlyArray<TeceraEvent>): PendingApp
     const rid = (e.payload as { requestId?: string }).requestId;
     if (!rid) continue;
     if (e.kind === 'approval.requested' || e.kind === 'step.held') {
-      if (!pending.has(rid)) pending.set(rid, { requestId: rid, runId: e.runId, stepId: e.trace.stepId, eventId: e.id });
+      const action = (e.payload as { action?: unknown }).action;
+      if (!pending.has(rid)) pending.set(rid, { requestId: rid, runId: e.runId, stepId: e.trace.stepId, ...(typeof action === 'string' ? { action } : {}), eventId: e.id });
     } else if (e.kind === 'approval.denied' || e.kind === 'approval.consumed' || e.kind === 'approval.expired') pending.delete(rid);
   }
   return [...pending.values()];
@@ -68,7 +75,30 @@ export const statusCommand: Command = async (c) => {
   const live = [...board.intentions.values()].filter((i) => i.status === 'committed' || i.status === 'running' || i.status === 'held');
   for (const i of live) c.out.say(`intention  ${i.id}  ${i.status}  plan ${i.planId}  ${Object.entries(i.stepStatus).map(([s, st]) => `${s}:${st}`).join(' ')}`);
   for (const p of pending) {
-    c.out.say(p.state === 'granted' ? `held       ${p.requestId}  step ${p.stepId ?? '-'}  granted → tecera run --resume ${p.runId ?? '<run>'}` : `held       ${p.requestId}  step ${p.stepId ?? '-'}  ${p.state} → tecera approve ${p.requestId}`);
+    const what = p.action === 'accept_criteria' ? 'criteria sign-off' : p.action === 'provide_capability' ? 'capability' : p.action === 'answer_criterion' ? `criterion ${String(p.stepId ?? '').replace(/^answer:/, '')}` : `step ${p.stepId ?? '-'}`;
+    const how = p.action === 'accept_criteria' ? `tecera criteria accept ${p.runId ?? '<run>'}` : `tecera approve ${p.requestId}`;
+    c.out.say(p.state === 'granted' ? `held       ${p.requestId}  ${what}  granted → tecera run --resume ${p.runId ?? '<run>'}` : `held       ${p.requestId}  ${what}  ${p.state} → ${how}`);
+  }
+  // D8–D12: the contract of the run's goal, the fidelity of its proofs, and what Tecera still owes.
+  const opts = provenOptionsOf(rt.manifest, rt.redactor);
+  const contracts: Json[] = [];
+  let transfers: Json[] = [];
+  if (runId) {
+    const signoffAlways = rt.manifest.acceptance.signoff === 'always';
+    const verdict = await runVerdict(rt, { ledger, runId });
+    for (const goalId of [...new Set(runEvents.filter((e) => e.kind === 'goal.adopted').map((e) => e.trace.goalId).filter((g): g is string => !!g))]) {
+      const view = acceptedContractOf(runEvents, goalId, { runId, ...(signoffAlways ? { requireApproval: true } : {}) });
+      if (view.state === 'none' || !view.contract) continue;
+      const g = verdict?.goals[goalId];
+      const provisional = !g?.achieved && runEvents.some((e) => e.kind === 'goal.provisional' && e.trace.goalId === goalId);
+      const fid = g?.achieved ? (g.proof?.fidelity ?? 'real') : provisional ? 'mocked' : null;
+      c.out.say(`criteria   ${goalId}  ${view.state}  ${view.contract.criteria.length} criteria${fid ? ` · fidelity ${fid}` : ''}${provisional ? ' · PROVISIONAL (rests on a mock; never achieved)' : ''}  (tecera criteria show ${runId})`);
+      contracts.push({ goalId, state: view.state, hash: view.current ?? null, criteria: view.contract.criteria.length, fidelity: fid, provisional });
+    }
+    const reg = resourceRegistryOf(runEvents, { runId, ...(opts.allowance ? { allowance: opts.allowance } : {}), ...(opts.secrets ? { secrets: opts.secrets } : {}) });
+    for (const r of reg.pending) c.out.say(`transfer   ${r.id}  ${r.kind}  ${r.locator}  expires ${new Date(r.expiresAt).toISOString()} → tecera resources transfer|release ${r.id}`);
+    for (const p of reg.problems) c.out.error(`resources: ${p}`);
+    transfers = reg.pending.map((r) => ({ id: r.id, capability: r.capability, kind: r.kind, locator: r.locator, expiresAt: r.expiresAt }));
   }
   c.out.say(`plans      ${plans.accepted().length} accepted · ${plans.candidates().length} candidate(s) awaiting review`);
   c.out.set('runId', runId ?? null);
@@ -76,5 +106,7 @@ export const statusCommand: Command = async (c) => {
   c.out.set('openGoals', open.map((g) => g.id));
   c.out.set('intentions', live as unknown as Json);
   c.out.set('pending', pending as unknown as Json);
+  c.out.set('contracts', contracts);
+  c.out.set('pendingTransfer', transfers);
   return EXIT.ok;
 };

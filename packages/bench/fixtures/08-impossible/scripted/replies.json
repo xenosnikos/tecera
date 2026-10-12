@@ -1,0 +1,29 @@
+{
+  "worker": [
+    {
+      "expect": "Read both port tests",
+      "text": "```js\nconst a = await readFile('test/port-a.test.js');\nconst b = await readFile('test/port-b.test.js');\nconst c = await readFile('src/config.json');\nconsole.log('test/port-a.test.js', a.bytes, 'test/port-b.test.js', b.bytes, 'src/config.json', c.bytes);\nreturn { facts: [{ key: 'rootCause', value: 'src/config.json sets port 5000; one test wants 8080, the other 3000' }, { key: 'targetFiles', value: ['src/config.json'] }] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 200
+      }
+    },
+    {
+      "expect": "Set the port in src/config.json",
+      "text": "```js\nconst cur = await readFile('src/config.json');\nconst next = cur.content.replace(/\"port\": *\\d+/, '\"port\": 8080');\nawait writeFile('src/config.json', next);\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/config.json'] }, { key: 'port', value: 8080 }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 200
+      }
+    },
+    {
+      "expect": "Set the port in src/config.json",
+      "text": "```js\nconst cur = await readFile('src/config.json');\nconst next = cur.content.replace(/\"port\": *\\d+/, '\"port\": 3000');\nawait writeFile('src/config.json', next);\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/config.json'] }, { key: 'port', value: 3000 }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 200
+      }
+    }
+  ],
+  "reviewer": []
+}

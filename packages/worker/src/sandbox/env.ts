@@ -13,6 +13,14 @@ import { containsSecret } from '@tecera/contracts';
 /** The only names that may ever cross into a sandbox or verify env. */
 export const SANDBOX_SAFE_ENV: readonly string[] = Object.freeze(['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'CI', 'TERM', 'NO_COLOR']);
 
+/**
+ * Set (to the kind of process: 'repl' or 'verify') in the env of every process the sandbox starts. It is the
+ * supervisor's own marker, not an allowlist entry: commands that must not be run from inside the sandbox
+ * (Tecera's human decision commands) refuse when they see it. A program that wants to can unset it; it
+ * guards against accidents, nothing more.
+ */
+export const SANDBOX_MARKER_ENV = 'TECERA_SANDBOX';
+
 const DANGEROUS: readonly RegExp[] = [
   /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)/i,
   /^NODE_OPTIONS$/i,

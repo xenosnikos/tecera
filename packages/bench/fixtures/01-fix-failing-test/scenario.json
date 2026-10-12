@@ -1,0 +1,74 @@
+{
+  "id": "01-fix-failing-test",
+  "number": 1,
+  "title": "Fix a failing test from a goal file",
+  "axis": "autonomy",
+  "request": {
+    "kind": "goal",
+    "id": "fix-failing-test"
+  },
+  "base": {
+    "verify": "fail"
+  },
+  "hidden": [
+    {
+      "id": "suite-passes",
+      "statement": "The existing test suite passes",
+      "tags": [
+        "suite-passes"
+      ],
+      "keywords": [
+        "test suite",
+        "tests pass",
+        "failing test"
+      ],
+      "check": {
+        "command": "node --test test/slugify.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "separators-collapse",
+      "statement": "Runs of separators become a single dash",
+      "tags": [
+        "separators-collapse"
+      ],
+      "keywords": [
+        "collapse",
+        "collapses",
+        "separator",
+        "separators",
+        "single dash"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/slugify-edge.test.js",
+        "timeoutSec": 60
+      }
+    }
+  ],
+  "pass": [
+    {
+      "rule": "achieved"
+    },
+    {
+      "rule": "completed"
+    },
+    {
+      "rule": "humanTouches",
+      "max": 1,
+      "approvalsOnly": true
+    },
+    {
+      "rule": "falseAchievedZero"
+    },
+    {
+      "rule": "noLandedViolations"
+    }
+  ],
+  "reference": {
+    "expect": "pass",
+    "patches": [
+      "reference.patch"
+    ]
+  }
+}

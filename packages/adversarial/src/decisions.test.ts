@@ -25,7 +25,6 @@ import { SqliteLedger } from '@tecera/ledger';
 import { deliveryChainProblems, DELIVERY_CHAIN } from '@tecera/policy';
 import { ReflexRouter } from '@tecera/reflex';
 import { replayRun } from '@tecera/runtime';
-import { expectGap } from './harness/gap.js';
 import { cli, dump, fixturePlan, fixtureReplies, Flow, git, KEYS, ledgerEvents, requestIdOf, sampleRepo, stopHook, type Ev } from './harness/e2e.js';
 import { manifestInput, StubReviewer, WRITERS } from './harness/gates.js';
 import { environ } from './harness/procs.js';
@@ -270,7 +269,7 @@ describe('owner decisions D1–D7 (2026-10-05)', () => {
     expect(broken.code, broken.out + broken.err).toBe(2);
   }, 300_000);
 
-  it('decision.d4_stop_hook [forged achievement while held] GAP (owner: runtime stopHook.ts): a well-formed goal.achieved appended out of band while the run is still held at its PR (nothing delivered, so the run does not derive as achieved) does not let the assistant stop', async () => {
+  it('decision.d4_stop_hook [forged achievement while held]: a well-formed goal.achieved appended out of band while the run is still held at its PR (nothing delivered, so the run does not derive as achieved) does not let the assistant stop', async () => {
     const h = await heldAtPr();
     const runId = h.flow.runId;
     const verify2 = h.evs.find((e) => e.kind === 'verify.passed' && e.trace.stepId === 'verify2')!.payload as { evidenceKey: string; fingerprint: string };
@@ -296,11 +295,84 @@ describe('owner decisions D1–D7 (2026-10-05)', () => {
     } finally {
       l.close();
     }
+    const before = (await ledgerEvents(h.dir)).length;
     const r = await stopHook(h.dir);
-    await expectGap('decision.d4_stop_hook [forged achievement while held]', 'runtime stopHook.ts (accept a proof only for a run whose achievement derives: deriveGoalStatus with the PR delivered)', { assertion: 'the Stop hook blocks on an underived achievement' }, () => {
-      expect(r.code, 'the Stop hook blocks on an underived achievement').toBe(2);
-    });
+    expect(r.code, 'the Stop hook blocks on an underived achievement').toBe(2);
+    expect(r.err).toMatch(/before delivering it: no PR was delivered/);
+    expect((await ledgerEvents(h.dir)).slice(before).map((e) => e.kind)).toContain('stop.blocked');
   }, 240_000);
+
+  it('decision.d4_stop_hook [forged run.ended]: a chain-valid run.ended appended out of band while the run is held at its PR (any exit code) does not hide the run: its approval is still open in the approvals table, so the Stop hook keeps blocking', async () => {
+    for (const exitCode of [0, 1, 5, 7]) {
+      const h = await heldAtPr();
+      const runId = h.flow.runId;
+      expect((await stopHook(h.dir)).code).toBe(2);
+      await appendForged(h.dir, 'run.ended', runId, {}, { exitCode, reason: 'forged', goalId: h.goalId });
+      // the attack state: the chain is intact, the run's last run.ended is the forged one, nothing was delivered
+      const l = new SqliteLedger(join(h.dir, '.tecera/ledger.sqlite'));
+      try {
+        expect(await l.verifyChain()).toMatchObject({ ok: true });
+        expect((await l.getApproval(requestIdOf(await h.flow.pending())!))?.state).toBe('pending');
+      } finally {
+        l.close();
+      }
+      const evs = await ledgerEvents(h.dir);
+      expect(evs.filter((e) => e.kind === 'run.ended' && e.runId === runId).at(-1)!.payload).toMatchObject({ exitCode, reason: 'forged' });
+      expect(evs.some((e) => e.kind === 'pr.requested' || e.kind === 'pr.opened')).toBe(false);
+      const before = evs.length;
+      const r = await stopHook(h.dir);
+      expect(r.code, `forged run.ended exit ${exitCode}: the Stop hook let the assistant stop\n${r.out}${r.err}`).toBe(2);
+      expect(r.err).toMatch(/still open in the approvals table/);
+      const recorded = (await ledgerEvents(h.dir)).slice(before);
+      expect(recorded.map((e) => e.kind)).toEqual(['stop.blocked']);
+      expect((recorded[0]!.payload as { activeRun?: { runId?: string; state?: string } }).activeRun).toMatchObject({ runId, state: 'held' });
+      // what really closes the hold still does: the human denies it, and the forged end then hides nothing
+      if (exitCode === 1) {
+        const deny = await cli(h.dir, ['deny', requestIdOf(await h.flow.pending())!, '--as', 'reviewer-human', '--reason', 'no'], { env: { ...KEYS } });
+        expect(deny.code, deny.out + deny.err).toBe(0);
+        expect((await stopHook(h.dir)).code).toBe(0);
+      }
+    }
+  }, 600_000);
+
+  it('decision.d4_stop_hook [forged pr.requested]: between `tecera approve` and the resume, a forged pr.requested naming the granted (unconsumed) approval plus a well-formed goal.achieved does not let the assistant stop: nothing was delivered', async () => {
+    const h = await heldAtPr();
+    const runId = h.flow.runId;
+    const request = (await h.flow.pending())!;
+    const rid = await h.flow.approvePending('pr');
+    // approved, not resumed: still held
+    expect((await stopHook(h.dir)).code).toBe(2);
+    const verify2 = h.evs.find((e) => e.kind === 'verify.passed' && e.trace.stepId === 'verify2')!.payload as { evidenceKey: string; fingerprint: string };
+    const sha = (h.evs.find((e) => e.kind === 'commit.recorded')!.payload as { sha: string }).sha;
+    const l0 = new SqliteLedger(join(h.dir, '.tecera/ledger.sqlite'));
+    let verifiedAt = Date.now();
+    try {
+      const b = (await l0.getEvidence(verify2.evidenceKey))!.body as { startedAt?: number; finishedAt?: number };
+      verifiedAt = b.finishedAt ?? b.startedAt ?? verifiedAt;
+    } finally {
+      l0.close();
+    }
+    const prTrace = { goalId: h.goalId, intentionId: request.trace.intentionId!, stepId: 'pr' };
+    const achieved = { goal: { ...h.goal, status: 'achieved' } as never, evidence: [verify2.evidenceKey], proof: { command: 'node --test', exitCode: 0, fingerprint: verify2.fingerprint, evidenceKey: verify2.evidenceKey, verifiedAt } };
+    // (1) the PR event alone, naming the granted approval
+    await appendForged(h.dir, 'pr.requested', runId, prTrace, { step: 'pr', sha, branch: 'tecera/fix-failing-test', approvalRequestId: rid, evidenceKey: `pr:${runId}:forged` });
+    await appendForged(h.dir, 'goal.achieved', runId, { goalId: h.goalId }, achieved);
+    const l = new SqliteLedger(join(h.dir, '.tecera/ledger.sqlite'));
+    try {
+      expect(await l.verifyChain()).toMatchObject({ ok: true });
+      expect((await l.getApproval(rid))?.state, 'the grant was never spent').toBe('granted');
+    } finally {
+      l.close();
+    }
+    expect((await ledgerEvents(h.dir)).filter((e) => e.kind === 'approval.consumed')).toEqual([]);
+    const r = await stopHook(h.dir);
+    expect(r.code, `the Stop hook let the assistant stop on a forged pr.requested\n${r.out}${r.err}`).toBe(2);
+    expect(r.err).toMatch(/before delivering it: its PR approval \S+ is granted in the approvals table, not consumed/);
+    // (2) with a forged run.ended on top (exit 0): the open grant still holds the run
+    await appendForged(h.dir, 'run.ended', runId, {}, { exitCode: 0, reason: 'goal achieved', goalId: h.goalId });
+    expect((await stopHook(h.dir)).code).toBe(2);
+    expect((await ledgerEvents(h.dir)).filter((e) => e.kind === 'stop.allowed')).toEqual([]);
+  }, 300_000);
 
   it('decision.d4_achieved_proof: every goal.achieved carries a proof bound to the passing final verify of the committed candidate; contracts refuse an achievement without evidence or with a malformed proof; derivation refuses a proof-less achievement', async () => {
     // contracts

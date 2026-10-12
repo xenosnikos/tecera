@@ -1,0 +1,12 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+const bin = fileURLToPath(new URL('../bin/report.js', import.meta.url));
+const run = (...a) => spawnSync(process.execPath, [bin, ...a], { encoding: 'utf8' });
+
+test('--format csv starts with a header row', () => {
+  const r = run('--format', 'csv');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.split('\n')[0], 'region,total');
+});

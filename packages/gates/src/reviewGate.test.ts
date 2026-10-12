@@ -87,6 +87,17 @@ describe('ReviewGate verdicts', () => {
     expect((await gate.review(c)).verdict).toBe('reject');
   });
 
+  it('a reviewer reply that did not finish with stop is never an approve, whatever its body says', async () => {
+    for (const [finishReason, reason] of [['length', 'incomplete'], ['error', 'reviewer-error'], ['tool_use', 'incomplete']] as const) {
+      const s = setup(() => APPROVE);
+      // an approving body, cut off or errored by the provider
+      s.reviewer.complete = async (req) => ({ content: APPROVE, usage: { inputTokens: 10, outputTokens: 5, usd: 0.001 }, model: req.model, finishReason: finishReason as never, ...(finishReason === 'error' ? { error: 'upstream failed' } : {}) });
+      const r = await s.gate.review(s.c);
+      expect(r, finishReason).toMatchObject({ verdict: 'reject', reason });
+      expect(((await s.ledger.getEvidence(r.evidenceKey))!.body as { verdict: string }).verdict).toBe('reject');
+    }
+  });
+
   it('an explicit reject keeps its findings (not terminal: the loop may retry the intention)', async () => {
     const { gate, ledger, c } = setup(() => '{"verdict":"reject","findings":[{"title":"bug","path":"src/a.ts"}]}');
     const r = await gate.review(c);

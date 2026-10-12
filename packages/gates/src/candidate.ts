@@ -87,6 +87,12 @@ export interface IgnoredBaseline {
 export interface SnapshotOptions {
   /** Ignored files recorded on the untouched tree. Unchanged ones are not changes; missing ones are. */
   ignoredBaseline?: IgnoredBaseline;
+  /**
+   * The work branch of an intention that was prepared onto its own branch (intentionBranch.ts). It is part
+   * of the fingerprint, so evidence keyed by a fingerprint (verify, criteria, review) is never shared between
+   * two intentions of one run. Absent for a goal's first intention: its fingerprints are unchanged.
+   */
+  branch?: string;
   signal?: AbortSignal;
 }
 
@@ -219,7 +225,9 @@ export async function snapshotCandidate(dir: string, base: string, o: SnapshotOp
     const oid = gitOid(safety.objectFormat, bytes);
     const sha = sha256(bytes);
     if (basename(p) === '.gitattributes' || p === '.gitmodules') attrTexts.push({ path: p, text: bytes.toString('utf8') });
-    if (b && b.mode === mode && b.oid === oid) continue;
+    // An unchanged tracked file is exempt only while it is no second name of another inode: the same bytes
+    // hard-linked to a file outside the tree are recorded (nlink) so the commit gate refuses the link.
+    if (b && b.mode === mode && b.oid === oid && st.nlink <= 1) continue;
     let stamp: string | undefined;
     if (ign) {
       // The metadata is stamped BEFORE the baseline exemption: same bytes with another type, mode or link
@@ -270,6 +278,7 @@ export async function snapshotCandidate(dir: string, base: string, o: SnapshotOp
     v: 4,
     head,
     baseCommit,
+    ...(o.branch !== undefined ? { branch: o.branch } : {}),
     // A deleted baseline entry is fingerprinted by its key, never by its (display) name.
     files: files.map((f) => [f.deleted ? `<deleted ${f.pathKey}>` : f.path, f.status, f.mode ?? null, f.oid ?? null, f.sha256 ?? null, f.unreadable ?? null, f.stamp ?? null]),
     ignored: Object.keys(ignored)

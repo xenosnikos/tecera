@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prActionHash, type GateContext, type GateRunner } from '@tecera/contracts';
 import { createGates, SameProviderReview } from './index.js';
-import { ctx, FakeReviewer, FakeRunner, grantAudited, LEDGERS, makeRepo, manifest, WRITERS } from './testkit/fixtures.js';
+import { ctx, FakeReviewer, FakeRunner, grantAudited, LEDGERS, makeRepo, manifest, recordVerify, WRITERS } from './testkit/fixtures.js';
 
 /**
  * The loop's side of the contract (D6), replayed step by step exactly as packages/loop/src/loop.ts does it
@@ -24,6 +24,8 @@ describe.each(LEDGERS)('loop: commit (no approval) → PR hold → grant → res
     const base = { worktree: repo.dir };
     const v = await gates.verify(ctx('v', base));
     expect(v).toMatchObject({ exitCode: 0, terminal: false });
+    // loop: verify.passed, the audited event gate.pr proves achievement with
+    await recordVerify(ledger, v, { at: 1000 });
     const r = await gates.review(ctx('r', { ...base, candidate: { d1: v.fingerprint } }));
     expect(r).toMatchObject({ verdict: 'approve', terminal: false, fingerprint: v.fingerprint });
     expect(reviewer.calls[0]!.model).toBe('gpt-review');
@@ -44,8 +46,8 @@ describe.each(LEDGERS)('loop: commit (no approval) → PR hold → grant → res
     expect((await ledger.getApproval!('ap1'))!.state).toBe('consumed');
     const events = [];
     for await (const e of ledger.events()) events.push(e);
-    // The only event is the ingress audit of the grant: the gates themselves emit none.
-    expect(events.map((e) => e.kind)).toEqual(['approval.granted']);
+    // The only events are the loop's verify.passed and the ingress audit of the grant: the gates themselves emit none.
+    expect(events.map((e) => e.kind)).toEqual(['verify.passed', 'approval.granted']);
     for (const k of [v.evidenceKey, r.evidenceKey, c.evidenceKey, pr.evidenceKey]) expect(await ledger.getEvidence(k)).not.toBeNull();
   });
 });

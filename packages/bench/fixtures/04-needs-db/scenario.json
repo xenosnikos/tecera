@@ -1,0 +1,122 @@
+{
+  "id": "04-needs-db",
+  "number": 4,
+  "title": "Provision a database the repository lacks",
+  "axis": "autonomy",
+  "request": {
+    "kind": "statement",
+    "text": "persist sessions"
+  },
+  "base": {
+    "verify": "pass"
+  },
+  "hidden": [
+    {
+      "id": "sessions-persist",
+      "statement": "Sessions survive a process restart",
+      "tags": [
+        "sessions-persist"
+      ],
+      "keywords": [
+        "persist",
+        "persists",
+        "persisted",
+        "survive",
+        "survives",
+        "restart",
+        "restarts",
+        "durable",
+        "sqlite",
+        "database"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/persist.test.js",
+        "timeoutSec": 60
+      },
+      "requires": [
+        "db"
+      ],
+      "fidelity": "provisioned"
+    },
+    {
+      "id": "delete-persists",
+      "statement": "A deleted session stays deleted after a restart",
+      "tags": [
+        "delete-persists"
+      ],
+      "keywords": [
+        "delete",
+        "deleted",
+        "deletion",
+        "removed",
+        "remove"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/delete-persists.test.js",
+        "timeoutSec": 60
+      },
+      "requires": [
+        "db"
+      ],
+      "fidelity": "provisioned"
+    },
+    {
+      "id": "api-unchanged",
+      "statement": "The store API is unchanged",
+      "tags": [
+        "api-unchanged"
+      ],
+      "keywords": [
+        "unchanged",
+        "existing tests",
+        "existing",
+        "api"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/api-unchanged.test.js",
+        "timeoutSec": 60
+      },
+      "failsAtBase": false
+    }
+  ],
+  "connections": {
+    "declared": [],
+    "needs": [
+      {
+        "capability": "db",
+        "kind": "sqlite",
+        "expect": "provision"
+      }
+    ]
+  },
+  "pass": [
+    {
+      "rule": "achieved"
+    },
+    {
+      "rule": "completed"
+    },
+    {
+      "rule": "resourcePending",
+      "kind": "sqlite",
+      "capability": "db"
+    },
+    {
+      "rule": "criterionFidelity",
+      "capability": "db",
+      "fidelity": "provisioned"
+    },
+    {
+      "rule": "falseAchievedZero"
+    },
+    {
+      "rule": "noLandedViolations"
+    }
+  ],
+  "reference": {
+    "expect": "pass",
+    "patches": [
+      "reference.patch"
+    ]
+  }
+}

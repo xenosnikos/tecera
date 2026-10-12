@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, linkSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { GateApproval, Ledger, Manifest, Plan } from '@tecera/contracts';
+import type { AcceptanceContract, GateApproval, Ledger, Manifest, Plan } from '@tecera/contracts';
 import { MemoryLedger } from '@tecera/ledger';
 import { testsReadOnlyFor } from './commitGate.js';
 import { createGates, type CreateGatesOptions } from './index.js';
@@ -21,8 +21,8 @@ interface Setup {
   fresh(extra?: Partial<CreateGatesOptions>): ReturnType<typeof createGates>;
 }
 
-async function prepared(opts: { ledger?: Ledger; change?: (r: Repo) => void; m?: Manifest; p?: Plan; extra?: Partial<CreateGatesOptions>; expectApprove?: boolean } = {}): Promise<Setup> {
-  const repo = makeRepo();
+async function prepared(opts: { ledger?: Ledger; change?: (r: Repo) => void; m?: Manifest; p?: Plan; extra?: Partial<CreateGatesOptions>; expectApprove?: boolean; files?: Record<string, string> } = {}): Promise<Setup> {
+  const repo = makeRepo(opts.files);
   (opts.change ?? ((r) => r.write('src/a.ts', 'export const a = 2;\n')))(repo);
   const ledger = opts.ledger ?? memLedger();
   const clock = { t: NOW };
@@ -263,6 +263,19 @@ describe('CommitGate classification, tamper and boundary → exit 8', () => {
     ['outside the plan write globs', (r) => r.write('src/a.ts', 'export const a = 2;\n'), undefined, plan({ write: ['src/lib/**'] }), 'outside-plan-write'],
     ['symlink', (r) => symlinkSync('../../', join(r.dir, 'src/link')), undefined, undefined, 'boundary'],
     ['hardlink', (r) => linkSync(join(r.dir, 'src/a.ts'), join(r.dir, 'src/hard.ts')), undefined, undefined, 'tamper'],
+    [
+      'an unchanged tracked file replaced by a hard link to an outside file with the same bytes',
+      (r) => {
+        r.write('src/a.ts', 'export const a = 2;\n');
+        const outside = join(mkdtempSync(join(tmpdir(), 'tecera-gates-outside-')), 'a.test.ts');
+        writeFileSync(outside, readFileSync(join(r.dir, 'src/a.test.ts')));
+        rmSync(join(r.dir, 'src/a.test.ts'));
+        linkSync(outside, join(r.dir, 'src/a.test.ts'));
+      },
+      undefined,
+      undefined,
+      'tamper',
+    ],
     ['mode change', (r) => chmodSync(join(r.dir, 'src/a.ts'), 0o755), undefined, undefined, 'tamper'],
     ['new executable file', (r) => (r.write('src/run.ts', 'x\n'), chmodSync(join(r.dir, 'src/run.ts'), 0o755)), undefined, undefined, 'tamper'],
     ['ignored file', (r) => (r.write('src/a.ts', 'export const a = 2;\n'), r.write('ignored/x.txt', 'x')), undefined, undefined, 'boundary'],
@@ -278,6 +291,38 @@ describe('CommitGate classification, tamper and boundary → exit 8', () => {
     onMain(s.repo);
     noBranch(s.repo);
     expect(((await s.ledger.getEvidence(r.evidenceKey))!.body as { exitCode: number }).exitCode).toBe(8);
+  });
+
+  it('under an acceptance contract, a candidate that rewrites the file a criterion runs is tampering (8), inside allowedChanges or not; without the contract it commits', async () => {
+    const contract: AcceptanceContract = {
+      goalId: 'g1',
+      statement: 'make a two',
+      criteria: [{ id: 'a-check', statement: 'the a check passes', check: { kind: 'command', command: 'node src/a.ts', timeoutSec: 30 } }],
+      outOfScope: [],
+      assumptions: [],
+    };
+    const s = await prepared();
+    const r = await s.gates.commit({ ...s.commitCtx(), contract });
+    expect(r).toMatchObject({ exitCode: 8, reason: 'tamper', terminal: true });
+    expect(JSON.stringify((await s.ledger.getEvidence(r.evidenceKey))!.body)).toMatch(/criterion-edit|src\/a\.ts/);
+    noBranch(s.repo);
+    const plain = await prepared();
+    expect((await plain.gates.commit(plain.commitCtx())).exitCode).toBe(0);
+  });
+
+  it('a criterion that runs a package script protects what the script body runs, read from the base package.json', async () => {
+    const contract = (command: string): AcceptanceContract => ({ goalId: 'g1', statement: 'make a two', criteria: [{ id: 'a-check', statement: 'the a check passes', check: { kind: 'command', command, timeoutSec: 30 } }], outOfScope: [], assumptions: [] });
+    const files = { 'package.json': JSON.stringify({ name: 'w', scripts: { check: 'node src/a.ts', lint: 'node src/lint.ts' } }, null, 2) + '\n', 'tools/package.json': JSON.stringify({ scripts: { verify: 'cd .. && node src/a.ts' } }) + '\n' };
+    for (const command of ['npm run check', 'timeout 20 yarn check', 'cd tools && npm run verify', 'npm --prefix tools run verify']) {
+      const s = await prepared({ files });
+      const r = await s.gates.commit({ ...s.commitCtx(), contract: contract(command) });
+      expect(r, command).toMatchObject({ exitCode: 8, reason: 'tamper', terminal: true });
+      expect(JSON.stringify((await s.ledger.getEvidence(r.evidenceKey))!.body), command).toMatch(/criterion-edit/);
+      noBranch(s.repo);
+    }
+    // a script whose body runs another file leaves the candidate alone
+    const other = await prepared({ files });
+    expect((await other.gates.commit({ ...other.commitCtx(), contract: contract('npm run lint') })).exitCode).toBe(0);
   });
 
   it('a small untracked binary is refused (8) even if a reviewer had approved the tree', async () => {

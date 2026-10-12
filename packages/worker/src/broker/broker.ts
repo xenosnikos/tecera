@@ -9,15 +9,21 @@ import {
   jsonDepth,
   makeRedactor,
   narrow,
+  payloadOf,
   requireWriteGuard,
   RPC_LIMITS,
   sha256,
+  simulatedProvenance,
   type ApprovalGrant,
+  type CapabilityMockedPayload,
+  type CapabilityRecord,
   type CapabilitySet,
   type Inputs,
   type Json,
   type JsonObject,
+  type MockToolDeclaration,
   type Outcome,
+  type Provenance,
   type Redactor,
   type SuspendRequest,
   type Tool,
@@ -35,7 +41,9 @@ import { CHECKPOINT_KEY_RE, STANDARD_STUBS } from '../protocol/prompts.js';
 import { toSafeJson } from '../protocol/serializer.js';
 import { canAuthorize, type WorkerToolContext } from '../tools/common.js';
 import { markWorktreeTainted, worktreeTaint } from '../tools/paths.js';
+import { MockRegistrationError, standInProblems, type StandIn } from '../mocks/admit.js';
 import { HandleError, HandleTable } from './handles.js';
+import { hostGateActionOf } from './hostGates.js';
 
 /**
  * The broker: the only path from generated code to tools. It implements the ToolBridge port. Authority
@@ -74,7 +82,8 @@ import { HandleError, HandleTable } from './handles.js';
  * Owner decision D6 (2026-10-05): writes inside paths.write on the leased work branch proceed without
  * approval under ANY isolation (fenced, logged, protected paths and tamper rules unchanged). There are no
  * per-write approvals: a guard answer other than 'allowed' refuses the write (tools/common.ts), and a
- * Suspend that names a write (SuspendRequest.write) is refused, never held.
+ * Suspend on a write-risk tool (Tool.risk 'write', authoritative: with or without SuspendRequest.write) or
+ * one that names a write on any tool is refused, never held.
  *
  * Host gates: pushing, opening a PR (HOST_GATE_ACTIONS) and merging are never worker tool calls. The
  * gate.pr step does them on the human approval it consumes; Tecera never merges. A program that calls a
@@ -106,29 +115,7 @@ export const INVOKE_TOOL = HOST_FUNCTIONS.invoke;
 /** @deprecated use HOST_FUNCTIONS.checkpoint from @tecera/contracts */
 export const CHECKPOINT_TOOL = HOST_FUNCTIONS.checkpoint;
 
-/**
- * Actions only the host performs (D6): gate.pr pushes and opens the PR on the human approval it consumes,
- * and nobody in Tecera merges. Kept in step with @tecera/policy PR_GATE_ACTIONS and MERGE_ACTIONS (the
- * worker depends on contracts only). A tool call is matched by `<tool>_<method>`, the method and the tool.
- */
-export const HOST_GATE_ACTIONS: ReadonlySet<string> = new Set([
-  'open_pr',
-  'git_push',
-  'gh_pr',
-  'pr_create',
-  'gh_pr_create',
-  'merge',
-  'git_merge',
-  'gh_merge',
-  'pr_merge',
-  'gh_pr_merge',
-]);
-
-/** The host-gate action a tool call would perform, or undefined. */
-export function hostGateActionOf(tool: string, method: string): string | undefined {
-  const names = [method && method !== 'call' ? `${tool}_${method}` : tool, method, tool].filter((a) => typeof a === 'string' && a !== '');
-  return names.find((a) => HOST_GATE_ACTIONS.has(a));
-}
+export { HOST_GATE_ACTIONS, hostGateActionOf } from './hostGates.js';
 
 export type BrokerErrorCode = 'E_HANDLE' | 'E_DENIED' | 'E_LIMIT' | 'E_SUSPENDED' | 'E_ABORTED' | 'E_TOOL' | 'E_FRAME';
 
@@ -239,6 +226,27 @@ export interface BrokerOptions {
   guard?: WriteGuard;
   /** tool name → program binding name (default: read→readFile, edit→writeFile, listFiles, runVerify). */
   stubNames?: Record<string, string>;
+  /**
+   * Stand-ins for capabilities the inventory lacks (mocks/admit.ts). Each is admitted against `inventory` and
+   * `connections` when the broker is built (MockRegistrationError otherwise); its results are always
+   * provenance-tagged simulated, and its first use in the tree records `capability.mocked`.
+   */
+  standIns?: readonly StandIn[];
+  /** The run's capability inventory; required whenever standIns are given (fail closed). */
+  inventory?: readonly CapabilityRecord[];
+  /** Manifest connections by capability id (`mockable: false` refuses a stand-in). */
+  connections?: Readonly<Record<string, { mockable?: boolean }>>;
+  /**
+   * Called once per stand-in per tree, on its first use, after the `capability.mocked` evidence was written
+   * and before the stand-in runs: the host records the `capability.mocked` event. A throw refuses the call.
+   */
+  onMocked?: (p: CapabilityMockedPayload) => void | Promise<void>;
+}
+
+/** What stand-ins served in an invoke tree: the capabilities and mock ids whose (simulated) results a program saw. */
+export interface SimulatedUse {
+  capabilities: string[];
+  mockIds: string[];
 }
 
 type Entry = { kind: 'tool'; tool: Tool } | { kind: 'history' };
@@ -256,6 +264,10 @@ interface Shared {
   qgen: { n: number };
   /** Every exec open on any broker of the tree (a quarantine stops them all). */
   execs: Set<{ broker: Broker; live: Live }>;
+  /** Mock ids whose first use was announced (capability.mocked) in this tree. */
+  mocked: Set<string>;
+  /** Announcements in progress (concurrent first calls share one). */
+  announcing: Map<string, Promise<AbortReason | null>>;
 }
 
 /** Apply `a` then `b` (both secret lists are honoured). */
@@ -345,10 +357,15 @@ export class Broker {
   private readonly adopted = new Set<Redactor>();
   private gen = 0;
   private live?: Live;
+  /** Stand-in tool name → its declaration. */
+  private readonly standIns: Map<string, MockToolDeclaration>;
 
   constructor(private readonly o: BrokerOptions, shared?: Shared) {
-    this.tools = new Map(o.tools.map((t) => [t.name, t]));
-    this.shared = shared ?? { key: o.key ?? randomBytes(32), grants: new Map(), journal: new Map(), execSeq: { n: 0 }, red: { r: o.redactor ?? makeRedactor([]) }, taint: null, effects: new Map(), qgen: { n: 0 }, execs: new Set() };
+    const refused = standInProblems(o.tools, o.standIns, { ...(o.inventory ? { inventory: o.inventory } : {}), ...(o.connections ? { connections: o.connections } : {}) }, (t) => this.stubName(t));
+    if (refused.length) throw new MockRegistrationError(refused);
+    this.standIns = new Map((o.standIns ?? []).map((s) => [s.declaration.tool, s.declaration]));
+    this.tools = new Map([...o.tools.map((t): [string, Tool] => [t.name, t]), ...(o.standIns ?? []).map((s): [string, Tool] => [s.declaration.tool, { ...s.tool, standsIn: s.declaration.capability }])]);
+    this.shared = shared ?? { key: o.key ?? randomBytes(32), grants: new Map(), journal: new Map(), execSeq: { n: 0 }, red: { r: o.redactor ?? makeRedactor([]) }, taint: null, effects: new Map(), qgen: { n: 0 }, execs: new Set(), mocked: new Set(), announcing: new Map() };
     this.handles = new HandleTable<Entry>(o.runId, this.shared.key);
   }
 
@@ -387,6 +404,22 @@ export class Broker {
   /** Quarantine state of this invoke tree (null when clean). */
   get tainted(): TaintInfo | null {
     return this.shared.taint ?? (worktreeTaint(this.o.worktree) !== null ? { reason: worktreeTaint(this.o.worktree)!, unresolved: [], worktree: this.o.worktree } : null);
+  }
+
+  /**
+   * What stand-ins served in this tree (announced first uses, plus stand-in effects carried over from a
+   * checkpoint). Non-empty = anything the step returns may rest on simulated data.
+   */
+  simulatedUses(): SimulatedUse {
+    const byTool = new Map([...this.standIns.values()].map((d) => [d.tool, d]));
+    const used = new Map<string, MockToolDeclaration>();
+    for (const d of byTool.values()) if (this.shared.mocked.has(d.mockId)) used.set(d.mockId, d);
+    for (const e of this.shared.effects.values()) {
+      const d = byTool.get(e.tool);
+      if (d) used.set(d.mockId, d);
+    }
+    const list = [...used.values()];
+    return { capabilities: [...new Set(list.map((d) => d.capability))].sort(), mockIds: list.map((d) => d.mockId).sort() };
   }
 
   /** Completed non-read effects of an invoke and its descendants. */
@@ -513,7 +546,9 @@ export class Broker {
     const out: Inputs = {};
     for (const t of this.tools.values()) {
       if (!s.capabilities.tools.includes(t.name)) continue;
-      out[this.stubName(t.name)] = { kind: 'handle', id: this.handles.mint(s.execNo, { kind: 'tool', tool: t }), methods: [...t.methods], description: `tool ${t.name} (risk ${t.risk})` };
+      const standIn = this.standIns.get(t.name);
+      const description = standIn ? `stand-in ${t.name} for ${standIn.capability} (risk ${t.risk}; SIMULATED: results are not real)` : `tool ${t.name} (risk ${t.risk})`;
+      out[this.stubName(t.name)] = { kind: 'handle', id: this.handles.mint(s.execNo, { kind: 'tool', tool: t }), methods: [...t.methods], description };
     }
     out.__history__ = { kind: 'handle', id: this.handles.mint(s.execNo, { kind: 'history' }), methods: [...HISTORY_METHODS], description: 'earlier turns of this step (untrusted data)' };
     return out;
@@ -832,6 +867,26 @@ export class Broker {
     this.fatal(L, [...settle, ...(exit.abort?.reasons ?? [])]);
   }
 
+  /**
+   * Record a stand-in's first use: `capability.mocked` evidence (key mock:<runId>:<mockId>, idempotent) and
+   * the host's onMocked. Returns the refusal reason when either fails (the stand-in then serves nothing).
+   */
+  private async announceMock(L: Live, d: MockToolDeclaration): Promise<AbortReason | null> {
+    const payload: CapabilityMockedPayload = { capability: d.capability, kind: d.kind, tool: d.tool, mockId: d.mockId, reason: d.reason };
+    try {
+      await L.session.spans.evidence(`mock:${this.o.runId}:${d.mockId}`, 'capability.mocked', payloadOf('capability.mocked', payload));
+    } catch (e) {
+      return { code: 'ledger', reason: `capability.mocked not recorded: ${(e as Error).message}`, hookId: 'broker' };
+    }
+    try {
+      await this.o.onMocked?.(payload);
+    } catch (e) {
+      return { code: 'policy', reason: `capability.mocked refused by the host: ${(e as Error)?.message ?? 'onMocked failed'}`, hookId: 'broker' };
+    }
+    this.shared.mocked.add(d.mockId);
+    return null;
+  }
+
   private async toolCall(L: Live, tool: Tool, req: ToolRequest, callSeq: number): Promise<ToolResult> {
     const s = L.session;
     const spanId = `tool:${s.invokeId}:e${s.execNo}:c${callSeq}:g${s.spans.attempt}`;
@@ -897,7 +952,10 @@ export class Broker {
     c = await s.spans.emit('ToolCall', 'Send', spanId, input, caps);
     if (c.abort) return this.deny(L, spanId, input, caps, req, tool.name, c.abort.reasons);
     if (c.suspend) {
-      // D6: a write is never held for its own approval; a Suspend naming one is refused.
+      // D6: a write is never held for its own approval. The tool's risk is authoritative: a Suspend on a
+      // write-risk tool is refused whatever the request says (with or without SuspendRequest.write), so it
+      // never reaches the suspension report, a checkpoint or an approval request.
+      if (tool.risk === 'write') return this.deny(L, spanId, input, caps, req, tool.name, [{ code: 'policy', reason: `${tool.name} is a write-risk tool: a hook may not hold it for approval (per-write approvals were removed, D6)`, hookId: 'broker' }]);
       const perWrite = c.suspend.find((r) => r && typeof r === 'object' && r.write !== undefined);
       if (perWrite) return this.deny(L, spanId, input, caps, req, tool.name, [{ code: 'policy', reason: `Suspend request ${perWrite.requestId} names a write: per-write approvals were removed (D6)`, hookId: 'broker' }]);
       const unbound = c.suspend.filter((r) => r.actionHash !== actionHash);
@@ -921,6 +979,19 @@ export class Broker {
       if (refused.length) return this.deny(L, spanId, input, caps, req, tool.name, refused);
     }
 
+    // A stand-in's first use in the tree is announced before it serves anything: `capability.mocked`
+    // evidence, then the host's record (onMocked). Either failing refuses the call.
+    const standIn = this.standIns.get(tool.name);
+    if (standIn && !this.shared.mocked.has(standIn.mockId)) {
+      let pending = this.shared.announcing.get(standIn.mockId);
+      if (!pending) {
+        pending = this.announceMock(L, standIn).finally(() => this.shared.announcing.delete(standIn.mockId));
+        this.shared.announcing.set(standIn.mockId, pending);
+      }
+      const announced = await pending;
+      if (announced) return this.deny(L, spanId, input, caps, req, tool.name, [announced]);
+    }
+
     // Liveness re-check immediately before anything runs: a suspension, an abort or the end of the exec
     // that happened while this call was in its hooks means it never executes.
     if (!this.isLive(L)) {
@@ -936,10 +1007,12 @@ export class Broker {
       return this.stoppedError(L, req.callId);
     }
 
+    // Tools never mint trust; a stand-in's results are simulated whatever it (or a hook) says.
+    const prov: Provenance = standIn ? simulatedProvenance(standIn.capability, this.o.runId) : { src: `tool:${tool.name}`, trust: 'untrusted' };
     let result: ToolResult;
     let executed = false;
     if (c.replaceOutput !== undefined) {
-      result = { callId: req.callId, ok: true, value: c.replaceOutput, provenance: { src: `tool:${tool.name}`, trust: 'untrusted' }, truncated: false };
+      result = { callId: req.callId, ok: true, value: c.replaceOutput, provenance: prov, truncated: false };
     } else {
       executed = true;
       L.running.set(callSeq, tool.name);
@@ -947,7 +1020,7 @@ export class Broker {
         result = await tool.call(call, this.ctxFor(caps, L), L.guard);
         if (!result || typeof result !== 'object') throw new Error('tool returned no result');
       } catch (e) {
-        result = { callId: req.callId, ok: false, error: { name: 'E_TOOL', message: (e as Error)?.message ?? 'tool failed' }, provenance: { src: `tool:${tool.name}`, trust: 'untrusted' }, truncated: false };
+        result = { callId: req.callId, ok: false, error: { name: 'E_TOOL', message: (e as Error)?.message ?? 'tool failed' }, provenance: prov, truncated: false };
       } finally {
         L.running.delete(callSeq);
       }
@@ -966,7 +1039,7 @@ export class Broker {
       ok,
       ...(value !== undefined ? { value } : {}),
       ...(ok ? {} : { error: { name: this.red.redactText(String(result.error?.name ?? 'E_TOOL')).slice(0, 64), message: this.red.redactText(String(result.error?.message ?? 'tool failed')) } }),
-      provenance: { src: `tool:${tool.name}`, trust: 'untrusted', ...(path ? { path: this.red.redactText(path) } : {}), ...(value !== undefined ? { digest: digest(value) } : {}) },
+      provenance: { ...prov, ...(path ? { path: this.red.redactText(path) } : {}), ...(value !== undefined ? { digest: digest(value) } : {}) },
       truncated: result.truncated === true,
     };
     const effect = executed && out.ok && tool.risk !== 'read';

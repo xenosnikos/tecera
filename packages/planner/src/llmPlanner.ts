@@ -3,7 +3,10 @@ import {
   type AchievementGoal,
   type Belief,
   type BeliefProjection,
+  type CapabilityRecord,
+  type ContractDraft,
   type Intention,
+  type Json,
   type LLM,
   type LLMEffort,
   type LLMMessage,
@@ -12,6 +15,7 @@ import {
   type Manifest,
   type Plan,
   type Planner,
+  type PlanningContext,
   type Redactor,
   type SecretInput,
   type TeceraEvent,
@@ -20,9 +24,23 @@ import {
 import { DEFAULT_PERMISSIONS, type PermissionsDoc } from '@tecera/policy';
 import { materializeBudget } from './budget.js';
 import { DEFAULT_TOOL_CATALOG, sanitizeDiagnostics, validateCandidate } from './checks.js';
+import { assembleDraft, CONTRACT_WIRE_JSON_SCHEMA, ContractRejected, parseContractOutput, planCapabilities, planContractHash } from './contract.js';
 import { decodedSecretKind, inertRedacted } from './hygiene.js';
+import { contractQualityIssues, impliedNeeds, withTags } from './quality.js';
+import type { RepoFacts } from './repoFacts.js';
+import { settlePlanDocument } from './scope.js';
+import { capabilityRoutes, standInInstructionIssues } from './standIn.js';
 import { parseDeliberationOutput, parsePlanOutput } from './parse.js';
-import { buildDeliberationPrompt, buildPlannerPrompt, buildRepairMessage, echoAssistant, type PromptNote, type PromptSeat } from './prompt.js';
+import {
+  buildContractPrompt,
+  buildContractRepairMessage,
+  buildDeliberationPrompt,
+  buildPlannerPrompt,
+  buildRepairMessage,
+  echoAssistant,
+  type PromptNote,
+  type PromptSeat,
+} from './prompt.js';
 import { newNonce, safeLine } from './render.js';
 import { PLAN_WIRE_JSON_SCHEMA, toPlan } from './schema.js';
 
@@ -32,6 +50,30 @@ import { PLAN_WIRE_JSON_SCHEMA, toPlan } from './schema.js';
  * the (sanitised) issues back; still invalid → PlanRejected {issues, plan?}. The returned plan is a
  * candidate (origin 'generated', status 'candidate', host-stamped id and trigger, every budget field set)
  * that the loop validates again and stages.
+ *
+ * With a planning context (an accepted contract), the plan records the contract hash and its capabilities
+ * (the document's plus every one a criterion requires) and must pass contractPlanIssues: a plan missing a
+ * criterion's verify is refused here, before it leaves the planner.
+ *
+ * The host settles two things in the model's document before it is stamped (settlePlanDocument):
+ * permissions.write is the manifest's allowedChanges (what the request or contract names never narrows it),
+ * and every file-changing worker step returns {changed, summary} with at least one changed path.
+ *
+ * draftContract(): prompt → one completion → strict decode (CONTRACT_WIRE_JSON_SCHEMA) → host-stamped goal
+ * id and statement, needs built from the criteria → contractDraftIssues (contractProblem, bounds, secrets, no
+ * requestor criterion weakened) → contractQualityIssues (behavioural, focused criteria; the capabilities the
+ * statement implies required; nothing the verify sandbox cannot run: a server, the network, a background job;
+ * with repoFacts, no import of a package the repository does not install and no call of an existing tested
+ * function with another call shape); on any
+ * issue the same single repair round; still invalid → ContractRejected. Every rejected answer is reported to
+ * onDraftRejected (redacted, inert) before anything else happens, so the screen's decision can be audited; a
+ * failing record aborts the call. An accepted draft's criteria carry normalised tags (outside the contract hash).
+ *
+ * Under a contract, the capabilities its criteria require are tools too (the host serves a provisioned resource
+ * or a stand-in under the capability's id): the prompt names them per capability and the catalog the plan is
+ * checked against includes them. Such a tool is for the worker's own exploration and checks only: a plan whose
+ * step instruction has the code call it is refused (standInInstructionIssues), since product code reaches the
+ * capability through the repository's own seam.
  *
  * deliberate(): choose by plan id; a provider (transport) failure, a non-'stop' (e.g. truncated) answer or
  * an unparseable one falls back to the first option, and a truncated answer's text is never used.
@@ -88,7 +130,7 @@ export class PlannerAccountingError extends Error {
   readonly code?: 'budget';
   constructor(
     message: string,
-    public readonly sink: 'usage' | 'deliberation',
+    public readonly sink: 'usage' | 'deliberation' | 'draft',
     budget = false,
   ) {
     super(message);
@@ -129,7 +171,7 @@ export function isBudgetFailure(err: unknown): boolean {
 /** Recorded on the meter when real usage is unknown: the loop charges the full reservation for it. */
 const UNKNOWN_USAGE: LLMUsage = Object.freeze({ inputTokens: Number.NaN, outputTokens: Number.NaN, usd: Number.NaN }) as LLMUsage;
 
-export type PlannerCallPurpose = 'write' | 'repair' | 'deliberate';
+export type PlannerCallPurpose = 'write' | 'repair' | 'deliberate' | 'draft' | 'draft-repair';
 
 export interface PlannerUsage {
   seatId: string;
@@ -150,6 +192,17 @@ export interface DeliberationRecord {
   reason: string;
   /** True when the model's answer was unusable and the first option was taken. */
   fallback: boolean;
+}
+
+/** A drafted contract the host refused (onDraftRejected): what was proposed and why, for the record. */
+export interface RejectedDraft {
+  goalId: string;
+  /** 1 for the first answer, 2 for the repair round. */
+  attempt: number;
+  /** Sanitised issues (redacted, single-line, bounded). */
+  issues: string[];
+  /** The draft as assembled (redacted, inert), or null when the answer did not parse into one. */
+  contract: Json | null;
 }
 
 type NotesSource = readonly PromptNote[] | ((goal: AchievementGoal, e: TeceraEvent) => readonly PromptNote[] | Promise<readonly PromptNote[]>);
@@ -180,6 +233,19 @@ export interface LLMPlannerOptions {
   /** Awaited for every deliberation decision. A throw/rejection aborts the call. */
   onDeliberation?: (d: DeliberationRecord) => void | Promise<void>;
   signal?: AbortSignal;
+  /**
+   * Whether a repository-relative file exists now (read-only). When given, a drafted criterion that runs a file
+   * the repository does not hold yet is refused: a worker may never write a file a criterion runs.
+   */
+  repoFiles?: (path: string) => boolean;
+  /**
+   * What the repository installs and the API its tests use (read-only, the host's). Given, both prompts list
+   * them, and a drafted criterion that imports a package the repository does not install, or calls an existing
+   * tested function with another call shape, is refused.
+   */
+  repoFacts?: RepoFacts | (() => RepoFacts);
+  /** Awaited for every drafted contract the host refuses. A throw/rejection aborts the call. */
+  onDraftRejected?: (r: RejectedDraft) => void | Promise<void>;
   /** Envelope nonce generator (tests). */
   nonce?: () => string;
 }
@@ -230,9 +296,10 @@ export class LLMPlanner implements Planner {
     this.workerSeats = o.seats ? manifestSeats.filter((s) => o.seats!.some((x) => x.id === s)) : manifestSeats;
   }
 
-  async write(e: TeceraEvent, beliefs: BeliefProjection, goal: AchievementGoal, meter?: UsageMeter): Promise<Plan> {
+  async write(e: TeceraEvent, beliefs: BeliefProjection, goal: AchievementGoal, meter?: UsageMeter, ctx?: PlanningContext): Promise<Plan> {
     const nonce = this.o.nonce?.() ?? newNonce();
     const [lessons, skills] = await Promise.all([this.notes(this.o.lessons, goal, e), this.notes(this.o.skills, goal, e)]);
+    const repo = this.facts();
     const messages = buildPlannerPrompt({
       manifest: this.o.manifest,
       goal,
@@ -242,13 +309,15 @@ export class LLMPlanner implements Planner {
       lessons,
       skills,
       permissions: this.o.permissions,
-      toolCatalog: this.o.toolCatalog,
+      toolCatalog: this.catalogFor(goal, ctx),
       redactor: this.redactor,
       nonce,
+      ...(ctx ? { planning: ctx } : {}),
+      ...(repo ? { repo } : {}),
     });
 
     const first = await this.complete(messages, 'write', meter);
-    const a1 = this.evaluate(first, e, goal);
+    const a1 = this.evaluate(first, e, goal, ctx, repo);
     if (a1.ok) return a1.plan;
     this.throwIfCancelled(meter);
 
@@ -258,12 +327,35 @@ export class LLMPlanner implements Planner {
       buildRepairMessage(a1.issues, { redactor: this.redactor, nonce }),
     ];
     const second = await this.complete(repair, 'repair', meter);
-    let a2 = this.evaluate(second, e, goal);
+    let a2 = this.evaluate(second, e, goal, ctx, repo);
     // Validation is deterministic, so the same id fails the same way; say so first in the diagnostics.
     if (a2.ok) return a2.plan;
     if (a1.plan && a2.plan && a1.plan.id === a2.plan.id) a2 = { ...a2, issues: [`repair round returned the rejected plan ${a1.plan.id} unchanged`, ...a2.issues] };
     const last = a2.plan ?? a1.plan;
     throw new PlanRejected(this.sanitizeIssues(a2.issues), last ? this.redactPlan(last) : undefined, 2);
+  }
+
+  async draftContract(statement: string, goal: AchievementGoal, inventory: readonly CapabilityRecord[], meter?: UsageMeter): Promise<ContractDraft> {
+    // Nothing to draft from: refuse before anything is sent or billed.
+    if (typeof statement !== 'string' || !statement.trim()) throw new ContractRejected(['the request has no statement to draft a contract from'], 0);
+    const nonce = this.o.nonce?.() ?? newNonce();
+    const repo = this.facts();
+    const messages = buildContractPrompt({ manifest: this.o.manifest, goal, statement, inventory, redactor: this.redactor, nonce, ...(repo ? { repo } : {}) });
+    const first = await this.complete(messages, 'draft', meter);
+    const d1 = this.evaluateDraft(first, statement, goal, inventory, repo);
+    if (d1.ok) return d1.draft;
+    await this.rejected(goal, 1, d1);
+    this.throwIfCancelled(meter);
+    const repair: LLMMessage[] = [
+      ...messages,
+      echoAssistant(first?.content, { redactor: this.redactor, nonce }),
+      buildContractRepairMessage(d1.issues, { redactor: this.redactor, nonce }),
+    ];
+    const second = await this.complete(repair, 'draft-repair', meter);
+    const d2 = this.evaluateDraft(second, statement, goal, inventory, repo);
+    if (d2.ok) return d2.draft;
+    await this.rejected(goal, 2, d2);
+    throw new ContractRejected(this.sanitizeIssues(d2.issues), 2);
   }
 
   async deliberate(options: Plan[], intentions: Intention[], beliefs: BeliefProjection, meter?: UsageMeter): Promise<Plan> {
@@ -297,6 +389,35 @@ export class LLMPlanner implements Planner {
   }
 
   // ---------- internals ----------
+
+  /** The repository facts (a throwing source gives none: the screens that need them are then skipped). */
+  private facts(): RepoFacts | undefined {
+    try {
+      const f = typeof this.o.repoFacts === 'function' ? this.o.repoFacts() : this.o.repoFacts;
+      return f && Array.isArray(f.dependencies) && Array.isArray(f.testedApi) ? f : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The tool catalog a plan is written and checked against: the configured one plus every capability the contract requires. */
+  private catalogFor(goal: AchievementGoal, ctx?: PlanningContext): readonly string[] {
+    const base = this.o.toolCatalog ?? DEFAULT_TOOL_CATALOG;
+    const criteria = ctx?.contract?.criteria ?? (Array.isArray(goal.criteria) ? goal.criteria : []);
+    const caps = criteria.flatMap((k) => (Array.isArray(k.requires) ? k.requires : []));
+    return caps.length ? [...new Set([...base, ...caps])] : base;
+  }
+
+  /** Report a refused draft (onDraftRejected); a failing record is an accounting failure, never ignored. */
+  private async rejected(goal: AchievementGoal, attempt: number, d: { issues: string[]; draft?: ContractDraft }): Promise<void> {
+    if (!this.o.onDraftRejected) return;
+    const contract = d.draft ? (inertRedacted(d.draft.contract, this.redactor) as Json) : null;
+    try {
+      await this.o.onDraftRejected({ goalId: goal.id, attempt, issues: this.sanitizeIssues(d.issues), contract });
+    } catch (err) {
+      throw new PlannerAccountingError(`rejected draft record failed: ${this.errText(err)}`, 'draft', isBudgetFailure(err));
+    }
+  }
 
   private async notes(src: NotesSource | undefined, goal: AchievementGoal, e: TeceraEvent): Promise<readonly PromptNote[]> {
     if (!src) return [];
@@ -340,7 +461,7 @@ export class LLMPlanner implements Planner {
           maxTokens: this.o.maxTokens ?? 4096,
           temperature: this.o.temperature ?? 0,
           ...(this.effort ? { effort: this.effort } : {}),
-          ...(purpose === 'deliberate' ? {} : { schema: PLAN_WIRE_JSON_SCHEMA }),
+          ...(purpose === 'deliberate' ? {} : { schema: purpose === 'draft' || purpose === 'draft-repair' ? CONTRACT_WIRE_JSON_SCHEMA : PLAN_WIRE_JSON_SCHEMA }),
         },
         signal,
       );
@@ -421,7 +542,39 @@ export class LLMPlanner implements Planner {
     return inertRedacted(p, this.redactor) as unknown as Plan;
   }
 
-  private evaluate(res: LLMResponse, e: TeceraEvent, goal: AchievementGoal): Attempt {
+  /** One contract answer → a validated draft, or sanitised issues. A truncated or error answer is never used. */
+  private evaluateDraft(res: LLMResponse, statement: string, goal: AchievementGoal, inventory: readonly CapabilityRecord[], repo?: RepoFacts): { ok: true; draft: ContractDraft } | { ok: false; issues: string[]; draft?: ContractDraft } {
+    if (typeof res.content !== 'string') return { ok: false, issues: ['model returned no content'] };
+    if (res.finishReason === 'error') {
+      const why = typeof res.error === 'string' && res.error ? `: ${safeLine(res.error, this.redactor, '', 200)}` : '';
+      return { ok: false, issues: [`model returned an error instead of a contract${why}`] };
+    }
+    if (res.finishReason === 'length') return { ok: false, issues: ['output hit the token limit (truncated); a truncated answer is never used'] };
+    // Only a completed answer is a contract (a filtered or otherwise cut answer never is).
+    if (res.finishReason !== 'stop') return { ok: false, issues: ['model did not finish its answer; only a completed answer is used'] };
+    const parsed = parseContractOutput(res.content);
+    if (!parsed.ok) return { ok: false, issues: this.sanitizeIssues(parsed.issues) };
+    const inv = Array.isArray(inventory) ? inventory : [];
+    const connections = this.o.manifest.connections;
+    const built = assembleDraft(parsed.proposal, {
+      statement,
+      goal,
+      inventory: inv,
+      connections,
+      redactor: this.redactor,
+      implied: impliedNeeds(statement, connections, inv),
+      // a drafted envelope stays inside the manifest's boundary and matches the repository as it is
+      allowedChanges: this.o.manifest.repo.allowedChanges,
+      protectedPaths: this.o.manifest.policy.protectedPaths,
+      ...(this.o.repoFiles ? { fileExists: this.o.repoFiles } : {}),
+    });
+    if (!built.ok) return { ok: false, issues: this.sanitizeIssues(built.issues) };
+    // A well-formed draft that proves too little about the request goes back for repair like a malformed one.
+    const weak = contractQualityIssues(built.draft, { statement, goal, verifyCommand: this.o.manifest.verify?.command, connections, inventory: inv, ...(this.o.repoFiles ? { fileExists: this.o.repoFiles } : {}), ...(repo ? { dependencies: repo.dependencies, testedApi: repo.testedApi } : {}) });
+    return weak.length ? { ok: false, issues: this.sanitizeIssues(weak), draft: built.draft } : { ok: true, draft: withTags(built.draft) };
+  }
+
+  private evaluate(res: LLMResponse, e: TeceraEvent, goal: AchievementGoal, ctx?: PlanningContext, repo?: RepoFacts): Attempt {
     if (typeof res.content !== 'string') return { ok: false, issues: ['model returned no content'] };
     if (res.finishReason === 'error') {
       const why = typeof res.error === 'string' && res.error ? `: ${safeLine(res.error, this.redactor, '', 200)}` : '';
@@ -433,20 +586,37 @@ export class LLMPlanner implements Planner {
       return { ok: false, issues: this.sanitizeIssues(issues) };
     }
     const { budget, issues: budgetIssues } = materializeBudget(parsed.plan.budget, this.o.manifest, goal);
-    const plan = toPlan(parsed.plan, { trigger: { kind: e.kind }, origin: 'generated', status: 'candidate', budget });
+    // The host settles the write scope (the manifest's allowedChanges) and the return schema of every
+    // file-changing worker step.
+    const doc = settlePlanDocument(parsed.plan, { manifest: this.o.manifest });
+    // The host records the contract the plan answers to and adds every capability its criteria require.
+    const contractHash = planContractHash(ctx, goal);
+    const capabilities = planCapabilities(doc.capabilities, ctx, goal);
+    const plan = toPlan(doc, {
+      trigger: { kind: e.kind },
+      origin: 'generated',
+      status: 'candidate',
+      budget,
+      ...(contractHash !== undefined ? { contractHash } : {}),
+      ...(capabilities !== undefined ? { capabilities } : {}),
+    });
     const issues = [
       ...budgetIssues,
       ...validateCandidate(plan, {
         manifest: this.o.manifest,
         goal,
         permissions: this.o.permissions ?? DEFAULT_PERMISSIONS,
-        toolCatalog: this.o.toolCatalog ?? DEFAULT_TOOL_CATALOG,
+        toolCatalog: this.catalogFor(goal, ctx),
         workerSeats: this.workerSeats,
         redactor: this.redactor,
         requireCompleteBudget: true,
+        ...(ctx ? { ctx } : {}),
       }),
+      // A brokered capability tool is the worker's own instrument: an instruction that puts it in the code is refused.
+      ...standInInstructionIssues(doc.steps, capabilityRoutes({ manifest: this.o.manifest, criteria: ctx?.contract?.criteria ?? (Array.isArray(goal.criteria) ? goal.criteria : []), ...(ctx ? { planning: ctx } : {}) }), repo),
     ];
     if (res.finishReason === 'length') issues.push('output hit the token limit (truncated); a truncated answer is never used');
+    else if (res.finishReason !== 'stop') issues.push('model did not finish its answer; only a completed answer is used');
     const clean = this.sanitizeIssues(issues);
     return clean.length ? { ok: false, issues: clean, plan } : { ok: true, plan };
   }

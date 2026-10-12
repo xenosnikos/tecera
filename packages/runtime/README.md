@@ -5,11 +5,19 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
 
 ## Behaviour
 
-- **no auth package.** `@tecera/auth` is gone from this package and the JWT ingress is deleted. Approvals and
+- **local approvals, no authentication.** There is no auth package and no token ingress. Approvals and
   learning decisions are made by the local human principal (`--as <id>`, default `$USER`; src/principal.ts),
-  recorded in the audited `approval.granted` event and its `approval.identity` evidence. Separation of duty is
-  the ledger's: the requester (the loop) can never approve, a principal never approves its own request (exit 8).
-  Agents cannot reach `tecera approve` (the pre-tool hook refuses it from a mediated shell).
+  recorded in the audited `approval.granted` event and its `approval.identity` evidence with
+  `authenticated: false`. Separation of duty is the ledger's: the requester (the loop) can never approve, a
+  principal never approves its own request, and only a human principal can approve (exit 8). The name is
+  asserted, not verified: any local process that can run `tecera` can approve under any name. Workers
+  have no shell and no such tool. For a host assistant, the Claude Code pre-tool hook refuses every
+  `tecera` command except `gate`, `status`, `why` and `validate` with their listed flags, and the Codex
+  adapter installs no hook at all. The decision commands carry an accident guard of their own
+  (src/decisionGuard.ts): they refuse with exit 8 under an agent-host marker (`CLAUDECODE`,
+  `CLAUDE_CODE_ENTRYPOINT`, `CODEX_*`, `TECERA_SANDBOX`) or without a terminal on stdin, unless
+  `TECERA_DECISION_NONINTERACTIVE=1` is set, and record what they saw as `guard` on the decision event. It
+  prevents accidents; it is not authentication.
 - **reflexes on.** Seams are `rule` / `model` / `frontier` (the manifest refuses `off`); the planner seat is
   the frontier, wired into the reflex router and as `LoopPorts.frontier` (metered by its own SeatMeter).
 - **budgets off by default.** `openRunPools` opens usd / tokens / calls / wallMs with `budgets.enforce`
@@ -18,10 +26,20 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
   (depth, iterations, attempts, exec timeouts) always hold. Every run ends with a cost line; `tecera evidence`
   writes the cost per step, per model and per seat into summary.md (src/cost.ts: one `cost.call` event per
   model call, plus the pools' usage).
-- **proof of achievement.** `tecera hook stop` (Claude Code's Stop hook, src/stopHook.ts) exits 2 with
-  `goal not achieved: …` while a run of this business case is active (running, held at the PR, interrupted)
-  without a `goal.achieved` proof whose verify evidence is in the ledger; exit 0 otherwise. It never considers
-  budget. Every decision is recorded (`stop.blocked` / `stop.allowed`).
+- **proof of achievement.** "Achieved" has one source: `@tecera/contracts` `ledgerProvenRun` (the hash chain,
+  the verify evidence and its digest, the `verify.passed` it follows, the accepted contract and every
+  criterion proof), called with the manifest's provisioning allowance, `acceptance.signoff: always` as
+  `requireApproval`, and the run's secrets (src/proof.ts). The run's exit status uses it (a `goal.achieved`
+  event alone exits 9, not 0), and so do `tecera status` and `tecera criteria show`. `tecera hook stop`
+  (Claude Code's Stop hook, src/stopHook.ts, through `@tecera/policy` `evaluateStopLedger`) exits 2 with
+  `goal not achieved: …` while a run of this business case is active (running, held, interrupted) and not
+  proven, while a run ended provisional (exit 10) and neither it nor a later run of the same goal is
+  proven, when the ledger's chain does not verify, or when the business case's `tecera.json` (or the one
+  named with `--manifest`) cannot be found, read or validated; exit 0 otherwise (also outside any business
+  case). It never considers budget. Every decision is recorded (`stop.blocked` / `stop.allowed`). A run with
+  an open approval request stays held whatever its events say, and delivery counts only with a consumed
+  human approval plus the PR gate's evidence. A run with no open approval is judged from run events, which
+  a process that can write the ledger can forge. The hook is installed for Claude Code only.
 - **review plugged in.** `review.foreign` must be true; the reviewer seat runs live on its own key and the
   review gate checks provider AND key fingerprint against every writer. `--allow-same-vendor-review` is gone.
 - **PR-level gating.** Writes inside `repo.allowedChanges` on the leased work branch proceed under any
@@ -29,7 +47,8 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
   approval; `gate.pr` is the only approval point (exit 4 while it waits). After `tecera approve` the resume
   pushes the branch to `origin` and opens the PR with `gh pr create` when gh is on PATH and authenticated, or
   records `pr.requested` with a patch bundle under `.tecera/runs/<run>/pr/`. Tecera never merges (`merge` is in
-  `never`; the host settings deny `git push`, `gh pr create`, `git merge` and `gh pr merge`).
+  `never`; the Claude Code settings fragment denies `git push`, `gh pr create`, `git merge` and
+  `gh pr merge`; the Codex adapter installs no deny list).
 - **live keys.** Providers come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`. The shipped
   template and sample seat the planner (`anthropic/claude-sonnet-4.5`) and the worker (`anthropic/claude-haiku-4.5`)
   on OpenRouter and the reviewer (`gpt-5.6-terra`) on OpenAI. `tecera doctor` probes every seat live (under a
@@ -47,23 +66,23 @@ hence `TECERA_VERIFY_ALLOW_ROOT=1` and the `verify degraded` line):
 
 ```
 $ tecera run fix-failing-test --scripted <fixtures>
-run        r_e4  goal g_fix-failing-test
+run        r_e4  goal fix-failing-test
 worktree   /tmp/tecera-wt-XXXXXX/r_e4 (git worktree at main@7dac388) · lease token 1
 verify     degraded: verify controls missing: uid; runs as root (uid 0): can write supervisor files and start work outside containment
 scripted   replies from /tmp/tecera-scripts-XXXXXX (no network, no model)
 isolation  node: the worker child has no OS isolation beyond what the host provides (recorded as isolation.degraded); writes to the work branch proceed fenced, the PR gate is the approval point
 cost       $0.0111 · 7,240 tokens · 3 model call(s) · usd pool $0.0652/$2.0000 incl. reservations (not enforced) · by model: openrouter/anthropic/claude-haiku-4.5 $0.0070, openai/gpt-5.6-terra $0.0041
-run r_e4  goal g_fix-failing-test  → held for PR approval ap_ev_e86 → exit 4
+run r_e4  goal fix-failing-test  → held for PR approval ap_ev_e86 → exit 4
 → exit 4
 $ tecera hook stop          # Claude Code Stop hook, payload on stdin
-tecera: goal not achieved: run r_e4 (goal g_fix-failing-test) is held for a human decision and has no goal.achieved proof — Tecera run r_e4 for goal g_fix-failing-test is active without a goal.achieved proof (no proof of achievement). Keep working until the goal's check passes through the run (`tecera run --resume`, `tecera status`), or hand back to a human (`tecera approve` / `tecera deny`) — do not stop yet.
+tecera: goal not achieved: run r_e4 (goal fix-failing-test) is held for a human decision and has no goal.achieved proof — Tecera run r_e4 for goal fix-failing-test is active without a goal.achieved proof (no proof of achievement). Keep working until the goal's check passes through the run (`tecera run --resume`, `tecera status`), or hand back to a human (`tecera approve` / `tecera deny`) — do not stop yet.
 → exit 2
 $ tecera approve ap_ev_e86 --as reviewer-human --yes
 note: --yes never approves; this decision is the explicit command you ran
 approved ap_ev_e86 as reviewer-human (local principal, --as) (step pr, run r_e4) · event ev_e92
 resume the run with `tecera run --resume r_e4`
 $ tecera run --resume r_e4 --scripted <fixtures>
-run        r_e4  goal g_fix-failing-test  (resume)
+run        r_e4  goal fix-failing-test  (resume)
 worktree   /tmp/tecera-wt-XXXXXX/r_e4 (git worktree at main@7dac388) · lease token 2
 verify     degraded: verify controls missing: uid; runs as root (uid 0): can write supervisor files and start work outside containment
 scripted   replies from /tmp/tecera-scripts-XXXXXX (no network, no model)
@@ -71,7 +90,7 @@ isolation  node: the worker child has no OS isolation beyond what the host provi
 recovered gate.pr pr: held (approval ap_ev_e86 is granted)
 plan p_a529e0b9 staged as a candidate (its goal was achieved)
 cost       $0.0111 · 7,240 tokens · 3 model call(s) · usd pool $0.0652/$2.0000 incl. reservations (not enforced) · by model: openrouter/anthropic/claude-haiku-4.5 $0.0070, openai/gpt-5.6-terra $0.0041
-run r_e4  goal g_fix-failing-test  → goal achieved (environmental check passed) → exit 0
+run r_e4  goal fix-failing-test  → goal achieved (environmental check passed) → exit 0
 → exit 0
 $ tecera hook stop
 tecera: run r_e4 proved its goal: `node --test` exited 0 on ea104c66e9a3 (evidence verify:r_e4:ev_e16:verify2:1:0)
@@ -107,21 +126,121 @@ worktree to the loop's required checkpoint before `confirmWorktreeRestored`, and
 (worker restart with attempt + 1; interrupted verify re-run; a lost review stops for a human without another
 reviewer call; the durable PR approval re-held; commit reconciled, never repeated; one commit, one PR).
 
+## Acceptance contracts, capabilities and provisioning
+
+- **A request is a contract.** `tecera run "<statement>"` adopts the goal with `draftContract`: the planner
+  drafts an acceptance contract (criteria, each with its own check; out of scope; assumptions; the
+  capabilities the criteria need), recorded as `criteria.drafted`. Nothing is planned and no worker runs
+  until the requestor signs it off: the run holds (exit 4, `held for criteria sign-off approval …`).
+  `tecera criteria show <run>` prints it; `tecera criteria accept <run> [--as you]` grants the pending
+  `accept_criteria` approval (exactly `tecera approve`: a local human, never the requester, which is
+  Tecera); `tecera run --resume <run>` then records `criteria.accepted` and plans against that contract.
+- **Goal files carry criteria.** Front matter `criteria:` is a one-line JSON flow list:
+  `criteria: [{"id": "tests-pass", "statement": "the suite passes", "verify": "node --test", "timeoutSec": 120, "requires": ["db"]}, {"id": "readme", "statement": "the README explains it", "ask": "Is the README clear?"}]`.
+  `verify` is a command criterion, `ask` a human one; at least one must be a command. Such a file is its
+  own accepted contract under `acceptance.signoff: statement` (no sign-off hold); `always` holds every run.
+  A goal file without `criteria:` keeps the single-check path (its `verify` alone), exactly as before.
+- **One id, one branch per intention.** The ledger goal id is the goal file's id, or the statement's slug
+  (`make-the-failing-test-pass`); it names the work branch (`tecera/<id>`) on the first segment and on every
+  resume. The gates look the goal up by that id. Runs adopted before (with `g_<id>`) still commit to the
+  named branch. `g_` is reserved: `g_<id>` refers to the goal file `<id>`, so no goal file id starts with it.
+  A goal planned again in the same run works on `tecera/<id>.2`, then `.3`: a fresh branch at the base the
+  run pinned, with the earlier branch left as it was (see "Amendments re-plan").
+- **A contract may state where the change may land.** `envelope:` in a goal file's front matter is a
+  one-line JSON flow list: `envelope: [{"path": "src/slugify.js", "ops": ["modify"]}, {"path": "src/reports/*.js", "ops": ["create"]}]`.
+  It needs `criteria:`, must lie inside `repo.allowedChanges` and off the protected paths, and is part of
+  the contract hash. For a statement the planner drafts it with the criteria and the requestor signs both
+  off; a scripted `contract.json` may carry `envelope` too. A plan's writing steps may declare a subset
+  (`changes`); a step that names more is rejected with the plan. A write or deletion outside it fails at
+  the tool; a file that got there another way fails the step when it returns (the retried worker is told
+  which paths and can remove them with `deleteFile(path, digest)`); a candidate that still has one is
+  refused at verify and at commit. Without `envelope:` nothing changes: `repo.allowedChanges` is the
+  boundary and the contract hash is the one it had.
+- **Every criterion is verified.** The verify gate runs each command criterion on the frozen candidate;
+  the PR lists every criterion, how it was proven and at what fidelity. Human criteria are asked at the PR
+  hold, one `answer_criterion` approval each (`tecera approve <request>`).
+- **Capabilities are probed, provisioned, mocked or asked for.** Manifest `connections` are probed for real
+  (their `probe` command through the contained verify runner in the worktree, or their `auth` reference
+  resolved without printing it). For each capability a criterion requires, the loop takes the gap ladder:
+  use it; provision it in Tecera's own space (`provisioning`: local `tmpdir`, `git-remote`, `sqlite`,
+  `http-stub`, at most `maxResources` per run, `ttlSec` each, under `$TECERA_RESOURCES`, default
+  `~/.tecera/resources`); serve a stand-in when the connection is `mockable`; or hold and ask
+  (`provide_capability`, exit 4). `tecera doctor` and `tecera preflight` print the inventory.
+- **Stand-ins never count as real.** A capability resolved to `mock` is served to the step by the broker
+  (a generic store for store kinds, a message sink for mail-like kinds), named after the capability; its
+  first use records `capability.mocked`. A goal with a criterion on a mock is `goal.provisional`: the PR opens
+  marked provisional, the run exits **10** (never 0) and the Stop hook keeps blocking.
+- **Provisioned resources are debts.** Each `resource.provisioned` carries its locator (an absolute path or
+  a loopback URL, never a credential nor another host), teardown (no credential either, in any encoding) and
+  expiry. While the run's registry reports a problem or a resource past `maxResources`, no resource is
+  handed to a worker and no provisioned remote is pushed to. A provisioned sqlite or http-stub is a brokered
+  tool named after its capability; an http-stub cannot be reached by a criterion's check, which runs
+  contained with no network, so a criterion that needs it fails verification today. A
+  provisioned `git-remote` (its locator an absolute local path) receives the work-branch push when the
+  repository has no remote of that name (added to the worktree for the delivery only). The PR lists every pending resource. `tecera resources list`
+  shows them; `tecera resources transfer <id> [--to who]` hands one to a human; `tecera resources release <id>`
+  runs its recorded teardown. Expired resources are released at the start of every run. A worker
+  cannot reach `tecera criteria accept|amend` or `tecera resources release|transfer`; for a Claude Code
+  host assistant the pre-tool hook is meant to refuse them (see "local approvals" above for its state).
+  Under Codex nothing refuses them.
+- **Amendments re-plan.** `tecera criteria amend <run> --file contract.json --reason text [--as you]` records
+  `criteria.amended` with the human as actor. `accept` and `amend` refuse (exit 9) on a ledger whose hash
+  chain does not verify. The acceptance is stale: the next resume drops the running
+  intention (no step of it runs again) and holds for a sign-off of the new contract, then re-plans for it.
+  The dropped intention's pending PR approval is denied by Tecera (`tecera approve` on it then fails), and
+  what it committed stays on its branch, undelivered. Before the new plan's first step, the worktree is
+  put on the new intention's branch at the base commit (src/worktree.ts `prepareBranch`): the old commit,
+  uncommitted files and ignored files that were not there at the run's baseline are gone from the worktree,
+  and the new work is verified, reviewed and approved from scratch. The transition is recorded as
+  `intention-prepare:<run>:<intention>` before anything moves and `intention-prepared:…` after; a resume
+  that finds only the first completes it before any worker runs. A lost lease during it ends the segment
+  (exit 9) with the new intention still waiting.
+- **Scripted.** A scripted directory may hold `contract.json`: the contract proposal(s) the planner drafts
+  for a statement (`{criteria, outOfScope?, assumptions?, needs?}`, or a list with `when` substrings). The
+  scripted `plan.json` is stamped with the accepted contract's hash and capabilities, and its `gate.verify`
+  steps are bound to the contract's command criteria. `test-fixtures/fix-failing-test` has all three files:
+  `tecera run "make the failing test pass" --scripted test-fixtures/fix-failing-test` runs offline (with
+  placeholder provider keys set).
+
+`src/criteria.e2e.test.ts` proves it end to end with scripted models, the real sandbox and real gates: a goal
+file with criteria reaches achievement through the PR hold alone; a statement run holds for sign-off, then
+the PR, then is achieved on `tecera/make-the-failing-test-pass`; a goal file with an envelope refuses a
+write of an unrequested file at the tool call, fails a step that left one behind through the check, and
+lets the retried worker delete it and deliver the requested file alone; a mocked capability ends provisional (exit
+10, PR marked, Stop blocks); a provisioned bare remote receives the push, is listed for transfer and is torn
+down by `tecera resources release`; an amendment at the PR hold drops the intention, holds for sign-off and
+re-plans for the new hash. Two further cases follow an amendment after a commit to the end: the new
+intention's commit lands on `tecera/fix-failing-test.2` with the base as its parent, the first branch is
+unchanged, the new work has its own verify and review evidence, the first PR approval is denied and never
+consumed; and a lease lost before, or a crash after, the branch mutation leaves the new intention
+undispatched until a later resume completes the preparation.
+
 ## What wiring builds (src/wiring.ts)
 
 1. **Scripted mode** (`--scripted <dir>` or `TECERA_SCRIPTED=<dir>`). The directory holds `plan.json`
-   (optional) and `replies.json` (`{seat: [reply...]}`). Only the provider transport is replaced (src/scripted.ts);
+   (optional), `contract.json` (optional) and `replies.json` (`{seat: [reply...]}`). Only the provider transport is replaced (src/scripted.ts);
    the run records `run.scripted` evidence. A run cannot switch between scripted and live across resume.
+   Everything else is real: readiness still requires the key of every provider a seat uses (placeholder
+   values of at least 8 characters, the reviewer's different from the writers', are enough), and a scripted
+   run that is approved still pushes and opens a pull request when the repository has a remote and `gh` is
+   authenticated. Do not leave `TECERA_SCRIPTED` set in a shell used for real work.
 2. **One provider per seat.** `createProvider` runs over the run's SecretStore, with the shared redactor on top
    (`anthropic`, `openai`, `openrouter`; src/providerSetup.ts maps OpenRouter onto an older providers build).
    Every completed call is recorded as a `cost.call` event (worker and review calls with the step's trace).
 3. **The worktree lease** (src/worktree.ts):
    - The worktree lives at `$TECERA_WORKTREES/<runId>` (default `~/.tecera/worktrees`), outside the business case.
+     The root is created 0711 so the verify identity can enter the worktree; when the home directory does not let
+     others traverse it (root's 0700 home), the default is `<tmpdir>/tecera-<uid>/worktrees`, which must be
+     owned by this uid and writable by nobody else.
    - A git repository gets `git worktree add --detach <base>` under host-controlled git, after `assertSafeRepo`.
    - A business case that is not a git repository gets a private copy with a fresh one-commit repository,
      recorded as `worktree.no-git`.
    - The lease is `ledger.lease('worktree:<runId>')`, renewed while the run lives. Its fencing token goes to every
      worker step. Resume reuses the worktree and refuses if it is missing or foreign.
+   - `prepareBranch` puts the worktree on a later intention's branch at the base commit (the branch is
+     created there, HEAD is pointed at it, the tree and index are reset and proven equal to the base tree),
+     re-checking the lease before each mutation. The wiring wraps it in the two preparation records and
+     hands it to the Loop as `prepareIntention`.
    - **Losing the lease revokes authority**: `lost` fires, the Loop stops (`leaseSignal`) and aborts its running
      steps, live sandbox children are disposed, every write-class tool (src/fencing.ts) and every gate call
      re-proves the lease on the ledger right before it runs (a stale token or a refused renewal refuses it).
@@ -129,26 +248,40 @@ reviewer call; the durable PR approval re-held; commit reconciled, never repeate
    A host without containment refuses the run with exit 3. A root supervisor is refused unless the operator
    names an unprivileged identity (`TECERA_VERIFY_UID` / `TECERA_VERIFY_GID`, which must be able to read the
    worktree and run the check) or explicitly accepts a degraded root verify (`TECERA_VERIFY_ALLOW_ROOT=1`,
-   recorded as `verify.degraded`; the run is then recorded as degraded — never a hold, D6).
+   recorded as `verify.degraded`; the run is then recorded as degraded, never held). A non-root supervisor
+   runs the check under its own uid.
    These switches are read from the operator's environment, never from the manifest.
 5. **Worker.** `StepWorker` runs a `ChildProcessRepl` per exec, built from the manifest's sandbox profile, plus:
    - the fourteen mandatory hooks (`assertMandatory`);
-   - the tools read/edit/listFiles, and runVerify bound to the goal check;
+   - the tools read/edit/delete/listFiles, and runVerify bound to the goal check. Under a change-path
+     envelope the edit and delete tools get the step's declared subset (from the accepted contract and the
+     step's `changes`) and refuse any other path, naming it;
    - every known secret, for redaction and the canary;
-   - Brain context (lessons, episodes) added to each step's inputs.
+   - Brain context (lessons, episodes) added to each step's inputs. No run writes episodes or stages
+     lessons yet, so this context is empty in practice.
 
    The tool kinds `tool.denied`, `sandbox.*` become `evidence.appended` events that carry the step trace.
+   Provisioned sqlite / http-stub resources join the tools under their capability's name; a step whose plan
+   names a capability the loop resolved to `mock` gets its stand-in (`WorkerStepRequest.mocks`), and the
+   stand-in's first use is recorded as `capability.mocked` on the step's goal.
 6. **Gates.** `createGates` gets the METERED reviewer seat (src/metering.ts: reserve before, settle at actual
    after, an overrun is exhaustion → exit 7), every writer identity, the redactor, the worktree and the
-   session. verify/review/commit/pr/reconcile are exposed. The commit branch is `<branchPrefix><goal name>`;
+   session. verify/review/commit/pr/reconcile are exposed. The commit branch is `<branchPrefix><goal name>`
+   for a goal's first intention and the prepared `<branchPrefix><goal name>.<n>` for a later one;
    the PR gate gets `.tecera/runs` for its bundle, the run's PATH for gh (gh sees only its own variables) and
    the run's cost line for the PR body. A gates build without a PR gate fails `gate.pr` for a human.
-7. **Planner.** `ScriptedPlanner` is used when a scripted plan is given. Otherwise `LLMPlanner` runs on the planner
-   seat, with Brain lessons and deliberations recorded as evidence. The Loop reserves before and settles after
-   every planner call; the planner's usage reports are bridged onto the Loop's meter (counted once).
+7. **Planner.** `ScriptedRunPlanner` (src/scripted.ts) is used when a scripted plan is given. Otherwise
+   `LLMPlanner` runs on the planner seat, with Brain lessons and deliberations recorded as evidence. The Loop
+   reserves before and settles after every planner call and every contract draft; the planner's usage reports
+   are bridged onto the Loop's meter (counted once). The planning context (accepted contract, inventory,
+   allowance) reaches the planner and the validator.
 8. **Validator, route costs and frontier.** The goal-aware `createPlanValidator` runs over the real tool catalog
-   and worker seats. Route costs come from the price table. The planner seat is the frontier, metered like the
+   (plus, under a contract, the capabilities its criteria require) and worker seats. Route costs come from the price table. The planner seat is the frontier, metered like the
    reviewer (a budget refusal propagates); it can only tighten a reflex answer (src/frontier.ts).
+
+9. **Capabilities.** `ConnectionProbe` (`LoopPorts.probe`), the `LocalProvisioner` (`LoopPorts.provisioner`;
+   tmpdir and sqlite payloads are handed to the verify identity when the supervisor is root), the secrets
+   predicate (`LoopPorts.secrets`) and the expiry sweep (`sweep()`).
 
 `executeRun` opens the `usd`, `tokens`, `calls` and `wallMs` pools (`openRunPools`, soft unless
 `budgets.enforce`), binds the goal's check into the effective
@@ -165,18 +298,21 @@ dispatchable.
 `defaultProbe` (doctor) is a real completion per seat through the provider adapters and
 `@tecera/providers` `doctorProbe`; doctor and preflight run it last, only when every offline check passed.
 
-## Exit codes (dx.md §4)
+## Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | goal achieved |
-| 3 | not ready / wiring refused |
-| 4 | held (at the PR: `tecera approve`, then `tecera run --resume`) |
+| 0 | goal achieved (proven by `ledgerProvenRun`) |
+| 1 | error (for example an unknown, expired or already-decided approval request) |
+| 2 | invalid input or usage |
+| 3 | not ready (validation, lock, ledger chain, a missing provider key, also in scripted mode) / wiring refused / verify containment unavailable |
+| 4 | held: criteria sign-off (`tecera criteria accept`), a capability ask, a human criterion or the PR (`tecera approve`), then `tecera run --resume` |
 | 5 | verify failed |
 | 6 | review rejected |
 | 7 | budget (only with `budgets.enforce: true`) |
 | 8 | policy |
-| 9 | ledger / loop stopped / lease lost / a human is needed (no progress, unreconciled commit) |
+| 9 | ledger / loop stopped / lease lost / a human is needed (no progress, unreconciled commit) / a `goal.achieved` the ledger does not prove |
+| 10 | provisional: every criterion proven, one on a mocked capability; the PR says so; never achieved |
 | 130 | interrupted |
 
 Only the current execution segment counts: a run that was interrupted and then resumed to success exits 0.

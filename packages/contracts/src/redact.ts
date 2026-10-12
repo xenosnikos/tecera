@@ -18,6 +18,11 @@ import { SECRET_PATTERNS } from './manifest.js';
  * - Redaction runs BEFORE truncation (`maxChars`), so a cut can never leave a partial secret behind.
  * - redactJson walks own enumerable data properties only. It never invokes getters, setters, toJSON,
  *   valueOf or toString; an accessor property becomes '[unserializable:getter]'. Depth is bounded.
+ *   A boxed String / Number / Boolean is read as its primitive. Binary values (Buffer, typed arrays,
+ *   DataView, ArrayBuffer) are scanned as text in UTF-8, Latin-1 and UTF-16LE and emitted as redacted text
+ *   (or '[binary:<bytes>]' when they hold NUL bytes), never as an index-to-byte map.
+ * - containsSecret answers UNSCANNED_KIND, not null, for a value it could not read completely (nested past
+ *   the depth limit, or throwing): callers treat any non-null answer as "do not let this out".
  */
 
 export const MIN_SECRET_CHARS = 8;
@@ -190,8 +195,12 @@ class Impl implements Redactor {
       return s;
     };
     if (typeof input === 'string') return this.kindIn(input);
-    walk(input, 0, DEFAULT_REDACT_DEPTH, [], check, check);
-    return hit;
+    // A subtree the walk could not read (too deep, or it threw) was never scanned: it is not clean.
+    let unscanned = false;
+    walk(input, 0, DEFAULT_REDACT_DEPTH, [], check, check, () => {
+      unscanned = true;
+    });
+    return hit ?? (unscanned ? UNSCANNED_KIND : null);
   }
 
   private kindIn(s: string): string | null {
@@ -221,8 +230,46 @@ function truncate(s: string, maxChars: number | undefined): string {
   return `${s.slice(0, maxChars)}…[truncated:${s.length - maxChars}]`;
 }
 
-/** Safe structural walk: own enumerable data properties only; no getters, toJSON, valueOf or toString. */
-function walk(v: unknown, depth: number, maxDepth: number, stack: object[], onString: (s: string) => string, onKey: (k: string) => string): Json | typeof OMIT {
+/** containsSecret's answer for a value it could not scan completely (nested past the depth limit, or unreadable). */
+export const UNSCANNED_KIND = 'unscanned';
+
+/** The primitive inside a boxed String / Number / Boolean (internal slot, no user code), or undefined. */
+function unboxed(obj: object): string | number | boolean | undefined {
+  for (const proto of [String.prototype, Number.prototype, Boolean.prototype] as const) {
+    try {
+      return (proto.valueOf as (this: unknown) => string | number | boolean).call(obj);
+    } catch {
+      /* not this kind of box */
+    }
+  }
+  return undefined;
+}
+
+/** The bytes of an ArrayBuffer, SharedArrayBuffer or any view over one (Buffer, typed array, DataView), or null. */
+function bytesOf(obj: object): Uint8Array | null {
+  if (ArrayBuffer.isView(obj)) return new Uint8Array(obj.buffer, obj.byteOffset, obj.byteLength);
+  if (obj instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && obj instanceof SharedArrayBuffer)) return new Uint8Array(obj);
+  return null;
+}
+
+/**
+ * Binary data as text: every decoding a secret could sit in is passed through `onString` (UTF-8, Latin-1
+ * and UTF-16LE). Text without NUL bytes is emitted as its redacted UTF-8 reading; anything else is replaced
+ * by a marker, so bytes are never emitted as an index-to-byte map.
+ */
+function binaryText(bytes: Uint8Array, onString: (s: string) => string): string {
+  const utf8 = onString(new TextDecoder('utf-8').decode(bytes));
+  onString(new TextDecoder('latin1').decode(bytes));
+  onString(new TextDecoder('utf-16le').decode(bytes));
+  return bytes.includes(0) ? `[binary:${bytes.byteLength}]` : utf8;
+}
+
+/**
+ * Safe structural walk: own enumerable data properties only; no getters, toJSON, valueOf or toString. Boxed
+ * primitives are read as their primitive and binary values as text (binaryText). `onUnscanned` is told when
+ * a subtree was not read (depth limit, or an error).
+ */
+function walk(v: unknown, depth: number, maxDepth: number, stack: object[], onString: (s: string) => string, onKey: (k: string) => string, onUnscanned?: () => void): Json | typeof OMIT {
   try {
     if (v === null) return null;
     switch (typeof v) {
@@ -240,7 +287,14 @@ function walk(v: unknown, depth: number, maxDepth: number, stack: object[], onSt
         return OMIT;
     }
     const obj = v as object;
-    if (depth >= maxDepth) return DEPTH_MARKER;
+    const boxed = unboxed(obj);
+    if (boxed !== undefined) return walk(boxed, depth, maxDepth, stack, onString, onKey, onUnscanned);
+    const bytes = bytesOf(obj);
+    if (bytes) return binaryText(bytes, onString);
+    if (depth >= maxDepth) {
+      onUnscanned?.();
+      return DEPTH_MARKER;
+    }
     if (stack.includes(obj)) return CYCLE_MARKER;
     stack.push(obj);
     try {
@@ -258,7 +312,7 @@ function walk(v: unknown, depth: number, maxDepth: number, stack: object[], onSt
             out.push(GETTER_MARKER);
             continue;
           }
-          const r = walk(d.value, depth + 1, maxDepth, stack, onString, onKey);
+          const r = walk(d.value, depth + 1, maxDepth, stack, onString, onKey, onUnscanned);
           out.push(r === OMIT ? null : r);
         }
         return out;
@@ -269,7 +323,7 @@ function walk(v: unknown, depth: number, maxDepth: number, stack: object[], onSt
         if (!d || !d.enumerable) continue;
         let r: Json | typeof OMIT;
         if (d.get || d.set || !('value' in d)) r = GETTER_MARKER;
-        else r = walk(d.value, depth + 1, maxDepth, stack, onString, onKey);
+        else r = walk(d.value, depth + 1, maxDepth, stack, onString, onKey, onUnscanned);
         if (r === OMIT) continue;
         let key = onKey(k);
         for (let n = 2; Object.prototype.hasOwnProperty.call(out, key); n++) key = `${onKey(k)}~${n}`;
@@ -280,6 +334,7 @@ function walk(v: unknown, depth: number, maxDepth: number, stack: object[], onSt
       stack.pop();
     }
   } catch {
+    onUnscanned?.();
     return ERROR_MARKER;
   }
 }

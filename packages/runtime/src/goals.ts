@@ -1,37 +1,70 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
-import type { Budget, Commitment, Manifest } from '@tecera/contracts';
+import { canonicalEnvelope, contractHash, contractProblem, type AcceptanceContract, type Budget, type Commitment, type Criterion, type Manifest } from '@tecera/contracts';
+import { envelopeDraftIssues } from '@tecera/planner';
 import { FrontMatterError, splitFrontMatter } from './util/frontmatter.js';
 import { safeReadFile, UnsafePathError } from './util/safefs.js';
 
 /**
- * Goal files: `.tecera/goals/<id>.goal.md` = front matter (what is checked, commitment, budget) + the
- * statement. The goal id on the ledger is `g_<id>`. Unknown front-matter keys are rejected. A run given a
- * free-form statement gets an ad hoc goal whose check is the manifest's verify command: done is always an
- * environmental check, never a model's opinion.
+ * Goal files: `.tecera/goals/<id>.goal.md` = front matter (what is checked, commitment, budget, and optionally
+ * the acceptance criteria) + the statement. The goal id on the ledger is the file id (it names the work
+ * branch `tecera/<id>` too, so the gates' goal and branch always agree; `g_<id>` is still accepted as a
+ * reference). Unknown front-matter keys are rejected. A run given a free-form statement gets an ad hoc goal whose check is the manifest's verify
+ * command: done is always an environmental check, never a model's opinion. Its id is the statement's slug,
+ * the same on the first run and on every resume (the work branch is `tecera/<slug>`).
+ *
+ * `criteria:` (D8) is a one-line flow list of maps, each `{id, statement, verify | ask, timeoutSec?,
+ * requires?}`: `verify` is a command criterion (exit 0 passes, run by the verify gate on the final
+ * candidate), `ask` a human criterion (the question a human other than the requester answers at the PR hold),
+ * `requires` the capability ids it rests on (manifest `connections` keys or needs the run must provision or
+ * mock). `envelope:` is the contract's change-path envelope, a one-line flow list of `{path, ops}` (ops:
+ * create, modify, delete): the only paths the delivered change may touch. It needs `criteria:`, is part of the
+ * contract hash, and must lie inside repo.allowedChanges and off the protected paths. Without it the
+ * manifest's allowedChanges is the envelope, as before. A goal file with criteria carries its own acceptance contract (no sign-off under
+ * `acceptance.signoff: statement`); one without keeps the single-check path (its check alone).
  */
 
 export const GOALS_DIR = '.tecera/goals';
 
 const budgetKeys = ['usd', 'tokens', 'wallClockSec', 'maxDepth', 'maxIterations', 'maxAttempts', 'maxChangedFiles'] as const;
 
-const GoalFrontSchema = z
+const CriterionFrontSchema = z
   .object({
     id: z.string().regex(/^[a-z0-9][a-z0-9_-]*$/),
+    statement: z.string().min(1),
+    verify: z.string().min(1).optional(),
+    ask: z.string().min(1).optional(),
+    timeoutSec: z.number().int().positive().optional(),
+    requires: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/)).optional(),
+  })
+  .strict()
+  .refine((k) => (k.verify === undefined) !== (k.ask === undefined), { message: 'a criterion has exactly one of verify (a command) or ask (a human question)' })
+  .refine((k) => k.ask === undefined || k.timeoutSec === undefined, { message: 'timeoutSec belongs to a verify criterion' });
+
+const GoalFrontSchema = z
+  .object({
+    // `g_<id>` is a reference to the goal file <id> (and the ledger id of runs before wave 6): never a file id.
+    id: z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9_-]*$/)
+      .refine((id) => !id.startsWith('g_'), { message: 'the g_ prefix is reserved (g_<id> refers to the goal file <id>)' }),
     kind: z.literal('achievement'),
     verify: z.string().min(1).optional(),
     timeoutSec: z.number().int().positive().optional(),
     commitment: z.enum(['blind', 'single-minded', 'open-minded']).optional(),
     budget: z.object(Object.fromEntries(budgetKeys.map((k) => [k, z.number().positive().optional()])) as Record<(typeof budgetKeys)[number], z.ZodOptional<z.ZodNumber>>).strict().optional(),
     'on-violation': z.enum(['wake-human', 'demote', 'drop']).optional(),
+    criteria: z.array(CriterionFrontSchema).min(1).optional(),
+    // The change-path envelope of the contract: [{"path": "src/slug.js", "ops": ["modify"]}, …]
+    envelope: z.array(z.object({ path: z.string().min(1), ops: z.array(z.enum(['create', 'modify', 'delete'])).min(1) }).strict()).min(1).optional(),
   })
   .strict();
 
 export interface GoalSpec {
-  /** File id (`fix-failing-test`); `adhoc` for statements. */
+  /** File id (`fix-failing-test`); the statement's slug for an ad hoc statement. */
   id: string;
-  /** Ledger goal id (`g_fix-failing-test`). */
+  /** Ledger goal id: the file id or the statement's slug (`fix-failing-test`); runs before wave 6 used `g_<id>`. */
   goalId: string;
   statement: string;
   check: { command: string; timeoutSec: number };
@@ -40,6 +73,12 @@ export interface GoalSpec {
   onViolation: 'wake-human' | 'demote' | 'drop';
   source: 'file' | 'statement';
   path?: string;
+  /**
+   * The goal file's acceptance contract (front matter `criteria:`) and its hash. Absent: the single-check
+   * path (a goal file without criteria), or a statement whose contract the planner drafts at run time.
+   */
+  contract?: AcceptanceContract;
+  contractHash?: string;
 }
 
 export class GoalError extends Error {
@@ -65,16 +104,35 @@ export function parseGoalFile(text: string, m: Manifest, path?: string): GoalSpe
   if (!r.success) throw new GoalError(`${path ?? 'goal'}: ${r.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')}`);
   if (!fm.body) throw new GoalError(`${path ?? 'goal'}: the goal statement (body) is empty`);
   const d = r.data;
+  const check = { command: d.verify ?? m.verify.command, timeoutSec: d.timeoutSec ?? m.verify.timeoutSec };
+  let contract: AcceptanceContract | undefined;
+  if (d.criteria) {
+    const criteria: Criterion[] = d.criteria.map((k) => ({
+      id: k.id,
+      statement: k.statement,
+      check: k.verify !== undefined ? { kind: 'command' as const, command: k.verify, timeoutSec: k.timeoutSec ?? check.timeoutSec } : { kind: 'human' as const, prompt: k.ask! },
+      ...(k.requires?.length ? { requires: [...k.requires] } : {}),
+    }));
+    contract = { goalId: d.id, statement: fm.body, criteria, outOfScope: [], assumptions: [], ...(d.envelope ? { envelope: canonicalEnvelope(d.envelope) } : {}) };
+    const why = contractProblem(contract);
+    if (why) throw new GoalError(`${path ?? 'goal'}: criteria: ${why}`);
+    // The manifest stays the outer boundary: an envelope cannot name what repo.allowedChanges or the protected paths exclude.
+    const outside = envelopeDraftIssues(contract.envelope, { allowedChanges: m.repo.allowedChanges, protectedPaths: m.policy.protectedPaths });
+    if (outside.length) throw new GoalError(`${path ?? 'goal'}: envelope: ${outside.join('; ')}`);
+  } else if (d.envelope) {
+    throw new GoalError(`${path ?? 'goal'}: envelope: a change-path envelope is part of an acceptance contract; the goal needs criteria`);
+  }
   return {
     id: d.id,
-    goalId: `g_${d.id}`,
+    goalId: d.id,
     statement: fm.body,
-    check: { command: d.verify ?? m.verify.command, timeoutSec: d.timeoutSec ?? m.verify.timeoutSec },
+    check,
     commitment: d.commitment ?? m.commitment,
     budget: Object.fromEntries(Object.entries(d.budget ?? {}).filter(([, v]) => v !== undefined)) as Partial<Budget>,
     onViolation: d['on-violation'] ?? 'wake-human',
     source: 'file',
     path,
+    ...(contract ? { contract, contractHash: contractHash(contract) } : {}),
   };
 }
 
@@ -119,9 +177,11 @@ export function resolveGoal(root: string, arg: string, m: Manifest): GoalSpec {
   if (/^[a-z0-9][a-z0-9_-]*$/.test(id) && existsSync(goalPath(root, id))) return loadGoal(root, id, m);
   const statement = arg.trim();
   if (!statement) throw new GoalError('empty goal statement');
+  // One canonical slug for the goal id and the work branch, on the first run and on every resume (L5-F1).
+  const name = slug(statement);
   return {
-    id: 'adhoc',
-    goalId: `g_${slug(statement)}`,
+    id: name,
+    goalId: name,
     statement,
     check: { command: m.verify.command, timeoutSec: m.verify.timeoutSec },
     commitment: m.commitment,

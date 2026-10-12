@@ -1,4 +1,5 @@
 import type { Redactor, VerifyOutcome, VerifyRequest, VerifyRunner } from '@tecera/contracts';
+import { SANDBOX_MARKER_ENV } from '@tecera/worker';
 import { buildVerifyEnv } from './env.js';
 import { runProcess, type Env } from './util/proc.js';
 
@@ -30,7 +31,10 @@ export class HostVerifyRunner implements VerifyRunner {
   ) {}
 
   async run(req: VerifyRequest, signal?: AbortSignal): Promise<HostVerifyOutcome> {
-    const { env, dropped } = buildVerifyEnv(this.env, req.envAllowlist, this.opts.redactor);
+    const { env: granted, dropped } = buildVerifyEnv(this.env, req.envAllowlist, this.opts.redactor);
+    // The check is sandbox work: it carries the marker the worker's own verify runner sets, so a decision
+    // command started from inside it is refused by the accident guard.
+    const env = { ...granted, [SANDBOX_MARKER_ENV]: 'verify' };
     const r = await runProcess('/bin/sh', ['-c', req.command], {
       cwd: req.cwd,
       env,

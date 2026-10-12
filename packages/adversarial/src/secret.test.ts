@@ -4,7 +4,6 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterAll, describe, expect, it } from 'vitest';
 import { gateRig } from './harness/gates.js';
-import { expectGap } from './harness/gap.js';
 import { cli, dump, fixturePlan, fixtureReplies, Flow, git, js, KEYS, requestIdOf, sampleRepo } from './harness/e2e.js';
 import { environ } from './harness/procs.js';
 import { sandboxNodes } from './harness/sandbox.js';
@@ -74,7 +73,7 @@ describe('secret (security.md §6, §7)', () => {
 
     // __history__: a first worker turn whose printed output (and checkpoint) carries a canary built in the child
     const replies = fixtureReplies();
-    const histTurn = { expect: 'Run verify and read the failing assertion', text: js(`const c = 'TECERA_CAN' + 'ARY_${histSuffix}';\nconsole.log('history note', c);\ncheckpoint('note', { c });`) };
+    const histTurn = { expect: 'Read the failing test and the implementation under test', text: js(`const c = 'TECERA_CAN' + 'ARY_${histSuffix}';\nconsole.log('history note', c);\ncheckpoint('note', { c });`) };
     replies.worker = [histTurn, ...replies.worker];
 
     const modelOut: Array<{ seat: string; body: string }> = [];
@@ -105,7 +104,9 @@ describe('secret (security.md §6, §7)', () => {
       expect(held.code, held.err + held.out + (await dump(dir))).toBe(4);
       expect((await flow.pending())?.trace.stepId).toBe('pr');
       const done = await flow.finish(wire);
-      expect(done.code, done.err + done.out + (await dump(dir))).toBe(0);
+      // the fix sits next to registered secrets in src/slugify.js: delivery would carry them in the diff
+      // context, so the PR gate refuses it (8 secret-in-delivery): nothing pushed, opened or bundled
+      expect(done.code, done.err + done.out + (await dump(dir))).toBe(8);
       const evs = await flow.events();
       const ex = await cli(dir, ['evidence', flow.runId], { env: flow.env });
       expect(ex.code, ex.err).toBe(0);
@@ -117,7 +118,8 @@ describe('secret (security.md §6, §7)', () => {
       statusJson = stj.out;
       out = [...flow.segments.flatMap((s) => [s.out, s.err]), ex.out, ex.err, why.out, why.err, st.out, st.err, stj.out, stj.err].join('\n');
       expect(requestIdOf(evs.find((e) => e.kind === 'approval.requested' && e.trace.stepId === 'pr'))).toBeTruthy();
-      expect(evs.some((e) => e.kind === 'pr.requested'), 'the PR was delivered as a bundle (no remote)').toBe(true);
+      expect(evs.some((e) => e.kind === 'pr.requested' || e.kind === 'pr.opened'), 'a delivery carrying registered secrets').toBe(false);
+      expect(JSON.stringify(evs.filter((e) => e.kind === 'step.failed' && e.trace.stepId === 'pr').map((e) => e.payload))).toMatch(/secret-in-delivery/);
     } finally {
       for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
       Object.assign(process.env, saved);
@@ -163,7 +165,7 @@ describe('secret (security.md §6, §7)', () => {
       }
     };
     walk(join(dir, '.tecera/runs', flow.runId));
-    expect(existsSync(prDir) && readdirSync(prDir).length > 0, 'the PR bundle was written').toBe(true);
+    expect(existsSync(prDir) ? readdirSync(prDir) : [], 'no PR bundle is written for a refused delivery').toEqual([]);
     scan('cli output', out);
     const db = new DatabaseSync(join(dir, '.tecera/ledger.sqlite'), { readOnly: true });
     const checkpoints = (db.prepare('SELECT state FROM checkpoints').all() as Array<{ state: string }>).map((r) => r.state);
@@ -280,22 +282,22 @@ describe('secret (security.md §6, §7)', () => {
     const PLAIN = `plain/ck+secret=${tail}`;
     const { dir, wt } = await sampleRepo({
       mutate: (d) => {
-        // D6: writes never suspend any more; a NON-write action the human requires approval for still does.
-        // Here runVerify: the worker suspends mid-program on it and checkpoints.
+        // D6: writes never suspend any more, and runVerify is write-risk; a read-risk action the human requires
+        // approval for still does. Here read: the worker suspends mid-program on it and checkpoints.
         const p = join(d, '.tecera/protocols/permissions.json');
         const perms = JSON.parse(readFileSync(p, 'utf8')) as { always: string[]; requiresApproval: string[]; never: string[] };
-        perms.always = perms.always.filter((a) => a !== 'runVerify');
-        perms.requiresApproval = [...new Set([...perms.requiresApproval, 'runVerify'])];
+        perms.always = perms.always.filter((a) => a !== 'read');
+        perms.requiresApproval = [...new Set([...perms.requiresApproval, 'read'])];
         writeFileSync(p, `${JSON.stringify(perms, null, 2)}\n`);
       },
     });
     const fx = fixtureReplies();
     // the first step records a canary (built in the child) and a registered secret in its checkpoints, then calls
-    // runVerify; both values are BUILT in the child (split literals): the model output never carries them
-    const noteTurn = { expect: 'Run verify and read the failing assertion', text: js(`const c = 'TECERA_CAN' + 'ARY_${C_CK}';\nconst token = 'plain/ck' + '+secret=' + '${tail}';\ncheckpoint('note', { c, token });\nconsole.log('noted');\nconst v = await runVerify();\nreturn { facts: [{ key: 'baselineVerifyExit', value: v.exitCode }] };`) };
+    // read; both values are BUILT in the child (split literals): the model output never carries them
+    const noteTurn = { expect: 'Read the failing test and the implementation under test', text: js(`const c = 'TECERA_CAN' + 'ARY_${C_CK}';\nconst token = 'plain/ck' + '+secret=' + '${tail}';\ncheckpoint('note', { c, token });\nconsole.log('noted');\nconst f = await readFile('src/slugify.js');\nreturn { facts: [{ key: 'bytes', value: f.bytes }] };`) };
     const replies = { ...fx, worker: [noteTurn, ...fx.worker] };
     const plan = fixturePlan() as { permissions: { approvals: string[] } };
-    plan.permissions.approvals = [...plan.permissions.approvals, 'runVerify'];
+    plan.permissions.approvals = [...plan.permissions.approvals, 'read'];
     const flow = new Flow(dir, wt, replies, { MY_SERVICE_KEY: PLAIN }, plan);
     let held = await flow.drive();
     // the loop may hold the step up front (its tools need an approval): grant that, then the program runs
@@ -307,8 +309,8 @@ describe('secret (security.md §6, §7)', () => {
     }
     expect(held.code, held.err + held.out + (await dump(dir))).toBe(4);
     const evs = await flow.events();
-    // the attack ran: the worker suspended inside the step on the runVerify approval
-    const suspended = evs.filter((e) => e.kind === 'step.held' && e.trace.stepId === 'analyze' && (e.payload as { owner?: string }).owner === 'worker' && /runVerify requires approval/.test(JSON.stringify(e.payload)));
+    // the attack ran: the worker suspended inside the step on the read approval
+    const suspended = evs.filter((e) => e.kind === 'step.held' && e.trace.stepId === 'analyze' && (e.payload as { owner?: string }).owner === 'worker' && /read requires approval/.test(JSON.stringify(e.payload)));
     expect(suspended.length, `${held.code} ${held.err}\n${await dump(dir)}`).toBeGreaterThan(0);
     const db = new DatabaseSync(join(dir, '.tecera/ledger.sqlite'), { readOnly: true });
     const rows = (db.prepare('SELECT key, state FROM checkpoints').all() as Array<{ key: string; state: string }>);
@@ -371,7 +373,7 @@ describe('secret (security.md §6, §7)', () => {
     expect(evs.some((e) => e.kind === 'step.completed' && e.trace.stepId === 'edit'), 'the edit step never completed on the refused reply').toBe(false);
   }, 300_000);
 
-  it('secret.canary_* [PR bundle] GAP (owner: gates prGate.ts): a registered secret that sits in the repository file next to the fix (here the OpenRouter provider key, D7) never appears raw in the PR delivery bundle under .tecera/runs/<run>/pr/ (patch, body, request)', async () => {
+  it('secret.canary_* [PR bundle]: a registered secret that sits in the repository file next to the fix (here the OpenRouter provider key, D7) never leaves in a delivery: the PR gate refuses it (8 secret-in-delivery), nothing is pushed or bundled under .tecera/runs/<run>/pr/, and the refusal is on the ledger', async () => {
     const PLAIN = `plain/bundle+secret=${rand()}`;
     const { dir, wt } = await sampleRepo({
       mutate: (d) => {
@@ -386,9 +388,8 @@ describe('secret (security.md §6, §7)', () => {
     const held = await flow.drive({ wire });
     expect(held.code, held.err + held.out + (await dump(dir))).toBe(4);
     const done = await flow.finish(wire);
-    expect(done.code, done.err + done.out + (await dump(dir))).toBe(0);
+    expect(done.code, done.err + done.out + (await dump(dir))).toBe(8);
     const evs = await flow.events();
-    expect(evs.some((e) => e.kind === 'pr.requested'), 'the PR was delivered as a bundle (no remote)').toBe(true);
     const sha = (evs.find((e) => e.kind === 'commit.recorded')!.payload as { sha: string }).sha;
     // the attack setup is real: the committed file carries the values (they were in the repository already)
     expect(git(dir, 'show', `${sha}:src/slugify.js`)).toContain(KEYS.OPENROUTER_API_KEY);
@@ -399,19 +400,18 @@ describe('secret (security.md §6, §7)', () => {
     for (const n of needles) expect(asked.some((x) => x.body.includes(n)), `model request carries ${n.slice(0, 16)}…`).toBe(false);
     const ledgerBytes = readdirSync(join(dir, '.tecera')).filter((n) => n.startsWith('ledger.sqlite')).map((f) => readFileSync(join(dir, '.tecera', f)).toString('latin1')).join('\n');
     for (const n of needles) expect(ledgerBytes.includes(n), `ledger holds ${n.slice(0, 16)}…`).toBe(false);
-    // the bundle exists and holds the fix (coverage: the scanned files are the delivery)
+    // the refusal: recorded on the ledger, nothing delivered, no bundle written
+    expect(JSON.stringify(evs.filter((e) => e.kind === 'step.failed' && e.trace.stepId === 'pr').map((e) => e.payload))).toMatch(/secret-in-delivery/);
+    expect(evs.some((e) => e.kind === 'pr.requested' || e.kind === 'pr.opened')).toBe(false);
+    expect(evs.some((e) => e.kind === 'goal.achieved')).toBe(false);
     const prDir = join(dir, '.tecera/runs', flow.runId, 'pr');
-    const files = readdirSync(prDir);
-    expect(files.length).toBeGreaterThan(0);
-    const bundle = files.map((f) => ({ f, t: readFileSync(join(prDir, f)).toString('latin1') }));
-    expect(bundle.some((b) => b.t.includes("'-'")), 'the bundle carries the fix').toBe(true);
-    await expectGap('secret.canary_* [PR bundle]', 'gates prGate.ts (redact the bundle or refuse delivery of a patch that carries a registered secret)', { assertion: 'no registered secret raw in the PR bundle' }, () => {
-      const exposed = bundle.flatMap((b) => needles.filter((n) => b.t.includes(n)).map((n) => `${b.f}: ${n.slice(0, 16)}…`));
-      expect(exposed, 'no registered secret raw in the PR bundle').toEqual([]);
-    });
+    const files = existsSync(prDir) ? readdirSync(prDir) : [];
+    const exposed = files.flatMap((f) => needles.filter((n) => readFileSync(join(prDir, f)).toString('latin1').includes(n)).map((n) => `${f}: ${n.slice(0, 16)}…`));
+    expect(exposed, 'no registered secret raw in a PR bundle').toEqual([]);
+    expect(files.filter((f) => f.endsWith('.patch')), 'no patch bundle for a refused delivery').toEqual([]);
   }, 300_000);
 
-  it('secret.canary_* [gate evidence keys] GAP (owner: gates evidence.ts keys): a registered secret that ends up in a run/intention identifier never appears raw in a gate result, an evidence body or an evidence KEY', async () => {
+  it('secret.canary_* [gate evidence keys]: a registered secret that ends up in a run/intention identifier never appears raw in a gate result, an evidence body or an evidence KEY', async () => {
     const SECRET = `idsecret_${rand()}${rand()}`;
     const rig = gateRig({ extra: { secrets: [SECRET] }, change: (r) => r.write('src/a.ts', 'export const a = 2;\n') });
     // the identifier the loop would pass carries the secret (e.g. an intention id derived from untrusted text)
@@ -429,9 +429,31 @@ describe('secret (security.md §6, §7)', () => {
     const bodies = recs.map((x) => JSON.stringify(x.body)).join('\n');
     expect(bodies.includes(SECRET), 'raw secret in an evidence body').toBe(false);
     expect(bodies, 'the identifier is referenced in evidence bodies only as the marker').toMatch(MARK);
-    await expectGap('secret.canary_* [gate evidence keys]', 'gates evidence.ts / verifyGate.ts / commitGate.ts (digest-based key components or refuse secret-bearing identifiers)', { assertion: 'no raw secret in a returned result or an evidence key' }, () => {
-      const exposed = [JSON.stringify(v), JSON.stringify(r), ...recs.map((x) => x.key)].filter((t) => t.includes(SECRET));
-      expect(exposed.length, 'no raw secret in a returned result or an evidence key').toBe(0);
-    });
+    const exposed = [JSON.stringify(v), JSON.stringify(r), ...recs.map((x) => x.key)].filter((t) => t.includes(SECRET));
+    expect(exposed.length, 'no raw secret in a returned result or an evidence key').toBe(0);
+    // the keys still name the identifier, as a digest
+    expect(v.evidenceKey).toMatch(/^verify:h_[0-9a-f]{24}:\d+$/);
+
+    // the refused-verify path (an unsafe repository: no slot key was ever built) keys by the digest too
+    const unsafe = gateRig({ extra: { secrets: [SECRET] }, change: (r) => (r.g('config', 'core.hooksPath', '.hooks'), r.write('src/a.ts', 'export const a = 2;\n')) });
+    await unsafe.ready;
+    const uv = await unsafe.gates.verify(unsafe.ctx('v', { intentionId }));
+    expect(uv.exitCode).not.toBe(0);
+    expect(uv.evidenceKey).toMatch(/^verify-refused:h_[0-9a-f]{24}:/);
+    const urecs = await (unsafe.ledger as unknown as typeof ledger).listEvidence('run1');
+    expect(urecs.length).toBeGreaterThan(0);
+    expect([JSON.stringify(uv), ...urecs.map((x) => x.key)].filter((t) => t.includes(SECRET)), 'raw secret on the refused-verify path').toEqual([]);
+
+    // a secret in the RUN id: verify and review refuse (their shared keys are derived from the raw id); no key holds it
+    const runId = `run-${SECRET}`;
+    const byRun = gateRig({ extra: { secrets: [SECRET] }, change: (r) => r.write('src/a.ts', 'export const a = 2;\n') });
+    await byRun.ready;
+    const rv = await byRun.gates.verify(byRun.ctx('v', { runId }));
+    const rr = await byRun.gates.review(byRun.ctx('r', { runId }));
+    expect(rv.exitCode).not.toBe(0);
+    expect(rr.verdict).toBe('reject');
+    const rrecs = await (byRun.ledger as unknown as typeof ledger).listEvidence(runId);
+    expect(rrecs.length, 'both refusals are recorded').toBe(2);
+    expect([JSON.stringify(rv), JSON.stringify(rr), ...rrecs.map((x) => x.key)].filter((t) => t.includes(SECRET)), 'raw secret in a key or result for a secret-bearing run id').toEqual([]);
   }, 120_000);
 });

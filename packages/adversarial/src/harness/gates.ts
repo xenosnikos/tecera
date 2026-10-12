@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   approvalGrantedEvent,
+  event,
   FencedWriteGuard,
   MANDATORY_HOOKS,
   parseManifest,
@@ -264,6 +265,24 @@ export function gateRig(o: { change?: (r: Repo) => void; files?: Record<string, 
   return { repo, ledger, gates, plan: p, reviewer, runner, ready, runsDir, ctx: (stepId, x = {}) => gateCtx(stepId, { worktree: repo.dir, plan: p, ...x }) };
 }
 
+let verifyEvents = 0;
+/**
+ * The verify.passed / verify.failed event the loop appends after each gate.verify step: the PR gate reads the
+ * latest one of the intention as its proof that the committed candidate was verified.
+ */
+export async function recordVerify(ledger: Ledger, v: { exitCode: number; evidenceKey: string; fingerprint?: string }, stepId = 'v'): Promise<void> {
+  await ledger.append(
+    event(v.exitCode === 0 ? 'verify.passed' : 'verify.failed', {
+      id: `adv_verify_${++verifyEvents}`,
+      at: NOW,
+      actor: { kind: 'system', id: 'loop' },
+      runId: 'run1',
+      trace: { goalId: 'g1', intentionId: 'i1', stepId },
+      payload: { exitCode: v.exitCode, evidenceKey: v.evidenceKey, ...(v.fingerprint !== undefined ? { fingerprint: v.fingerprint } : {}) },
+    }),
+  );
+}
+
 /**
  * verify → review → verify → commit, the way the loop drives the gate steps (D6: the commit to the work
  * branch takes no approval; the PR gate is the only approval point, see driveToPr).
@@ -273,6 +292,7 @@ export function gateRig(o: { change?: (r: Repo) => void; files?: Record<string, 
 export async function driveToCommit(rig: GateRig, o: { beforeCommit?: () => void | Promise<void>; afterVerify?: () => void | Promise<void>; compromisedReview?: boolean } = {}) {
   await rig.ready;
   const v = await rig.gates.verify(rig.ctx('v'));
+  await recordVerify(rig.ledger, v);
   await o.afterVerify?.();
   const r = await rig.gates.review(rig.ctx('r', { candidate: { d1: v.fingerprint } }));
   // the review gate must never refuse for want of a budget here: a refusal for another reason than the attack
@@ -285,6 +305,7 @@ export async function driveToCommit(rig: GateRig, o: { beforeCommit?: () => void
     rig.gates.memo.review.set(key, { evidenceKey: rv?.evidenceKey ?? r.evidenceKey, verdict: 'approve', d1: v.fingerprint, d2: v.fingerprint, files: vm?.files });
   }
   const v2 = await rig.gates.verify(rig.ctx('v'));
+  await recordVerify(rig.ledger, v2);
   await o.beforeCommit?.();
   const d1 = v2.fingerprint || v.fingerprint;
   const c = await rig.gates.commit(rig.ctx('c', { candidate: { d1, d2: o.compromisedReview ? d1 : (r.fingerprint ?? '') } }));

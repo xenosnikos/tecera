@@ -36,7 +36,7 @@ describe('SAMPLE_FIX_FAILING_TEST_PLAN', () => {
       'pr:gate.pr<commit',
     ]);
     expect(p.allowedModels).toEqual({ analyze: ['worker'], edit: ['worker'] });
-    expect(p.permissions).toEqual({ tools: ['read', 'listFiles', 'edit', 'runVerify'], write: ['src/**'], approvals: ['open_pr'] });
+    expect(p.permissions).toEqual({ tools: ['read', 'listFiles', 'edit', 'runVerify'], write: ['src/**'], approvals: ['open_pr', 'git_push'] });
     expect(p.goalKinds).toEqual(['fix-failing-test']);
     for (const s of p.steps) expect(s.inputs).toEqual({});
     expect(effectiveStepTools(p, p.steps[0]!)).toEqual(['read', 'listFiles', 'runVerify']);

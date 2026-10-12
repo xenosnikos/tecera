@@ -1,0 +1,9 @@
+diff --git a/src/config.json b/src/config.json
+index e71936b..2fab70e 100755
+--- a/src/config.json
++++ b/src/config.json
+@@ -1,3 +1,3 @@
+ {
+-  "port": 5000
++  "port": 8080
+ }

@@ -1,0 +1,192 @@
+{
+  "id": "p_bench03",
+  "trigger": {
+    "kind": "goal.adopted"
+  },
+  "context": [],
+  "steps": [
+    {
+      "id": "analyze",
+      "kind": "worker",
+      "dependsOn": [],
+      "inputs": {},
+      "tools": [
+        "read",
+        "listFiles"
+      ],
+      "instruction": "Read the report command, its library and the tests; the verify gate runs every criterion later. Do not edit anything. Return {\"facts\":[{\"key\":\"targetFiles\",\"value\":[\"src/...\",\"bin/...\"]}]}.",
+      "output": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "value"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "value": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "edit-lib",
+      "kind": "worker",
+      "dependsOn": [
+        "analyze"
+      ],
+      "inputs": {},
+      "tools": [
+        "read",
+        "listFiles",
+        "edit",
+        "runVerify"
+      ],
+      "instruction": "Add a CSV formatter to src/report.js beside formatText (quote fields with commas or quotes). Never edit tests, configs or lockfiles. Return {\"facts\":[{\"key\":\"csvFunction\",\"value\":\"<exported name>\"},{\"key\":\"changedFiles\",\"value\":[\"src/...\"]}]}.",
+      "output": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "value"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "edit-cli",
+      "kind": "worker",
+      "dependsOn": [
+        "edit-lib"
+      ],
+      "inputs": {},
+      "tools": [
+        "read",
+        "listFiles",
+        "edit",
+        "runVerify"
+      ],
+      "instruction": "Wire --format csv in bin/report.js to the formatter the previous step exported (its name is in your dependencies input). Run verify before returning. Return {\"facts\":[{\"key\":\"changedFiles\",\"value\":[\"bin/...\"]}]}.",
+      "output": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "value"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "verify",
+      "kind": "gate.verify",
+      "dependsOn": [
+        "edit-cli"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "review",
+      "kind": "gate.review",
+      "dependsOn": [
+        "verify"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "verify2",
+      "kind": "gate.verify",
+      "dependsOn": [
+        "review"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "commit",
+      "kind": "gate.commit",
+      "dependsOn": [
+        "verify2"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "pr",
+      "kind": "gate.pr",
+      "dependsOn": [
+        "commit"
+      ],
+      "inputs": {}
+    }
+  ],
+  "allowedModels": {
+    "analyze": [
+      "worker"
+    ],
+    "edit-lib": [
+      "worker"
+    ],
+    "edit-cli": [
+      "worker"
+    ]
+  },
+  "permissions": {
+    "tools": [
+      "read",
+      "listFiles",
+      "edit",
+      "runVerify"
+    ],
+    "write": [
+      "src/**",
+      "bin/**"
+    ],
+    "approvals": [
+      "open_pr",
+      "git_push"
+    ]
+  },
+  "budget": {
+    "usd": 1.5,
+    "tokens": 150000,
+    "wallClockSec": 1200,
+    "maxDepth": 2,
+    "maxIterations": 20,
+    "maxAttempts": 2,
+    "maxChangedFiles": 3
+  },
+  "goalKinds": [
+    "csv-export"
+  ],
+  "origin": "generated",
+  "status": "candidate",
+  "rationale": "Read before writing; one worker edits src/** only; verify, foreign review, verify again, commit to the work branch, then the PR (the one human approval)."
+}

@@ -1,5 +1,6 @@
 import { canonicalJson, sha256, type Json, type JsonObject } from './json.js';
 import type { Provenance } from './bdi.js';
+import type { CapabilityRecord } from './acceptance.js';
 
 /**
  * Worker-side types: the JAZ-shaped invoke runtime that executes one step. Spans, stages, effects,
@@ -283,6 +284,52 @@ export interface ToolResult {
    * view handles expose len/slice/search). `path` is the JSON path inside value that was cut.
    */
   handles?: Array<{ path: string; handle: string; methods: string[]; totalChars: number }>;
+}
+
+// ---------- mock tools (the third rung of the gap ladder) ----------
+
+/**
+ * A stand-in the broker serves for a capability the inventory lacks. Same tool name, methods and schema a
+ * real connector would expose; every result it returns carries simulatedProvenance. The first call emits
+ * capability.mocked (payload CapabilityMockedPayload).
+ */
+export interface MockToolDeclaration {
+  /** Capability id it stands in for (inventory id). */
+  capability: string;
+  kind: string;
+  /** Tool name programs call; the broker routes it to the stand-in. */
+  tool: string;
+  methods: string[];
+  schema: JsonObject;
+  /** Stable id of this stand-in (CapabilityRecord.resourceId once mocked). */
+  mockId: string;
+  /** Why a mock and not the real thing (the gap-ladder rung that led here). */
+  reason: string;
+}
+
+/** Provenance every stand-in result carries: src `simulated:<capability>`, untrusted, simulated. */
+export function simulatedProvenance(capability: string, runId?: string): Provenance {
+  return { src: `simulated:${capability}`, trust: 'untrusted', simulated: true, ...(runId ? { runId } : {}) };
+}
+
+/** True when a value came from a stand-in (either marker counts; neither can be cleared by a program). */
+export function isSimulated(p: Provenance | undefined | null): boolean {
+  return !!p && (p.simulated === true || (typeof p.src === 'string' && p.src.startsWith('simulated:')));
+}
+
+/**
+ * Why `decl` may not be registered (null when it may): a mock never stands in for a capability that is
+ * available or provisioned, never for one whose connection says `mockable: false`, and must name its tool,
+ * methods and capability. `record` is the inventory row of decl.capability (undefined = not in the inventory).
+ */
+export function mockRegistrationProblem(decl: MockToolDeclaration, record: CapabilityRecord | undefined, connection?: { mockable?: boolean }): string | null {
+  if (!decl || typeof decl.capability !== 'string' || !decl.capability) return 'a mock must name the capability it stands in for';
+  if (typeof decl.tool !== 'string' || !decl.tool || !Array.isArray(decl.methods) || decl.methods.length === 0) return `mock for ${decl.capability} names no tool or methods`;
+  if (typeof decl.mockId !== 'string' || !decl.mockId) return `mock for ${decl.capability} has no id`;
+  if (record?.state === 'available') return `capability ${decl.capability} is available: it may not be mocked`;
+  if (record?.state === 'provisioned') return `capability ${decl.capability} is provisioned: it may not be mocked`;
+  if (connection && connection.mockable === false) return `connection ${decl.capability} is not mockable`;
+  return null;
 }
 
 export interface HistoryEntry {

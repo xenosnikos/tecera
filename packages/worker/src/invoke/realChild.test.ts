@@ -6,13 +6,17 @@ import { newIntention, type CapabilitySet, type Effect, type Hook, type Inputs, 
 import { ChildProcessRepl } from '../sandbox/host.js';
 import { Broker } from '../broker/broker.js';
 import { EXAMPLE_PROGRAM } from '../protocol/prompts.js';
-import { createEditTool } from '../tools/edit.js';
+import { createEditTool as writeRiskEditTool, type EditToolOptions } from '../tools/edit.js';
+import { irreversibleDouble } from './fakes.js';
 import { createListFilesTool } from '../tools/listFiles.js';
 import { createReadTool } from '../tools/read.js';
 import { FakeLedger, FakeLLM, liveWriteGuard } from './fakes.js';
 import { invoke, type InvokeOptions, type ReplFactory } from './invoke.js';
 import { StepWorker } from './stepWorker.js';
 import type { TraceEntry } from './span.js';
+
+/** D6: a write-risk tool is never held for approval; the approval tests here hold an irreversible double of edit. */
+const createEditTool = (o?: EditToolOptions) => irreversibleDouble(writeRiskEditTool(o));
 
 /**
  * The invoke loop against the REAL sandbox child (ChildProcessRepl), wired the way production wires it:

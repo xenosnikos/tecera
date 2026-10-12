@@ -7,7 +7,8 @@ import { CliError, EXIT } from '../errors.js';
 /**
  * `tecera why <eventId>`: accountability walk. The ledger's whyChain returns the events sharing the
  * target's step, intention, goal and plan; this groups them as action → step → intention → goal → event
- * (the event that adopted the goal), oldest first.
+ * (the event that adopted the goal), oldest first. Under an acceptance contract the walk also names the
+ * contract the goal was held to and who accepted it (the latest criteria.accepted / amended of the goal).
  */
 
 export interface WhyReport {
@@ -50,6 +51,14 @@ export const whyCommand: Command = async (c) => {
   if (t.intentionId) c.out.say(`${pad('intention', 11)}${t.intentionId}  ${kinds(r.intention)}`);
   if (t.planId) c.out.say(`${pad('plan', 11)}${t.planId}  ${kinds(r.plan)}`);
   if (t.goalId) c.out.say(`${pad('goal', 11)}${t.goalId}  ${kinds(r.goal)}`);
+  const contract = [...r.goal].reverse().find((e) => e.kind === 'criteria.accepted' || e.kind === 'criteria.amended' || e.kind === 'criteria.drafted');
+  if (contract) {
+    const p = contract.payload as { hash?: unknown; to?: unknown; via?: unknown; approver?: { id?: unknown } };
+    const hash = String(p.hash ?? p.to ?? '').slice(0, 12);
+    const how = contract.kind === 'criteria.accepted' ? `accepted via ${String(p.via ?? '?')}${p.approver?.id ? ` by ${String(p.approver.id)}` : ''}` : contract.kind === 'criteria.amended' ? `amended by ${contract.actor.kind}:${contract.actor.id}, not yet accepted` : 'drafted, not yet accepted';
+    c.out.say(`${pad('contract', 11)}${hash}  ${how}  (${contract.kind} ${contract.id})`);
+    c.out.set('contract', { id: contract.id, kind: contract.kind, hash: String(p.hash ?? p.to ?? '') });
+  }
   if (r.origin) c.out.say(`${pad('event', 11)}${r.origin.kind}  ${r.origin.id}  by ${r.origin.actor.kind}:${r.origin.actor.id}  "${String(((r.origin.payload as { goal?: { statement?: string } }).goal?.statement ?? '')).split('\n')[0]}"`);
   else c.out.say(`${pad('event', 11)}(no goal.adopted in the chain)`);
   const ids = (xs: TeceraEvent[]): Json => xs.map((e) => ({ id: e.id, kind: e.kind }));

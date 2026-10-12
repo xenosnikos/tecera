@@ -1,11 +1,16 @@
 import {
   LedgerError,
   REFLEX_SEAMS,
+  acceptedContractOf,
   approvalAuditProblem,
+  capabilityInventoryOf,
+  ledgerProvenRun,
+  resourceRegistryOf,
   openRunPools,
   digest,
   event,
   requireApproval,
+  type AcceptanceContract,
   type AchievementGoal,
   type ApprovalGrant,
   type Budget,
@@ -17,15 +22,17 @@ import {
   type Principal,
   type Manifest,
   type Plan,
+  type PlanningContext,
   type PlanValidator,
   type ReflexSeam,
   type ReflexSetting,
+  type RunVerdict,
   type TeceraEvent,
   type Worker,
 } from '@tecera/contracts';
 import { BeliefMap, projectBeliefs } from '@tecera/ledger';
 import { ApprovalExpired, Loop, LoopStopped, type LoopStatus } from '@tecera/loop';
-import { validatePlan, type PermissionsDoc } from '@tecera/policy';
+import { allowanceOf, validatePlan, type PermissionsDoc } from '@tecera/policy';
 import { ReflexRouter } from '@tecera/reflex';
 import type { Command, CommandContext } from '../cli/context.js';
 import { UnsafeEnvError } from '../env.js';
@@ -33,6 +40,7 @@ import { costLine, costReport, type CostReport } from '../cost.js';
 import { CliError, EXIT, NotWired } from '../errors.js';
 import { effectiveBudget, GoalError, resolveGoal, type GoalSpec } from '../goals.js';
 import { PlanRegistry } from '../plans.js';
+import { provenOptionsOf } from '../proof.js';
 import { executionReadiness } from '../readiness.js';
 import { stripUndefined, type Runtime } from '../runtime.js';
 import { toolingProblem } from '../verify.js';
@@ -82,8 +90,17 @@ import { decisionEvent } from './approve.js';
  * same action hash, not expired, with their approval.granted audit event), and the loop is driven whenever
  * anything was resumed, recovered or is dispatchable. The durable run deadline and the run's budget pools
  * carry over from the first segment.
- * Exit code (read back from the ledger): 0 achieved; 3 not ready; 4 held (at the PR); 5 verify failed; 6 review
- * rejected; 7 budget (only with budgets.enforce); 8 policy; 9 ledger/loop stopped/not wired/human needed;
+ * Acceptance contracts (D8–D12): a statement run is adopted with `draftContract` (the planner drafts the
+ * criteria; the goal holds for the requestor's sign-off, an accept_criteria approval, exit 4); a goal file with
+ * `criteria:` is adopted with its own contract (no sign-off under `acceptance.signoff: statement`). The loop
+ * gets the wiring's capability probe, local provisioner and secrets predicate, so every capability a
+ * criterion requires is probed, provisioned, mocked or asked for (a provide_capability hold, exit 4) before
+ * anything is planned. Human criteria are asked at the PR hold (answer_criterion approvals, exit 4).
+ *
+ * Exit code (read back from the ledger; "achieved" is contracts ledgerProvenRun, never a goal.achieved event
+ * alone): 0 achieved; 3 not ready; 4 held (criteria sign-off, a capability ask, a human criterion, the PR);
+ * 5 verify failed; 6 review rejected; 7 budget (only with budgets.enforce); 8 policy; 9 ledger/loop
+ * stopped/not wired/human needed; 10 provisional (every criterion proven, one on a mock: never 0);
  * 130 interrupted. `returned` is never done.
  */
 
@@ -91,7 +108,7 @@ import { decisionEvent } from './approve.js';
 export const CALLS_PER_RUN = 400;
 
 /** Tools the default validator accepts when wiring does not supply a catalog. */
-export const DEFAULT_TOOL_CATALOG = ['read', 'edit', 'listFiles', 'runVerify'] as const;
+export const DEFAULT_TOOL_CATALOG = ['read', 'edit', 'delete', 'listFiles', 'runVerify'] as const;
 
 export function reflexSettings(m: Manifest): Record<ReflexSeam, ReflexSetting> {
   return Object.fromEntries(REFLEX_SEAMS.map((s) => [s, m.reflexes[s]])) as Record<ReflexSeam, ReflexSetting>;
@@ -111,8 +128,8 @@ const BUDGET_KEYS: Array<keyof Budget> = ['usd', 'tokens', 'wallClockSec', 'maxD
 /** Policy-backed, goal-aware validator: permissions, tool catalog, manifest budgets, then the goal's ceilings. */
 export function policyValidator(permissions: PermissionsDoc, toolCatalog: readonly string[]): PlanValidator {
   return {
-    validatePlan(plan: Plan, m: Manifest, goal: AchievementGoal): string[] {
-      const errors = validatePlan(plan, m, { toolCatalog: [...toolCatalog], permissions, goalHasCheck: !!goal?.check?.command });
+    validatePlan(plan: Plan, m: Manifest, goal: AchievementGoal, ctx?: PlanningContext): string[] {
+      const errors = validatePlan(plan, m, { toolCatalog: [...toolCatalog], permissions, goalHasCheck: !!goal?.check?.command, ...(ctx ? { context: ctx } : {}), ...(goal ? { goal } : {}) });
       for (const k of BUDGET_KEYS) {
         const v = plan.budget[k];
         const cap = goal?.budget?.[k];
@@ -145,14 +162,24 @@ export interface RunOutcome {
   reason: string;
 }
 
-/** Read a run's outcome back from its events (and the Loop's state). `returned` is never done. */
-export function exitCodeForRun(events: ReadonlyArray<TeceraEvent>, goalId: string, status?: Pick<LoopStatus, 'state' | 'stopReason' | 'failure'>): RunOutcome {
+/**
+ * Read a run's outcome back from its events (and the Loop's state). `verdict` is the run's contracts
+ * provenRun / ledgerProvenRun result: the only thing that makes a run exit 0 (a goal.achieved event without
+ * a verdict that proves it counts for nothing) or 10 (provisional). `returned` is never done.
+ */
+export function exitCodeForRun(events: ReadonlyArray<TeceraEvent>, goalId: string, status?: Pick<LoopStatus, 'state' | 'stopReason' | 'failure'>, verdict?: RunVerdict | null): RunOutcome {
   if (status?.state === 'stopped') {
     // A budget refusal that stopped the loop is a budget failure; anything else (ledger, lease) is exit 9.
     if (status.failure === 'budget') return { exitCode: EXIT.budget, reason: `loop stopped: ${status.stopReason ?? 'budget'}` };
     return { exitCode: EXIT.ledger, reason: `loop stopped: ${status.stopReason ?? 'unknown'}` };
   }
-  if (events.some((e) => e.kind === 'goal.achieved' && e.trace.goalId === goalId)) return { exitCode: EXIT.ok, reason: 'goal achieved (environmental check passed)' };
+  const proven = verdict?.goals?.[goalId];
+  if (proven?.achieved === true && proven.proof) {
+    const f = proven.proof.fidelity;
+    return { exitCode: EXIT.ok, reason: `goal achieved (${proven.proof.criteria?.length ? `${proven.proof.criteria.length} criteria proven${f ? `, fidelity ${f}` : ''}` : 'environmental check passed'})` };
+  }
+  if (proven?.provisional) return { exitCode: EXIT.provisional, reason: `goal provisional: every criterion is proven but one rests on a mock (${proven.why ?? 'mocked capability'}); never achieved` };
+  const unprovenAchieved = events.some((e) => e.kind === 'goal.achieved' && e.trace.goalId === goalId);
   // Only the current execution counts: an earlier segment (ended by run.ended) that was interrupted and then
   // resumed successfully is history, not the outcome.
   let segment = 0;
@@ -171,9 +198,20 @@ export function exitCodeForRun(events: ReadonlyArray<TeceraEvent>, goalId: strin
   }
   const dropped = events.some((e) => e.kind === 'goal.dropped' && e.trace.goalId === goalId);
   if (requested.size && !dropped) {
-    const atPr = [...requested.values()].some((h) => h.kind === 'approval.requested' && /^gate\.pr /.test(String((h.payload as { reason?: unknown }).reason ?? '')));
-    const prHeld = atPr || [...requested.values()].some((h) => (h.payload as { owner?: unknown }).owner === 'gate');
-    return { exitCode: EXIT.held, reason: `held for ${prHeld ? 'PR ' : ''}approval ${[...requested.keys()].join(', ')}` };
+    const holds = [...requested.values()];
+    const action = (h: TeceraEvent): string => String((h.payload as { action?: unknown }).action ?? '');
+    const atPr = holds.some((h) => h.kind === 'approval.requested' && /^gate\.pr /.test(String((h.payload as { reason?: unknown }).reason ?? '')));
+    const prHeld = atPr || holds.some((h) => (h.payload as { owner?: unknown }).owner === 'gate');
+    const what = holds.some((h) => action(h) === 'accept_criteria')
+      ? 'criteria sign-off '
+      : holds.some((h) => action(h) === 'provide_capability')
+        ? 'a capability the run lacks '
+        : holds.some((h) => action(h) === 'answer_criterion')
+          ? 'human criterion answer '
+          : prHeld
+            ? 'PR '
+            : '';
+    return { exitCode: EXIT.held, reason: `held for ${what}approval ${[...requested.keys()].join(', ')}` };
   }
   const lastFail = [...events].reverse().find((e) => e.kind === 'step.failed');
   if (lastFail) {
@@ -199,6 +237,7 @@ export function exitCodeForRun(events: ReadonlyArray<TeceraEvent>, goalId: strin
   }
   if (events.some((e) => e.kind === 'plan.rejected')) return { exitCode: EXIT.policy, reason: 'the plan was rejected by policy' };
   if (dropped) return { exitCode: EXIT.error, reason: 'goal dropped' };
+  if (unprovenAchieved) return { exitCode: EXIT.ledger, reason: `goal.achieved is recorded but not proven (${proven?.why ?? verdict?.why ?? 'no proven verdict for the run'})` };
   return { exitCode: EXIT.error, reason: 'the loop stopped without reaching the goal' };
 }
 
@@ -234,7 +273,7 @@ function describeBudget(b: Budget): string {
 }
 
 function goalOf(goal: GoalSpec, budget: Budget): AchievementGoal {
-  return { id: goal.goalId, statement: goal.statement, check: goal.check, commitment: goal.commitment, budget, status: 'open', evidence: [] };
+  return { id: goal.goalId, statement: goal.statement, check: goal.check, commitment: goal.commitment, budget, status: 'open', evidence: [], ...(goal.contract ? { criteria: goal.contract.criteria, contractHash: goal.contractHash } : {}) };
 }
 
 async function dryRun(c: CommandContext, rt: Runtime, goal: GoalSpec, budget: Budget): Promise<number> {
@@ -283,12 +322,28 @@ async function notReady(c: CommandContext, rt: Runtime, needCredentials: boolean
 /** Find the goal and budget a run was started with, from its goal.adopted event. */
 async function resumeTarget(rt: Runtime, runId: string): Promise<{ goal: GoalSpec; budget: Budget } | null> {
   for await (const e of rt.ledger().events({ runId, kinds: ['goal.adopted'] })) {
-    const g = (e.payload as { goal?: AchievementGoal }).goal;
+    const p = e.payload as { goal?: AchievementGoal; contract?: AcceptanceContract; draftContract?: boolean };
+    const g = p.goal;
     if (!g?.id) continue;
     const budget = { ...rt.manifest.budgets, ...(g.budget ?? {}) } as Budget;
     for (const k of BUDGET_KEYS) budget[k] = Math.min(budget[k], rt.manifest.budgets[k]);
+    // The goal file's contract as adopted (its hash is bound into the goal); a statement's contract is on the
+    // ledger as criteria.drafted / amended and the loop rebuilds it on restore.
+    const contract = g.criteria?.length && g.contractHash ? (p.contract ?? { goalId: g.id, statement: g.statement, criteria: g.criteria, outOfScope: [], assumptions: [] }) : undefined;
     return {
-      goal: { id: g.id.replace(/^g_/, ''), goalId: g.id, statement: g.statement, check: g.check, commitment: g.commitment, budget: g.budget ?? {}, onViolation: 'wake-human', source: 'statement' },
+      // The name is the goal id without its prefix: for a statement it is the same slug the first segment
+      // committed under (goals.ts), so the work branch stays tecera/<slug> across holds and resumes (L5-F1).
+      goal: {
+        id: g.id.replace(/^g_/, ''),
+        goalId: g.id,
+        statement: g.statement,
+        check: g.check,
+        commitment: g.commitment,
+        budget: g.budget ?? {},
+        onViolation: 'wake-human',
+        source: p.draftContract || !contract ? 'statement' : 'file',
+        ...(contract ? { contract, contractHash: g.contractHash } : {}),
+      },
       // enforcement follows the CURRENT manifest (the ledger never relaxes a pool opened enforced)
       budget: { ...budget, enforce: rt.manifest.budgets.enforce } as Budget,
     };
@@ -488,6 +543,16 @@ function buildLoop(rt: Runtime, ctx: WiringContext, ports: WiredPorts, signal?: 
     callsCap: CALLS_PER_RUN,
     // S2: the worktree is checkpointed after every worker step and at each suspension; a restart restores it.
     ...(ports.worktreeCheckpoint ? { worktreeCheckpoint: ports.worktreeCheckpoint } : {}),
+    // The change-path envelope at step close-out: the host's own list of what a worker step changed.
+    ...(ports.stepChanges ? { stepChanges: (a: { from: string; to: string }) => ports.stepChanges!({ from: a.from, to: a.to }) } : {}),
+    // A later intention of the goal works on its own branch cut from the pinned base; nothing is inherited.
+    ...(ports.prepareIntention ? { prepareIntention: ports.prepareIntention } : {}),
+    // closeOut evidence: which files a worker step changed (paths and line counts, never contents).
+    ...(ports.worktreeChanges ? { worktreeChanges: ports.worktreeChanges } : {}),
+    // D9/D10: declared connections are probed for real; missing capabilities provisioned in Tecera's space.
+    ...(ports.probe ? { probe: ports.probe } : {}),
+    ...(ports.provisioner ? { provisioner: ports.provisioner } : {}),
+    secrets: ports.secrets ?? ((v: string) => rt.redactor.containsSecret(v) !== null),
     redact: (v: Json) => rt.redactor.redactJson(v),
     now: rt.now,
     ids: ctx.ids,
@@ -567,13 +632,26 @@ export async function runCost(ledger: WiringContext['ledger'], runId: string, ev
   return costReport(evs, pools);
 }
 
+/**
+ * The single-source verdict on the run (contracts ledgerProvenRun: the hash chain, the verify evidence, the
+ * accepted contract and every criterion proof, the manifest allowance, sign-off and secrets). A ledger whose
+ * chain cannot be verified proves nothing: null.
+ */
+export async function runVerdict(rt: Runtime, ctx: Pick<WiringContext, 'ledger' | 'runId'>): Promise<RunVerdict | null> {
+  try {
+    return await ledgerProvenRun(ctx.ledger, ctx.runId, provenOptionsOf(rt.manifest, rt.redactor));
+  } catch {
+    return null;
+  }
+}
+
 async function finish(rt: Runtime, ctx: WiringContext, status: LoopStatus, signal: AbortSignal | undefined, notes: string[]): Promise<RunResult> {
   const { runId, goal } = ctx;
   if (signal?.aborted) await rt.append('run.interrupted', { runId, payload: { at: 'during loop' } });
   for (const p of await stageAchievedPlans(ctx.ledger, runId, { ids: ctx.ids, now: rt.now })) notes.push(`plan ${p} staged as a candidate (its goal was achieved)`);
   const events: TeceraEvent[] = [];
   for await (const e of ctx.ledger.events({ runId })) events.push(e);
-  const outcome = exitCodeForRun(events, goal.goalId, status);
+  const outcome = exitCodeForRun(events, goal.goalId, status, await runVerdict(rt, ctx));
   const cost = await runCost(ctx.ledger, runId, events);
   await rt.append('run.ended', {
     runId,
@@ -599,6 +677,8 @@ export async function executeRun(rt: Runtime, ctx: WiringContext, ports: WiredPo
   // budget hook reserves `calls` per LLM/tool call). Opened BEFORE the loop starts: the loop never widens
   // nor relaxes a pool, so an enforced pool opened here could not be softened later.
   await ledgerOp(() => openRunPools(ledger, runId, m, { callsCap: CALLS_PER_RUN }));
+  // D12: resources whose lifetime passed are released before anything new is provisioned.
+  const sweepNotes = (await ports.sweep?.().catch((e: unknown) => [`resources  expiry sweep failed: ${(e as Error)?.message ?? String(e)}`])) ?? [];
   await loop.start(rt.manifestHash);
   if (loop.status().state === 'stopped') throw new LoopStopped(loop.status().stopReason ?? 'ledger append failed');
   // The durable deadline also cancels every in-flight model call and gate through the run-wide signal.
@@ -664,8 +744,12 @@ export async function executeRun(rt: Runtime, ctx: WiringContext, ports: WiredPo
     await rt.append('run.interrupted', { runId, payload: { at: 'before goal adoption' } });
     return finish(rt, ctx, loop.status(), undefined, []);
   }
-  await loop.adoptGoal({ id: goal.goalId, statement: goal.statement, check: goal.check, commitment: goal.commitment, budget });
-  const notes: string[] = [];
+  // D8: a goal file with criteria carries its contract; a statement is drafted by the planner and signed off.
+  const base = { id: goal.goalId, statement: goal.statement, check: goal.check, commitment: goal.commitment, budget };
+  if (goal.contract) await loop.adoptGoal({ ...base, criteria: goal.contract.criteria, contractHash: goal.contractHash }, { contract: goal.contract });
+  else if (goal.source === 'statement') await loop.adoptGoal(base, { draftContract: true });
+  else await loop.adoptGoal(base);
+  const notes: string[] = [...sweepNotes];
   const status = await drive(loop, signal, 1000, ports, notes);
   return finish(rt, ctx, status, signal, notes);
 }
@@ -706,6 +790,26 @@ async function scanRun(ctx: WiringContext): Promise<RunScan> {
 }
 
 /**
+ * The planning context of a run's goal under its accepted contract (the one the loop plans with), or
+ * undefined when the goal is held to no contract or none is accepted now.
+ */
+function planningContextOf(rt: Runtime, ctx: WiringContext, events: readonly TeceraEvent[]): PlanningContext | undefined {
+  const goalId = ctx.goal.goalId;
+  const view = acceptedContractOf(events, goalId, { runId: ctx.runId, ...(rt.manifest.acceptance.signoff === 'always' ? { requireApproval: true } : {}) });
+  if (view.state !== 'accepted' || !view.accepted) return undefined;
+  const opts = provenOptionsOf(rt.manifest, rt.redactor);
+  const allowance = allowanceOf(rt.manifest);
+  const fold = { runId: ctx.runId, allowance, ...(opts.secrets ? { secrets: opts.secrets } : {}) };
+  return {
+    contract: view.accepted.contract,
+    contractHash: view.accepted.hash,
+    inventory: capabilityInventoryOf(events, fold).records,
+    allowance,
+    provisionedSoFar: resourceRegistryOf(events, fold).resources.length,
+  };
+}
+
+/**
  * Re-validate the authority a resumed run would restore against the CURRENT policy. Null when it may
  * proceed; otherwise why not (exit 8). Plans of unfinished intentions must validate under the current
  * manifest, permissions and goal; a worker suspension (whose checkpoint carries the capabilities it was
@@ -716,10 +820,14 @@ async function revalidateRestore(rt: Runtime, ctx: WiringContext, ports: WiredPo
   const changed = scan.policyHash !== current;
   const validator = ports.validator ?? policyValidator(rt.permissions, ports.toolCatalog ?? DEFAULT_TOOL_CATALOG);
   const goal = goalOf(ctx.goal, ctx.budget);
+  const pctx = planningContextOf(rt, ctx, scan.events);
   for (const [iid, planId] of scan.active) {
     const plan = scan.plans.get(planId) ?? (await ctx.library.get(planId));
     if (!plan) return `intention ${iid}: plan ${planId} is not in the ledger; its authority cannot be re-validated`;
-    const errors = validator.validatePlan(plan, ctx.manifest, goal);
+    // A plan written for a contract that is no longer the accepted one never runs again: the loop drops its
+    // intention before any step dispatches (and the goal holds for a sign-off of the current contract).
+    if (plan.contractHash !== undefined && plan.contractHash !== pctx?.contractHash) continue;
+    const errors = pctx ? validator.validatePlan(plan, ctx.manifest, goal, pctx) : validator.validatePlan(plan, ctx.manifest, goal);
     if (errors.length) return `intention ${iid}: plan ${planId} is no longer allowed by the current policy (${errors.slice(0, 3).join('; ')})`;
   }
   if (changed && scan.workerHolds.length) {
@@ -754,6 +862,7 @@ export async function resumeRun(rt: Runtime, ctx: WiringContext, ports: WiredPor
   for (const k of reap.killed) notes.push(`reaped pid ${k.pid} (${k.why})`);
   if (reap.killed.length) await rt.append('evidence.appended', { runId: ctx.runId, payload: { kind: 'recovery.reaped', pids: reap.killed.map((k) => k.pid), reasons: reap.killed.map((k) => k.why) } });
 
+  for (const n of (await ports.sweep?.().catch((e: unknown) => [`resources  expiry sweep failed: ${(e as Error)?.message ?? String(e)}`])) ?? []) notes.push(n);
   const loop = buildLoop(rt, ctx, ports, signal);
   const restored = await loop.restore();
   const dl = loop.status().deadline;
@@ -805,13 +914,15 @@ export async function resumeRun(rt: Runtime, ctx: WiringContext, ports: WiredPor
   // A note that only re-held a step changed nothing; anything else restore did (re-dispatch, restart,
   // reconcile, complete, fail, expire) must be driven and recorded.
   const recoveredWork = (restored.recovered ?? []).filter((n) => n.action !== 'held').length;
-  const work = resumed > 0 || expired > 0 || recoveredWork > 0 || (restored.dispatchable ?? 0) > 0 || (after.dispatchable ?? 0) > 0 || after.state === 'stopped';
+  // An intention still waiting for its own branch is work too: the first tick prepares it.
+  const unprepared = Object.keys(after.awaitingPreparation ?? {}).length;
+  const work = resumed > 0 || expired > 0 || recoveredWork > 0 || (restored.dispatchable ?? 0) > 0 || (after.dispatchable ?? 0) > 0 || unprepared > 0 || after.state === 'stopped';
   if (!work && failedResumes === 0) {
     // Nothing to do. A crash between goal.achieved and staging is still repaired (idempotent).
     for (const p of await stageAchievedPlans(ctx.ledger, ctx.runId, { ids: ctx.ids, now: rt.now })) notes.push(`plan ${p} staged as a candidate (its goal was achieved)`);
     const events: TeceraEvent[] = [];
     for await (const e of ctx.ledger.events({ runId: ctx.runId })) events.push(e);
-    const outcome = exitCodeForRun(events, ctx.goal.goalId, after);
+    const outcome = exitCodeForRun(events, ctx.goal.goalId, after, await runVerdict(rt, ctx));
     notes.push('nothing to resume');
     return { ...outcome, status: after, notes, cost: await runCost(ctx.ledger, ctx.runId, events) };
   }

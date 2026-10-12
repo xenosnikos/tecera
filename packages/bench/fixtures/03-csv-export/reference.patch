@@ -1,0 +1,37 @@
+diff --git a/bin/report.js b/bin/report.js
+index 6aa0094..678a553 100755
+--- a/bin/report.js
++++ b/bin/report.js
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env node
+ import { readFileSync } from 'node:fs';
+-import { formatText, summarize } from '../src/report.js';
++import { formatCsv, formatText, summarize } from '../src/report.js';
+ 
+-// report [--format text] [file.json]: totals per region of a sales file (default data/sales.json).
++// report [--format text|csv] [file.json]: totals per region of a sales file (default data/sales.json).
+ const args = process.argv.slice(2);
+ let format = 'text';
+ let file = new URL('../data/sales.json', import.meta.url);
+@@ -12,6 +12,7 @@ for (let i = 0; i < args.length; i++) {
+ }
+ const summary = summarize(JSON.parse(readFileSync(file, 'utf8')));
+ if (format === 'text') process.stdout.write(formatText(summary));
++else if (format === 'csv') process.stdout.write(formatCsv(summary));
+ else {
+   process.stderr.write(`unknown format ${format}\n`);
+   process.exit(2);
+diff --git a/src/report.js b/src/report.js
+index b7304b6..ea8dc14 100755
+--- a/src/report.js
++++ b/src/report.js
+@@ -10,3 +10,9 @@ export function summarize(rows) {
+ export function formatText(summary) {
+   return summary.map((s) => `${s.region.padEnd(16)} ${s.total.toFixed(2).padStart(10)}`).join('\n') + '\n';
+ }
++
++const csvField = (v) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
++
++export function formatCsv(summary) {
++  return ['region,total', ...summary.map((s) => `${csvField(s.region)},${s.total.toFixed(2)}`)].join('\n') + '\n';
++}

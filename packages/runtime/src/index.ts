@@ -33,9 +33,9 @@ export { loadGoal, resolveGoal, parseGoalFile, effectiveBudget, listGoalIds, Goa
 export type { GoalSpec } from './goals.js';
 export { PlanRegistry, PlanDecisionError } from './plans.js';
 export type { RegisteredPlan, PlanDecision, PlanVerdict } from './plans.js';
-export { wireRunPorts, defaultProbe, createProbe, createWiring, verifyIdentity, MeteredPlanner, SEAT_RESERVATION, VERIFY_UID_ENV, VERIFY_GID_ENV, VERIFY_ALLOW_ROOT_ENV, WiringError, exhaustionRecorder, ledgerCostSink, ghEnvOf, GH_ENV_KEYS } from './wiring.js';
+export { wireRunPorts, defaultProbe, createProbe, createWiring, usableResources, pushableRemote, verifyIdentity, MeteredPlanner, SEAT_RESERVATION, VERIFY_UID_ENV, VERIFY_GID_ENV, VERIFY_ALLOW_ROOT_ENV, WiringError, exhaustionRecorder, ledgerCostSink, ghEnvOf, GH_ENV_KEYS } from './wiring.js';
 export type { WiringContext, WiredPorts, WireFn, WiringOptions, SeatProbe, SeatRef, ProbeResult, BaselineResult } from './wiring.js';
-export { leaseWorktree, LeaseLost, worktreesRoot, WORKTREES_ENV, snapshotTree, restoreTree } from './worktree.js';
+export { leaseWorktree, LeaseLost, worktreesRoot, othersTraverse, WORKTREES_ENV, snapshotTree, restoreTree } from './worktree.js';
 export type { LeasedWorktree, LeaseOptions } from './worktree.js';
 export { fencedTool, fencedVerifyRunner, leaseGuard, leasedGateContext, mutationCheck } from './fencing.js';
 export type { LiveLease } from './fencing.js';
@@ -60,8 +60,17 @@ export {
   cancellableWorker,
   policyFingerprint,
   runCost,
+  runVerdict,
   DEFAULT_TOOL_CATALOG,
 } from './commands/run.js';
+export { criteriaCommand } from './commands/criteria.js';
+export { resourcesCommand, resourcesListCommand, resourcesReleaseCommand, resourcesTransferCommand, defaultProvisioner } from './commands/resources.js';
+export type { ResourcesCommandOptions } from './commands/resources.js';
+export { capabilityChecks } from './commands/doctor.js';
+export { provenOptionsOf } from './proof.js';
+export { loadScripts, scriptedFetch, ScriptedRunPlanner, bindVerifyCriteria, SCRIPTED_ENV } from './scripted.js';
+export type { ScriptSet, ScriptReply, ScriptTap } from './scripted.js';
+export * from './capabilities/index.js';
 export type { RunOutcome, RunResult } from './commands/run.js';
 export { toolingProblem } from './verify.js';
 export { admitVerify, ContainedVerifyRunner, VerifyContainmentError } from './containment.js';
@@ -89,3 +98,5 @@ export { renderBrainSummary, renderPermissionsSettings } from './adapters/render
 export { applyManagedBlock, jsonMerge, BLOCK_START, BLOCK_END } from './adapters/merge.js';
 export { PlannedFs } from './vfs.js';
 export type { Env } from './util/proc.js';
+export { DECISION_NONINTERACTIVE_ENV, AGENT_HOST_MARKERS, guardDecision, decisionGuard } from './decisionGuard.js';
+export type { DecisionGuardRecord, DecisionGuardVerdict } from './decisionGuard.js';

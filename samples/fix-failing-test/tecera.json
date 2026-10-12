@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "bc_sample001",
   "name": "fix-failing-test",
-  "owner": "nikoxenos@gmail.com",
+  "owner": "owner@example.com",
   "runtime": {
     "tecera": ">=0.1.0 <0.2.0"
   },

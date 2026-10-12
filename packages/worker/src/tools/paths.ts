@@ -1,8 +1,9 @@
 import { randomBytes } from 'node:crypto';
-import { constants as C, existsSync, fstatSync, linkSync, lstatSync, readlinkSync, realpathSync, renameSync, unlinkSync, type BigIntStats } from 'node:fs';
+import { constants as C, existsSync, fstatSync, linkSync, lstatSync, readlinkSync, renameSync, unlinkSync, type BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readlink, realpath, type FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { requireWriteGuard, sha256, type WriteGuard, type WriteIntent } from '@tecera/contracts';
+import { quarantineWorktree, worktreeQuarantine } from '../sandbox/quarantine.js';
 
 /**
  * Worktree confinement (docs/security.md, tamper.symlink_hardlink).
@@ -33,10 +34,11 @@ import { requireWriteGuard, sha256, type WriteGuard, type WriteIntent } from '@t
  *    segment); a parent swapped or moved after open is refused BEFORE anything is written into it.
  *  - No in-place mutation: the new content is written to a fresh O_CREAT|O_EXCL|O_NOFOLLOW temp file in
  *    the verified directory, fsync'ed, and then committed with synchronous calls only (no await, so nothing
- *    in this process interleaves): re-verify (target identity, nlink, directory path and identity, signal,
- *    guard) → keep a backup link of the original → rename over the target (or link(2) for a new file, which
- *    can never overwrite) → post-commit verify. The original inode is never written, so a hardlink or a
- *    move of the target after the checks can never carry the write into a protected file.
+ *    in this process interleaves): re-verify (directory path and identity, target identity and nlink) →
+ *    the last signal, guard and target checks immediately before the first mutation → keep a backup link of
+ *    the original → rename over the target (or link(2) for a new file, which can never overwrite) →
+ *    post-commit verify. The original inode is never written, so a hardlink or a move of the target after
+ *    the checks can never carry the write into a protected file.
  *  - Post-commit verification with rollback: if the directory chain or the committed entry is not what was
  *    authorized after the commit (an outside process raced the synchronous window), the commit is undone
  *    in the same directory inode (the original inode goes back under its name; a new entry is removed), so
@@ -48,6 +50,8 @@ import { requireWriteGuard, sha256, type WriteGuard, type WriteIntent } from '@t
  *    excluding outside writers needs kernel confinement (sandbox/runtime lanes).
  *  - Platforms without /proc/self/fd (no descriptor path verification) refuse every write. There is no
  *    path-based fallback.
+ *
+ * Deletions (deleteInWorktree) follow the same rules and are bound to the content the caller read; see there.
  */
 
 export class PathError extends Error {
@@ -103,32 +107,22 @@ function errno(e: unknown): string | undefined {
 
 // ---------------------------------------------------------------- taint registry
 
-const TAINTED = new Map<string, string>();
+/**
+ * The taint registry is the process-wide worktree quarantine (sandbox/quarantine.ts): one source of truth
+ * shared with the REPL and the verify runner. A taint recorded here refuses them; a taint they record (a
+ * REPL or verify run that left work unresolved) refuses every file and verify tool and the broker's fence.
+ */
 
-function keysOf(path: string): string[] {
-  const keys = new Set<string>([resolve(path)]);
-  try {
-    keys.add(realpathSync(path));
-  } catch {
-    /* the worktree may be gone: the lexical key still matches */
-  }
-  return [...keys];
-}
-
-/** Quarantine a worktree: every later file and verify tool on it refuses (this process). */
+/** Quarantine a worktree: every later file tool, verify run and REPL exec on it refuses (this process). */
 export function markWorktreeTainted(worktree: string, reason: string): void {
   if (typeof worktree !== 'string' || !worktree) return;
-  for (const k of keysOf(worktree)) if (!TAINTED.has(k)) TAINTED.set(k, reason);
+  quarantineWorktree(worktree, { source: 'tools', reason, outstanding: [], processes: [] });
 }
 
-/** Why the worktree is quarantined, or null. */
+/** Why the worktree is quarantined (by the tools, the broker, a REPL or a verify run), or null. */
 export function worktreeTaint(worktree: string): string | null {
   if (typeof worktree !== 'string' || !worktree) return null;
-  for (const k of keysOf(worktree)) {
-    const r = TAINTED.get(k);
-    if (r !== undefined) return r;
-  }
-  return null;
+  return worktreeQuarantine(worktree)?.reason ?? null;
 }
 
 function assertNotTainted(worktree: string): void {
@@ -359,7 +353,10 @@ export interface WriteOptions {
   afterRead?: (r: Resolved) => Promise<void>;
   /** Test seam: runs after the temp file was created and verified, immediately before its data is written. */
   beforeData?: (r: Resolved) => Promise<void>;
-  /** Test seam: runs synchronously after the pre-commit verification, immediately before the commit. */
+  /**
+   * Test seam: runs synchronously after the pre-commit chain verification; the final cancellation, guard and
+   * target (identity, nlink) checks run after it, immediately before the first commit mutation.
+   */
   beforeCommit?: (r: Resolved) => void;
   /** Test seam: pretend /proc/self/fd is unavailable (unsupported platform). */
   assumeNoProcFd?: boolean;
@@ -552,32 +549,40 @@ const NO_LINK = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']);
  */
 function commitSync(root: string, r: Resolved, dirFd: number, tmpFd: number, tmpName: string, name: string, expectedDir: string, chain: FsIdentity[], o: WriteOptions, guard: WriteGuard): void {
   const at = (n: string): string => `/proc/self/fd/${dirFd}/${n}`;
+  /** The target is still the authorized single-link inode (or, for a new file, still absent). */
+  const targetCheck = (): void => {
+    if (r.exists) {
+      let st: BigIntStats;
+      try {
+        st = lstatSync(at(name), { bigint: true });
+      } catch {
+        throw new PathError(`${r.rel} moved or vanished before commit; refused`);
+      }
+      if (!st.isFile() || !sameId(r.identity!.target, st)) throw new PathError(`${r.rel} was replaced before commit; refused`);
+      if (st.nlink !== 1n) throw new PathError(`refusing to write a hardlinked file (nlink=${st.nlink}, a link was added during the write): ${r.rel}`);
+    } else {
+      try {
+        lstatSync(at(name));
+        throw new PathError(`${r.rel} appeared between authorization and commit; refused`);
+      } catch (e) {
+        if (e instanceof PathError) throw e;
+      }
+    }
+  };
   if (o.signal?.aborted) throw new PathError(`write cancelled before commit: ${r.rel}`);
   verifyChainSync(root, expectedDir, dirFd, chain, (m) => new PathError(`${m}; refused before commit: ${r.rel}`));
-  if (r.exists) {
-    let st: BigIntStats;
-    try {
-      st = lstatSync(at(name), { bigint: true });
-    } catch {
-      throw new PathError(`${r.rel} moved or vanished before commit; refused`);
-    }
-    if (!st.isFile() || !sameId(r.identity!.target, st)) throw new PathError(`${r.rel} was replaced before commit; refused`);
-    if (st.nlink !== 1n) throw new PathError(`refusing to write a hardlinked file (nlink=${st.nlink}, a link was added during the write): ${r.rel}`);
-  } else {
-    try {
-      lstatSync(at(name));
-      throw new PathError(`${r.rel} appeared between authorization and commit; refused`);
-    } catch (e) {
-      if (e instanceof PathError) throw e;
-    }
-  }
+  targetCheck();
   const tmpSt = fstatSync(tmpFd, { bigint: true });
   // Backup of the original inode (same directory), so a commit that turns out to have landed in a moved
   // directory can be undone. Filesystems without hard links move the original aside instead.
   const bakName = `.tecera-bak-${randomBytes(8).toString('hex')}`;
   let backup: 'link' | 'moved' | null = null;
-  guard.check();
   o.beforeCommit?.(r);
+  // The last cancellation, fence and target checks run after every seam and immediately before the first
+  // mutation: a fence lost, a cancellation or a link added up to this point changes nothing.
+  if (o.signal?.aborted) throw new PathError(`write cancelled before commit: ${r.rel}`);
+  guard.check();
+  targetCheck();
   if (r.exists) {
     try {
       linkSync(at(name), at(bakName));
@@ -673,6 +678,217 @@ function verifyChainSync(root: string, expectedDir: string, dirFd: number, chain
     }
     if (st.isSymbolicLink() || !sameId(chain[i], st)) throw fail(`${toRel(root, p) || '.'} was replaced`);
   }
+}
+
+// ---------------------------------------------------------------- deletion
+
+export interface DeleteOptions {
+  maxBytes: number;
+  /** Policy check on the resolved worktree-relative path; throw to refuse. Runs before anything is opened. */
+  authorize: (rel: string) => void;
+  /** The mutation-time fence, checked immediately before the entry is moved. Absent = refused. */
+  guard?: WriteGuard;
+  /**
+   * What the caller read: the sha256 of the file's UTF-8 content (the digest the read tool returns) or the
+   * exact content. The file is removed only while the authorized inode still holds exactly that.
+   */
+  expected: { digest?: string; content?: string };
+  /** Authorization of this exact deletion (path + the digest of what is removed), before anything moves. */
+  beforeDelete?: (w: WriteIntent) => Promise<void>;
+  /** Cancellation: checked synchronously immediately before the removal. */
+  signal?: AbortSignal;
+  /** Test seam: runs after the path was authorized and before the directory chain is opened. */
+  beforeOpen?: (r: Resolved) => Promise<void>;
+  /** Test seam: runs after the content was read through the verified descriptor and matched. */
+  afterRead?: (r: Resolved) => Promise<void>;
+  /** Test seam: runs synchronously after the pre-removal verification; the final checks run after it. */
+  beforeCommit?: (r: Resolved) => void;
+  /** Test seam: pretend /proc/self/fd is unavailable (unsupported platform). */
+  assumeNoProcFd?: boolean;
+}
+
+export interface DeleteResult {
+  rel: string;
+  bytes: number;
+  /** sha256 of the removed content (UTF-8), as the read tool reports it. */
+  contentDigest: string;
+}
+
+/** The digest a deletion is authorized under: never equal to the digest of a write of the same bytes. */
+export function deletionDigest(contentDigest: string): string {
+  return sha256(`tecera.delete\0${contentDigest}`);
+}
+
+/**
+ * Delete one regular file inside the worktree, under the same rules as a write: the worktree lock, no
+ * symlink anywhere in the path, never .git/ or .tecera/, the resolved path authorized, every directory of
+ * the chain opened by descriptor and identity-checked, the target the authorized single-link inode. Nothing
+ * is removed unless that inode's content is exactly what the caller expects. Directories are never deleted
+ * (a directory, a link or a special file is refused), and nothing is deleted recursively.
+ *
+ * The removal itself is synchronous and reversible: the entry is moved aside under a private name in the
+ * same verified directory, the chain and the moved inode are verified again, and only then is the name
+ * unlinked. If that verification fails (an outside process moved a directory inside the window), the entry
+ * is put back and the worktree is quarantined (TaintError).
+ */
+export async function deleteInWorktree(worktree: string, input: unknown, o: DeleteOptions): Promise<DeleteResult> {
+  const guard = requireWriteGuard(o.guard);
+  const root = await rootOf(worktree);
+  if (!PROC_FD || o.assumeNoProcFd) throw new PathError('deletions are refused on this platform: descriptor paths (/proc/self/fd) cannot be verified, and there is no path-based fallback');
+  if (typeof o.expected.digest !== 'string' && typeof o.expected.content !== 'string') throw new PathError('a deletion must name the content it expects (a digest or the exact content)');
+  assertNotTainted(root);
+  guard.check();
+  return withWorktreeLock(root, async () => {
+    assertNotTainted(root);
+    const r = await resolveInWorktree(worktree, input, { forWrite: true });
+    if (r.rel === '' || r.abs === root) throw new PathError('cannot delete the worktree root');
+    o.authorize(r.rel);
+    if (!r.exists) throw new PathError(`no such file: ${r.rel}`);
+    await o.beforeOpen?.(r);
+    return deleteViaFds(root, r, o, guard);
+  });
+}
+
+async function deleteViaFds(root: string, r: Resolved, o: DeleteOptions, guard: WriteGuard): Promise<DeleteResult> {
+  const ids = r.identity;
+  if (!ids || ids.dirs.length === 0 || !ids.target) throw new PathError('deletion was not authorized with identities; refused');
+  const segs = r.rel.split('/');
+  const name = segs.pop()!;
+  const expectedDir = segs.length ? join(root, ...segs) : root;
+  const expectedFile = join(expectedDir, name);
+  const chain: FsIdentity[] = [];
+  let dir: FileHandle = await open(root, C.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  try {
+    const rootSt = await dir.stat({ bigint: true });
+    if (!sameId(ids.dirs[0], rootSt)) throw new PathError('the worktree root was replaced between authorization and open; refused');
+    chain.push(idOf(rootSt));
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i]!;
+      let child: FileHandle;
+      try {
+        child = await open(fdPath(dir, seg), C.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      } catch (e) {
+        const code = errno(e);
+        if (code === 'ENOENT') throw new PathError(`a directory in ${r.rel} was moved or removed between authorization and open; refused`);
+        if (code === 'ELOOP' || code === 'ENOTDIR') throw new PathError(`refusing to delete through a symlink or non-directory: ${seg}`);
+        throw new PathError(`cannot open directory ${seg}`);
+      }
+      const st = await child.stat({ bigint: true });
+      await dir.close().catch(() => undefined);
+      dir = child;
+      if (!st.isDirectory()) throw new PathError(`not a directory: ${segs.slice(0, i + 1).join('/')}`);
+      if (!sameId(ids.dirs[i + 1], st)) throw new PathError(`directory ${segs.slice(0, i + 1).join('/')} was replaced between authorization and open (inode changed); refused`);
+      chain.push(idOf(st));
+    }
+    const dirReal = await fdReal(dir);
+    if (dirReal === null || dirReal !== expectedDir) throw new PathError(`a directory in ${r.rel} was moved or replaced during the deletion; refused`);
+
+    // The content of the authorized inode, through its verified descriptor: it must be what the caller expects.
+    let fh: FileHandle;
+    try {
+      fh = await open(fdPath(dir, name), C.O_RDONLY | O_NOFOLLOW);
+    } catch (e) {
+      if (errno(e) === 'ELOOP') throw new PathError(`refusing to delete through a symlink: ${r.rel}`);
+      if (errno(e) === 'ENOENT') throw new PathError(`no such file: ${r.rel} (it moved after authorization)`);
+      throw new PathError(`cannot open ${r.rel}`);
+    }
+    let bytes: number;
+    let contentDigest: string;
+    try {
+      const st = await fh.stat({ bigint: true });
+      if (!st.isFile()) throw new PathError(`not a regular file: ${r.rel}`);
+      if (!sameId(ids.target, st)) throw new PathError(`${r.rel} was replaced between authorization and open (inode changed); refused`);
+      if (st.nlink !== 1n) throw new PathError(`refusing to delete a hardlinked file (nlink=${st.nlink}): ${r.rel}`);
+      if ((await fdReal(fh)) !== expectedFile) throw new PathError(`path changed during the deletion: ${r.rel}`);
+      if (Number(st.size) > o.maxBytes) throw new PathError(`file too large to delete through this tool: ${r.rel}`);
+      const content = (await readAllBuf(fh, Number(st.size))).toString('utf8');
+      bytes = Number(st.size);
+      contentDigest = sha256(content);
+      if (typeof o.expected.content === 'string' && o.expected.content !== content) throw new PathError(`${r.rel} does not hold the expected content; nothing was deleted (read it again)`);
+      if (typeof o.expected.digest === 'string' && o.expected.digest !== contentDigest) throw new PathError(`${r.rel} does not hold the expected content (digest ${contentDigest.slice(0, 12)}…, expected ${o.expected.digest.slice(0, 12)}…); nothing was deleted (read it again)`);
+    } finally {
+      await fh.close().catch(() => undefined);
+    }
+    await o.afterRead?.(r);
+    await o.beforeDelete?.({ path: r.rel, contentDigest: deletionDigest(contentDigest) });
+    removeSync(root, r, dir.fd, name, expectedDir, chain, o, guard);
+    await dir.sync().catch(() => undefined);
+    return { rel: r.rel, bytes, contentDigest };
+  } finally {
+    await dir.close().catch(() => undefined);
+  }
+}
+
+/** The removal: synchronous from the last verification to the post-removal verification (see deleteInWorktree). */
+function removeSync(root: string, r: Resolved, dirFd: number, name: string, expectedDir: string, chain: FsIdentity[], o: DeleteOptions, guard: WriteGuard): void {
+  const at = (n: string): string => `/proc/self/fd/${dirFd}/${n}`;
+  const targetCheck = (): void => {
+    let st: BigIntStats;
+    try {
+      st = lstatSync(at(name), { bigint: true });
+    } catch {
+      throw new PathError(`${r.rel} moved or vanished before the deletion; refused`);
+    }
+    if (!st.isFile() || !sameId(r.identity!.target, st)) throw new PathError(`${r.rel} was replaced before the deletion; refused`);
+    if (st.nlink !== 1n) throw new PathError(`refusing to delete a hardlinked file (nlink=${st.nlink}, a link was added during the call): ${r.rel}`);
+  };
+  if (o.signal?.aborted) throw new PathError(`deletion cancelled: ${r.rel}`);
+  verifyChainSync(root, expectedDir, dirFd, chain, (m) => new PathError(`${m}; refused before deleting ${r.rel}`));
+  targetCheck();
+  o.beforeCommit?.(r);
+  // The last cancellation, fence and target checks run after every seam, immediately before the mutation.
+  if (o.signal?.aborted) throw new PathError(`deletion cancelled: ${r.rel}`);
+  guard.check();
+  targetCheck();
+  const asideName = `.tecera-del-${randomBytes(8).toString('hex')}`;
+  try {
+    renameSync(at(name), at(asideName));
+  } catch {
+    throw new PathError(`cannot delete ${r.rel}; refused`);
+  }
+  // Post-removal verification: the entry moved aside must be the authorized inode in the authorized directory.
+  let problem: string | null = null;
+  try {
+    const st = lstatSync(at(asideName), { bigint: true });
+    if (!st.isFile() || !sameId(r.identity!.target, st)) problem = 'the removed entry is not the authorized file';
+    else if (st.nlink !== 1n) problem = `the removed inode has ${st.nlink} links`;
+  } catch {
+    problem = 'the removed entry is missing';
+  }
+  if (problem === null) {
+    try {
+      verifyChainSync(root, expectedDir, dirFd, chain, (m) => new Error(m));
+    } catch (e) {
+      problem = (e as Error).message;
+    }
+  }
+  if (problem === null) {
+    if (!unlinkQuiet(dirFd, asideName)) {
+      // Put it back rather than leave a stray name behind.
+      let restored = false;
+      try {
+        renameSync(at(asideName), at(name));
+        restored = true;
+      } catch {
+        restored = false;
+      }
+      if (restored) throw new PathError(`cannot delete ${r.rel}; refused`);
+      const reason = `the deletion of ${r.rel} could not be finished and its entry could not be put back`;
+      markWorktreeTainted(root, reason);
+      throw new TaintError(`${reason}; the worktree is quarantined`);
+    }
+    return;
+  }
+  let rolledBack = false;
+  try {
+    renameSync(at(asideName), at(name));
+    rolledBack = true;
+  } catch {
+    rolledBack = false;
+  }
+  const reason = `post-deletion verification failed for ${r.rel}: ${problem}; ${rolledBack ? 'the file was put back' : 'the rollback FAILED'}`;
+  markWorktreeTainted(root, reason);
+  throw new TaintError(`${reason}; the worktree is quarantined`);
 }
 
 async function readAllBuf(fh: FileHandle, size: number): Promise<Buffer> {

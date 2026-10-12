@@ -1,6 +1,6 @@
 import { requireWriteGuard, type Redactor, type ToolContext, type ToolRequest, type ToolResult, type VerifyOutcome, type VerifyRunner, type WriteGuard } from '@tecera/contracts';
 import { assertLease, assertMethod, assertWorktree, combinedSignal, fail, ok, redactorOf, type AuthorizingTool } from './common.js';
-import { withWorktreeLock } from './paths.js';
+import { markWorktreeTainted, withWorktreeLock } from './paths.js';
 
 /**
  * runVerify: run the goal's check command through the injected VerifyRunner (a separate scrubbed
@@ -83,6 +83,9 @@ export function createRunVerifyTool(o: RunVerifyOptions): AuthorizingTool {
           g.check(); // immediately before the run (repository scripts can mutate the tree)
           return o.runner.run({ cwd: ctx.worktree, command: o.command, timeoutSec: o.timeoutSec, envAllowlist: o.envAllowlist ?? ['PATH', 'HOME', 'CI'] }, signal);
         });
+        // A runner that reports survivors (a live writer in the tree) quarantines the worktree for every tool.
+        const survivors = (r as { tainted?: { reason?: unknown } } | undefined)?.tainted;
+        if (survivors) markWorktreeTainted(ctx.worktree, `runVerify: ${typeof survivors.reason === 'string' && survivors.reason ? survivors.reason : 'the verify run left work unresolved'}`);
         let fenceLost: string | null = null;
         try {
           g.check();

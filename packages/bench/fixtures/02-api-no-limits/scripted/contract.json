@@ -1,0 +1,78 @@
+[
+  {
+    "when": "rate limit",
+    "criteria": [
+      {
+        "id": "too-many-requests",
+        "statement": "A client over its limit within the window gets 429 Too Many Requests",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { createApp } from \"./src/app.js\"; const h = createApp({ rateLimit: { limit: 2, windowMs: 1000 }, now: () => 0 }); h({ ip: \"a\", path: \"/items\" }); h({ ip: \"a\", path: \"/items\" }); assert.equal(h({ ip: \"a\", path: \"/items\" }).status, 429);'",
+          "timeoutSec": 60
+        }
+      },
+      {
+        "id": "retry-after",
+        "statement": "A 429 response carries a Retry-After header in whole seconds",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { createApp } from \"./src/app.js\"; const h = createApp({ rateLimit: { limit: 1, windowMs: 5000 }, now: () => 0 }); h({ ip: \"a\", path: \"/items\" }); const r = h({ ip: \"a\", path: \"/items\" }); assert.equal(r.status, 429); assert.ok(Number(r.headers[\"Retry-After\"]) >= 1);'",
+          "timeoutSec": 60
+        }
+      },
+      {
+        "id": "per-client",
+        "statement": "Limits are counted per client ip: one client over its limit does not affect another",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { createApp } from \"./src/app.js\"; const h = createApp({ rateLimit: { limit: 1, windowMs: 1000 }, now: () => 0 }); h({ ip: \"a\", path: \"/items\" }); assert.equal(h({ ip: \"a\", path: \"/items\" }).status, 429); assert.equal(h({ ip: \"b\", path: \"/items\" }).status, 200);'",
+          "timeoutSec": 60
+        }
+      },
+      {
+        "id": "window-reset",
+        "statement": "The count resets when the time window passes",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { createApp } from \"./src/app.js\"; let t = 0; const h = createApp({ rateLimit: { limit: 1, windowMs: 1000 }, now: () => t }); h({ ip: \"a\", path: \"/items\" }); assert.equal(h({ ip: \"a\", path: \"/items\" }).status, 429); t = 1000; assert.equal(h({ ip: \"a\", path: \"/items\" }).status, 200);'",
+          "timeoutSec": 60
+        }
+      },
+      {
+        "id": "configurable-limit",
+        "statement": "The limit and the window come from the rateLimit option",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { createApp } from \"./src/app.js\"; const h = createApp({ rateLimit: { limit: 3, windowMs: 1000 }, now: () => 0 }); for (let i = 0; i < 3; i++) assert.equal(h({ ip: \"a\", path: \"/items\" }).status, 200); assert.equal(h({ ip: \"a\", path: \"/items\" }).status, 429);'",
+          "timeoutSec": 60
+        }
+      },
+      {
+        "id": "remaining-header",
+        "statement": "Every response says how many requests remain (X-RateLimit-Remaining)",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { createApp } from \"./src/app.js\"; const h = createApp({ rateLimit: { limit: 3, windowMs: 1000 }, now: () => 0 }); assert.equal(h({ ip: \"a\", path: \"/items\" }).headers[\"X-RateLimit-Remaining\"], \"2\"); assert.equal(h({ ip: \"a\", path: \"/items\" }).headers[\"X-RateLimit-Remaining\"], \"1\");'",
+          "timeoutSec": 60
+        }
+      },
+      {
+        "id": "suite-passes",
+        "statement": "The existing test suite still passes",
+        "check": {
+          "kind": "command",
+          "command": "node --test",
+          "timeoutSec": 60
+        }
+      }
+    ],
+    "outOfScope": [
+      "distributed or persistent counters",
+      "changes to tests"
+    ],
+    "assumptions": [
+      "the client is identified by request.ip",
+      "a fixed window per client is acceptable"
+    ]
+  }
+]

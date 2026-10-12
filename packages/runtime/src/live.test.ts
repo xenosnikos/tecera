@@ -30,11 +30,20 @@ afterEach(() => {
   for (const d of temps.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
+/**
+ * The human decision commands refuse without a terminal (decisionGuard.ts). This suite makes them as the local
+ * human from a test process: the explicit opt-out, on those commands only, never on `tecera run`.
+ */
+const humanEnv = (argv: readonly string[]): Record<string, string> =>
+  argv[0] === 'approve' || argv[0] === 'deny' || (argv[0] === 'criteria' && (argv[1] === 'accept' || argv[1] === 'amend')) || (argv[0] === 'resources' && (argv[1] === 'release' || argv[1] === 'transfer')) || ((argv[0] === 'plans' || argv[0] === 'memory') && ['graduate', 'reject', 'retract'].includes(argv[1] ?? ''))
+    ? { TECERA_DECISION_NONINTERACTIVE: '1' }
+    : {};
+
 async function cli(cwd: string, argv: string[], opts: MainOptions = {}): Promise<{ code: number; out: string; err: string }> {
   let out = '';
   let err = '';
   const { env: extraEnv, ...rest } = opts;
-  const code = await main(argv, { cwd, env: { PATH: process.env.PATH, HOME: process.env.HOME, USER: 'tester', ...(extraEnv ?? {}) }, stdout: (s) => (out += s), stderr: (s) => (err += s), isTTY: false, ...rest });
+  const code = await main(argv, { cwd, env: { PATH: process.env.PATH, HOME: process.env.HOME, USER: 'tester', ...humanEnv(argv), ...(extraEnv ?? {}) }, stdout: (s) => (out += s), stderr: (s) => (err += s), isTTY: false, ...rest });
   return { code, out, err };
 }
 

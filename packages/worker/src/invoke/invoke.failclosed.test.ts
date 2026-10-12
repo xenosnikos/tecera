@@ -4,12 +4,17 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CapabilitySet, Effect, Hook, Inputs, Json, JsonObject, Ledger, SpanEvent, SpanKind, Tool } from '@tecera/contracts';
 import { Broker } from '../broker/broker.js';
+import { Dispatcher } from '../hooks/dispatcher.js';
 import { scope } from '../scope.js';
-import { createEditTool } from '../tools/edit.js';
+import { createEditTool as writeRiskEditTool, type EditToolOptions } from '../tools/edit.js';
+import { irreversibleDouble } from './fakes.js';
 import { createReadTool } from '../tools/read.js';
 import { FakeLedger, FakeLLM, FakeRepl, liveWriteGuard } from './fakes.js';
 import { invoke, resume, type InvokeOptions, type ResumeDeps } from './invoke.js';
 import type { TraceEntry } from './span.js';
+
+/** D6: a write-risk tool is never held for approval; the approval tests here hold an irreversible double of edit. */
+const createEditTool = (o?: EditToolOptions) => irreversibleDouble(writeRiskEditTool(o));
 
 const caps = (tools = ['read', 'edit']): CapabilitySet => ({
   tools,
@@ -178,6 +183,37 @@ describe('recover.crash_each_step: a failed record at any Exit is terminal', () 
       }
       if (target === 'LLMQuery') expect(repl.execs).toHaveLength(0);
     });
+  }
+
+  // A hook that crashes, hangs or says Abort at an Exit cannot undo the work, but the step must not report
+  // `returned` with its Exit records missing: the failure is in the outcome and in the trace.
+  const modes = {
+    throws: () => {
+      throw new Error('recorder crashed');
+    },
+    hangs: () => new Promise<Effect[]>(() => {}),
+    aborts: (): Effect[] => [{ type: 'Abort', code: 'policy', reason: 'exit refused' }],
+  };
+  for (const target of kinds) {
+    for (const [mode, fn] of Object.entries(modes)) {
+      it(`a hook that ${mode} at ${target}/Exit → aborted, traced, and nothing further runs`, async () => {
+        const bad = hook('bad', kinds, (e) => (e.stage === 'Exit' && e.span === target ? fn() : []));
+        const repl = new FakeRepl();
+        const trace: TraceEntry[] = [];
+        const llm = new FakeLLM([js(`const f = await readFile('src/a.ts');\nconsole.log(f.path);`), js(`await writeFile('src/b.ts', 'late');\nreturn { summary: 'second turn' };`)]);
+        const out = await invoke(goal, opts(llm, { hooks: [bad], dispatcher: new Dispatcher([bad], { hookTimeoutMs: 100 }), repl, trace }));
+        expect(out.kind).toBe('aborted');
+        const code = mode === 'aborts' ? 'policy' : 'hookError';
+        if (out.kind === 'aborted') expect(out.reasons).toEqual(expect.arrayContaining([expect.objectContaining({ code, hookId: 'bad' })]));
+        const exits = trace.filter((e) => e.type === 'span' && e.span === target && e.stage === 'Exit' && e.aborted?.some((r) => r.code === code && r.hookId === 'bad'));
+        expect(exits.length).toBeGreaterThan(0);
+        if (target !== 'Invoke') {
+          expect(llm.requests).toHaveLength(1); // no second turn after the failed Exit
+          expect(writes).toBe(0);
+        }
+        if (target === 'LLMQuery') expect(repl.execs).toHaveLength(0);
+      });
+    }
   }
 
   it('a budget settlement failure is terminal (LLM and exec)', async () => {

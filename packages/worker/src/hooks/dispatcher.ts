@@ -3,7 +3,10 @@ import { composeEffects, type Composed } from './compose.js';
 
 /**
  * Emits one frozen event to every active hook at once, collects effects, composes them, and applies
- * blackboard CAS writes. A hook that throws or exceeds its time budget becomes an Abort (fail closed).
+ * blackboard CAS writes. A hook that throws or exceeds its time budget becomes an Abort (fail closed) at
+ * every stage, Exit included: the span's Exit then reports the failure instead of losing the hook's records.
+ * That Abort names its exact cause: the hook, the span and stage, and whether it threw or ran out of time
+ * (and after how long), so a slow hook on a loaded host is not mistaken for a refusal.
  * Hooks never see each other's effects at the same stage; the next stage carries the committed result.
  */
 export class Dispatcher {
@@ -30,7 +33,7 @@ export class Dispatcher {
       this.hooks
         .filter((h) => h.spans.has(event.span))
         .map(async (h): Promise<[string, Effect[]]> => {
-          const effects = await withTimeout(Promise.resolve().then(() => h.handle(frozen, ambient)), timeout, h.id);
+          const effects = await withTimeout(Promise.resolve().then(() => h.handle(frozen, ambient)), timeout, h.id, `${event.span}/${event.stage}`);
           return [h.id, effects];
         }),
     );
@@ -60,15 +63,15 @@ class HookFailure extends Error {
   }
 }
 
-async function withTimeout<T>(p: Promise<T>, ms: number, hookId: string): Promise<T> {
+async function withTimeout<T>(p: Promise<T>, ms: number, hookId: string, where: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
       p.catch((e: Error) => {
-        throw new HookFailure(hookId, e.message);
+        throw new HookFailure(hookId, `hook ${hookId} threw at ${where}: ${e?.message ?? String(e)}`);
       }),
       new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new HookFailure(hookId, `hook ${hookId} timed out after ${ms}ms`)), ms);
+        timer = setTimeout(() => reject(new HookFailure(hookId, `hook ${hookId} timed out at ${where} after ${ms} ms (it had not answered; its effects, if any, are lost)`)), ms);
       }),
     ]);
   } finally {

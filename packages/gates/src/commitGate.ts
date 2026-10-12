@@ -1,23 +1,28 @@
-import { FenceLost, type Json, type Ledger, type Manifest, type Redactor, type SecretInput, type WriteGuard } from '@tecera/contracts';
-import { BoundaryViolation, DEFAULT_CONFIG_GLOBS, DEFAULT_TEST_GLOBS, enforceChanges, matchesAny, tamperFindings } from '@tecera/policy';
+import { describeUnexpected, FenceLost, type AcceptanceContract, type Json, type Ledger, type Manifest, type Redactor, type SecretInput } from '@tecera/contracts';
+import { BoundaryViolation, criterionScriptDirs, DEFAULT_CONFIG_GLOBS, DEFAULT_TEST_GLOBS, enforceChanges, matchesAny, packageScriptsOf, tamperFindings, type PackageScripts } from '@tecera/policy';
 import { addedLines, buildCandidateTree, fileManifest, lsTree, manifestMismatch, policyChanges, sameEntries, snapshotCandidate, type BuiltTree, type Candidate } from './candidate.js';
-import { claim, commandDigest, defaultIds, errMsg, GateMemo, ignoredBaseline, latestReview, latestVerify, obj, redactorFrom, safeText, writeEvidence, type ReviewMemo, type VerifyMemo } from './evidence.js';
-import { assertSafeRepo, DEFAULT_IDENTITY, hostGit, refSafe, UnsafeRepo, type GitIdentity } from './gitx.js';
+import { envelopeView } from './envelope.js';
+import { claim, commandDigest, commitEvidenceKey, defaultIds, errMsg, GateMemo, ignoredBaseline, keyPart, latestReview, latestVerify, obj, redactorFrom, safeText, usableGuard, writeEvidence, type ReviewMemo, type VerifyMemo } from './evidence.js';
+import { assertSafeRepo, DEFAULT_IDENTITY, hostGit, UnsafeRepo, type GitIdentity } from './gitx.js';
+import { workBranchOf } from './intentionBranch.js';
 import { EXIT, type CommitResult, type StepContext } from './types.js';
 import { gateWorktree, resolveCheck } from './verifyGate.js';
 
 /**
  * Commit gate (security.md §4 S7–S8, §5). Nothing is committed unless, in order:
  *  1. the GateContext names the gate's worktree and the repository cannot make git run programs (9);
- *  2. HEAD is the base commit, verify passed on D1 running the adopted goal's check (its command digest),
+ *  2. HEAD is the base commit, verify passed on D1 running the adopted goal's check (its command digest;
+ *     there is no option to commit without it),
  *     review approved D2, and the host snapshot now (D3) equals both: fingerprints AND per-file {status,
  *     mode, sha256, oid} records (else 9);
  *  3. every change is readable UTF-8 text (binary/unreadable 8), inside allowedChanges and the plan's
- *     write globs, outside protectedPaths, under maxChangedFiles, free of tamper findings, with tests
+ *     write globs, inside the accepted change-path envelope when one was stated (envelope.ts; 8
+ *     'outside-envelope: <paths>'), outside protectedPaths, under maxChangedFiles, free of tamper findings, with tests
  *     read-only unless the plan explicitly grants test writes and the goal is not fix-failing-test (8);
  *  4. the candidate tree is built from the exact host-read bytes (hash-object --no-filters, private index)
  *     and the worktree is re-snapshotted unchanged (9);
- *  5. no approval (owner decision D6): the commit lands on the WORK branch tecera/<goal>, never on the
+ *  5. no approval (owner decision D6): the commit lands on the intention's WORK branch (tecera/<goal> for a
+ *     goal's first intention, the prepared tecera/<goal>.<n> for a later one; intentionBranch.ts), never on the
  *     base, and the PR gate is the only approval point. A GateContext approval handed to gate.commit is
  *     ignored, never consumed. Exactly-once per (run, intention, step, attempt) comes from a claim on the
  *     intent record (one writer wins; a loser reconciles);
@@ -50,8 +55,6 @@ export interface CommitGateOptions {
   base?: string;
   /** Kept for callers; the commit gate takes no approval (D6). */
   sessionId?: string;
-  /** Require passing verify evidence on D1. Default true. */
-  requireVerify?: boolean;
   /** Only tightens: true forces tests read-only; the derived rule (testsReadOnlyFor) cannot be relaxed. */
   testsReadOnly?: boolean;
   protectedExceptions?: string[];
@@ -82,11 +85,6 @@ export interface CommitTestHooks {
   afterUpdateRef?: () => void | Promise<void>;
 }
 
-/** A usable guard, or null (a guard without check() or signal is no guard). */
-function usableGuard(g: WriteGuard | undefined): WriteGuard | null {
-  return g && typeof g.check === 'function' && g.signal ? g : null;
-}
-
 interface Finding {
   code: string;
   path: string;
@@ -105,6 +103,25 @@ export function testsReadOnlyFor(ctx: Pick<StepContext, 'goal' | 'plan'>, overri
     (g) => matchesAny(g, DEFAULT_TEST_GLOBS) !== null || /(^|\/)(tests?|__tests__|spec)(\/|$)|\.(test|spec)\./.test(g),
   );
   return !explicit;
+}
+
+/**
+ * The scripts of every package.json a criterion of `contract` runs a script of, read from the BASE tree
+ * (blob ids from the snapshot, never the worktree): policy criterionTargets follows their bodies to the files
+ * they run. Scripts that run scripts of another directory are followed for a few rounds. A blob that cannot
+ * be read throws (the tamper check fails closed).
+ */
+export async function basePackageScripts(dir: string, baseEntries: ReadonlyMap<string, { mode: string; oid: string }>, contract: AcceptanceContract, signal?: AbortSignal): Promise<PackageScripts> {
+  const out: Record<string, Record<string, string>> = {};
+  for (let round = 0; round < 4; round++) {
+    const missing = criterionScriptDirs(contract, out).filter((d) => !(d in out));
+    if (!missing.length) break;
+    for (const d of missing) {
+      const entry = baseEntries.get(d ? `${d}/package.json` : 'package.json');
+      out[d] = entry ? packageScriptsOf(await hostGit(dir, ['cat-file', 'blob', entry.oid], { signal })) : {};
+    }
+  }
+  return out;
 }
 
 interface Intent {
@@ -131,13 +148,13 @@ export class CommitGate {
   }
 
   private keys(ctx: StepContext): { intent: string; final: string } {
-    const id = `${ctx.intention.id}:${ctx.step.id}:${ctx.intention.attempt}`;
-    return { intent: `commit-intent:${ctx.runId}:${id}`, final: `commit:${ctx.runId}:${id}` };
+    const id = keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${ctx.intention.attempt}`);
+    return { intent: `commit-intent:${id}`, final: commitEvidenceKey(this.redactor, ctx.runId, ctx.intention.id, ctx.step.id, ctx.intention.attempt) };
   }
 
   private failer(ctx: StepContext, record: Record<string, Json>) {
     return async (exitCode: number, reason: string, detail: Json = null): Promise<CommitResult> => {
-      const evidenceKey = `commit-refused:${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${this.ids()}`;
+      const evidenceKey = `commit-refused:${keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}`)}:${this.ids()}`;
       await writeEvidence(this.o.ledger, this.redactor, {
         key: evidenceKey,
         kind: 'gate.commit',
@@ -165,17 +182,26 @@ export class CommitGate {
     const rec = await this.reconcile(ctx);
     if (rec) return rec;
 
+    // ---- the intention's branch: its preparation record's, else the goal's first branch ----
+    const wb = await workBranchOf(this.o.ledger, this.redactor, this.o.manifest.repo.branchPrefix, ctx);
+    if (!wb.ok) return fail(EXIT.human, wb.reason, wb.detail);
+    const branch = wb.branch;
+    record.branch = branch;
+    const scope = wb.prepared ? { branch } : {};
+
     // ---- D3 and the recorded digests ----
     const baseline = await ignoredBaseline(this.o.ledger, this.memo, ctx.runId);
     let snap: Candidate;
     try {
-      snap = await snapshotCandidate(dir, this.base, { ignoredBaseline: baseline, signal: ctx.signal });
+      snap = await snapshotCandidate(dir, this.base, { ignoredBaseline: baseline, signal: ctx.signal, ...scope });
     } catch (err) {
       return fail(EXIT.human, err instanceof UnsafeRepo ? 'unsafe-repo' : 'snapshot-failed', errMsg(err));
     }
     const d3 = snap.fingerprint;
     record.d3 = d3;
     if (snap.head !== snap.baseCommit) return fail(EXIT.human, 'head-not-base', { head: snap.head, base: snap.baseCommit });
+    // A prepared branch was created at the run's pinned base: a base that moved since is not the one it was cut from.
+    if (wb.prepared && wb.prepared.baseSha !== snap.baseCommit) return fail(EXIT.human, 'prepared-base-moved', { prepared: wb.prepared.baseSha, base: snap.baseCommit });
 
     const bound = await this.boundDigests(ctx, snap);
     if (typeof bound === 'object' && 'exitCode' in bound) return fail(bound.exitCode, bound.reason, bound.detail);
@@ -187,6 +213,10 @@ export class CommitGate {
     if (committable.length === 0) return fail(EXIT.human, 'empty-change');
     const unreadable = snap.files.filter((f) => f.unreadable).map((f) => ({ path: f.path, detail: f.unreadable! }));
     if (unreadable.length) return fail(EXIT.policy, 'unreadable', unreadable);
+    // A second name of another inode is refused as such, before any boundary check: an unchanged tracked file
+    // that is now a hard link is listed only for its link, and must not read as an edit of its path.
+    const links: Finding[] = committable.filter((f) => f.nlink !== undefined && f.nlink > 1).map((f) => ({ code: 'hardlink', path: f.path, detail: `st_nlink=${f.nlink}` }));
+    if (links.length) return fail(EXIT.policy, 'tamper', links as unknown as Json);
     const binary = snap.files.filter((f) => f.status !== 'D' && f.binary).map((f) => f.path);
     if (binary.length) return fail(EXIT.policy, 'binary', binary);
     const limit = Math.min(this.o.manifest.budgets.maxChangedFiles, ctx.plan.budget?.maxChangedFiles ?? Infinity, ctx.goal.budget?.maxChangedFiles ?? Infinity);
@@ -209,12 +239,21 @@ export class CommitGate {
     const planWrite = ctx.plan.permissions?.write ?? [];
     const outsidePlan = committable.filter((f) => matchesAny(f.path, planWrite) === null).map((f) => f.path);
     if (outsidePlan.length) return fail(EXIT.policy, 'outside-plan-write', outsidePlan);
+    // The accepted change-path envelope, inside allowedChanges: a path nobody signed off is never committed,
+    // whatever the review said about it. The reason names the paths.
+    const envelope = envelopeView(ctx, snap);
+    record.envelope = { source: envelope.source, paths: envelope.entries.length };
+    if (envelope.unexpected.length) return fail(EXIT.policy, `outside-envelope: ${describeUnexpected(envelope.unexpected)}`, envelope.unexpected.map((c) => ({ path: c.path, op: c.op })));
     const testsReadOnly = testsReadOnlyFor(ctx, this.o.testsReadOnly);
     record.testsReadOnly = testsReadOnly;
     let findings: Finding[];
     try {
       findings = [
-        ...tamperFindings(changes, await addedLines(dir, snap, ctx.signal), { testGlobs: DEFAULT_TEST_GLOBS, configGlobs: DEFAULT_CONFIG_GLOBS, testsReadOnly, maxFileBytes: this.o.maxFileBytes }),
+        // Under an acceptance contract the goal file and whatever a criterion's check runs are the requestor's
+        // (D8): a candidate that changes them is tampering, inside allowedChanges or not.
+        // The package scripts are read from the base tree: what a criterion's `npm run x` runs is the
+        // requestor's script, never one the candidate rewrote.
+        ...tamperFindings(changes, await addedLines(dir, snap, ctx.signal), { testGlobs: DEFAULT_TEST_GLOBS, configGlobs: DEFAULT_CONFIG_GLOBS, testsReadOnly, maxFileBytes: this.o.maxFileBytes, ...(ctx.contract ? { contract: ctx.contract, packageScripts: await basePackageScripts(dir, snap.baseEntries, ctx.contract, ctx.signal) } : {}) }),
         ...(await this.localFindings(dir, snap)),
       ];
     } catch (err) {
@@ -232,14 +271,12 @@ export class CommitGate {
     }
     record.expectedTree = built.tree;
     await this.o.testHooks?.afterStage?.();
-    const recheck = await snapshotCandidate(dir, this.base, { ignoredBaseline: baseline }).then(
+    const recheck = await snapshotCandidate(dir, this.base, { ignoredBaseline: baseline, ...scope }).then(
       (s) => s.fingerprint,
       () => 'unreadable',
     );
     if (recheck !== d3) return fail(EXIT.human, 'digest-drift-before-commit', { d3, now: recheck });
 
-    const branch = `${this.o.manifest.repo.branchPrefix}${refSafe(ctx.goal.id)}`;
-    record.branch = branch;
     try {
       await hostGit(dir, ['check-ref-format', '--branch', branch]);
     } catch {
@@ -437,8 +474,7 @@ export class CommitGate {
       if (!chk.ok) return h('goal-check-invalid', chk.reason);
       if (verify.commandDigest !== commandDigest(chk.check.command)) return h('verify-check-mismatch', { expected: chk.check.source, note: 'the passing verify did not run the goal check' });
       d1 = verify.fingerprint;
-    } else if (this.o.requireVerify === false) d1 = review.d1;
-    else return h('no-verify-evidence');
+    } else return h('no-verify-evidence');
     if (ctx.candidate?.d1 !== undefined && ctx.candidate.d1 !== d1) return h('verify-digest-mismatch', { ctx: ctx.candidate.d1, evidence: d1 });
     if (!d1) return p('null-d1', 'refusing to commit a candidate with no verified fingerprint');
     if (d1 !== d2 || d1 !== d3) return h('digest-drift', { d1, d2, d3 });

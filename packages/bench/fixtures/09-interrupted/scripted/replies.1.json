@@ -1,0 +1,21 @@
+{
+  "worker": [
+    {
+      "expect": "Read the failing test and the implementation under test",
+      "text": "```js\nconst f0 = await readFile('test/greet.test.js');\nconst f1 = await readFile('test/farewell.test.js');\nconst f2 = await readFile('src/greet.js');\nconsole.log('test/greet.test.js', f0.bytes, 'test/farewell.test.js', f1.bytes, 'src/greet.js', f2.bytes);\nreturn { facts: [{ key: 'rootCause', value: 'greet and farewell return the old short forms' }, { key: 'targetFiles', value: ['src/greet.js'] }] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 200
+      }
+    },
+    {
+      "expect": "Fix the root cause",
+      "text": "```js\n// a long edit: the runner stops the process while this step runs\nconst t0 = Date.now();\nwhile (Date.now() - t0 < 30000) {}\nreturn { facts: [{ key: 'changedFiles', value: [] }] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 200
+      }
+    }
+  ],
+  "reviewer": []
+}

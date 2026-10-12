@@ -86,7 +86,7 @@ export function goodDoc(): PlanDocumentInput {
       { id: 'pr', kind: 'gate.pr', dependsOn: ['commit'] },
     ],
     allowedModels: { analyze: ['worker'], edit: ['worker'] },
-    permissions: { tools: ['read', 'listFiles', 'edit', 'runVerify'], write: ['src/**'], approvals: ['open_pr'] },
+    permissions: { tools: ['read', 'listFiles', 'edit', 'runVerify'], write: ['src/**'], approvals: ['open_pr', 'git_push'] },
     budget: { usd: 1, tokens: 100000, wallClockSec: 900 },
     goalKinds: ['fix-failing-test'],
     rationale: 'read, edit, gates',

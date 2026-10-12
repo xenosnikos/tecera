@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { chmod, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -131,7 +132,9 @@ describe('escape', () => {
       expect(found).toBe(true);
       expect(environ).not.toContain(value);
       expect(environ).not.toContain('NODE_OPTIONS');
-      expect(environ.split('\0').filter(Boolean).map((kv) => kv.split('=')[0]).sort()).toEqual(['HOME', 'LANG', 'PATH', 'TMPDIR']);
+      // TECERA_SANDBOX is the supervisor's own marker (env.ts), set for every process the sandbox starts.
+      expect(environ.split('\0').filter(Boolean).map((kv) => kv.split('=')[0]).sort()).toEqual(['HOME', 'LANG', 'PATH', 'TECERA_SANDBOX', 'TMPDIR']);
+      expect(environ.split('\0')).toContain('TECERA_SANDBOX=repl');
       // The dropped name is reported, but it is itself canary-shaped, so the trace carries it redacted.
       expect(r.trace.envDropped).toHaveLength(1);
       expect(JSON.stringify(r)).not.toContain(value);
@@ -237,6 +240,22 @@ describe('happy path', () => {
     expect(r).toMatchObject({ kind: 'return', value: { a: 1, b: [true, null, 'x'] }, printed: '' });
     expect(r.trace.exit).toEqual({ code: 0, signal: null });
     expect(r.trace.killed).toBeUndefined();
+  });
+
+  it("the trace records the child's exit even when its stdio closes after the result is reported", async () => {
+    // 'exit' comes before 'close' (the pipes drain afterwards); hold 'close' back so the order is certain.
+    const lateClose = ((...a: Parameters<typeof spawn>) => {
+      const c = spawn(...a);
+      const emit = c.emit.bind(c);
+      c.emit = ((ev: string, ...rest: unknown[]) => (ev === 'close' ? (setTimeout(() => emit(ev, ...rest), 400), true) : emit(ev, ...rest))) as typeof c.emit;
+      return c;
+    }) as typeof spawn;
+    for (let i = 0; i < 3; i++) {
+      const r = await run('return 1', { repl: repl({ testSpawn: lateClose }) });
+      expect(r).toMatchObject({ kind: 'return', value: 1 });
+      expect(r.trace.exit).toEqual({ code: 0, signal: null });
+      expect(r.trace.killed).toBeUndefined();
+    }
   });
 
   it('continue with printed output when the program falls off the end', async () => {

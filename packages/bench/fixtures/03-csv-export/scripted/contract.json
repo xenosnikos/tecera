@@ -1,0 +1,49 @@
+[
+  {
+    "when": "csv",
+    "criteria": [
+      {
+        "id": "csv-header",
+        "statement": "report --format csv starts with the header line region,total",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { spawnSync } from \"node:child_process\"; const r = spawnSync(process.execPath, [\"bin/report.js\", \"--format\", \"csv\"], { encoding: \"utf8\" }); assert.equal(r.status, 0, r.stderr); const lines = r.stdout.trimEnd().split(\"\\n\"); assert.equal(lines[0], \"region,total\");'",
+          "timeoutSec": 60
+        }
+      },
+      {
+        "id": "csv-rows",
+        "statement": "One CSV row per region, totals with two decimals",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { spawnSync } from \"node:child_process\"; const r = spawnSync(process.execPath, [\"bin/report.js\", \"--format\", \"csv\"], { encoding: \"utf8\" }); assert.equal(r.status, 0, r.stderr); const lines = r.stdout.trimEnd().split(\"\\n\"); assert.equal(lines.length, 5); assert.equal(lines[1], \"North,120.50\"); assert.equal(lines[4], \"South,75.25\");'",
+          "timeoutSec": 60
+        }
+      },
+      {
+        "id": "csv-escaping",
+        "statement": "Fields with commas or quotes are quoted, quotes doubled",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { spawnSync } from \"node:child_process\"; const r = spawnSync(process.execPath, [\"bin/report.js\", \"--format\", \"csv\"], { encoding: \"utf8\" }); assert.equal(r.status, 0, r.stderr); const lines = r.stdout.trimEnd().split(\"\\n\"); assert.equal(lines[2], \"\\\"North, East\\\",10.00\"); assert.equal(lines[3], \"\\\"Rivers \\\"\\\"Delta\\\"\\\"\\\",5.00\");'",
+          "timeoutSec": 60
+        }
+      },
+      {
+        "id": "text-unchanged",
+        "statement": "The default text report is unchanged",
+        "check": {
+          "kind": "command",
+          "command": "node --test",
+          "timeoutSec": 60
+        }
+      }
+    ],
+    "outOfScope": [
+      "other output formats"
+    ],
+    "assumptions": [
+      "--format csv selects the CSV output"
+    ]
+  }
+]

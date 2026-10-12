@@ -1,0 +1,155 @@
+{
+  "id": "p_bench08",
+  "trigger": {
+    "kind": "goal.adopted"
+  },
+  "context": [],
+  "steps": [
+    {
+      "id": "analyze",
+      "kind": "worker",
+      "dependsOn": [],
+      "inputs": {},
+      "tools": [
+        "read",
+        "listFiles"
+      ],
+      "instruction": "Read both port tests and src/config.json; the verify gate runs every criterion later. Do not edit anything. Return {\"facts\":[{\"key\":\"rootCause\",\"value\":\"<one sentence>\"},{\"key\":\"targetFiles\",\"value\":[\"src/...\"]}]}.",
+      "output": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "value"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "value": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "edit",
+      "kind": "worker",
+      "dependsOn": [
+        "analyze"
+      ],
+      "inputs": {},
+      "tools": [
+        "read",
+        "listFiles",
+        "edit",
+        "runVerify"
+      ],
+      "instruction": "Set the port in src/config.json so the criteria hold, with the smallest diff under src/**. Never edit tests. Run verify before returning. Return {\"facts\":[{\"key\":\"changedFiles\",\"value\":[\"src/...\"]}]}.",
+      "output": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "value"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "verify",
+      "kind": "gate.verify",
+      "dependsOn": [
+        "edit"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "review",
+      "kind": "gate.review",
+      "dependsOn": [
+        "verify"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "verify2",
+      "kind": "gate.verify",
+      "dependsOn": [
+        "review"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "commit",
+      "kind": "gate.commit",
+      "dependsOn": [
+        "verify2"
+      ],
+      "inputs": {}
+    },
+    {
+      "id": "pr",
+      "kind": "gate.pr",
+      "dependsOn": [
+        "commit"
+      ],
+      "inputs": {}
+    }
+  ],
+  "allowedModels": {
+    "analyze": [
+      "worker"
+    ],
+    "edit": [
+      "worker"
+    ]
+  },
+  "permissions": {
+    "tools": [
+      "read",
+      "listFiles",
+      "edit",
+      "runVerify"
+    ],
+    "write": [
+      "src/**"
+    ],
+    "approvals": [
+      "open_pr",
+      "git_push"
+    ]
+  },
+  "budget": {
+    "usd": 1.5,
+    "tokens": 150000,
+    "wallClockSec": 1200,
+    "maxDepth": 2,
+    "maxIterations": 20,
+    "maxAttempts": 2,
+    "maxChangedFiles": 3
+  },
+  "goalKinds": [
+    "set-port"
+  ],
+  "origin": "generated",
+  "status": "candidate",
+  "rationale": "Read both tests, set the one port in src/config.json, then verify every criterion of the contract (platform-port and proxy-port), review, verify again, commit and open the PR. The plan covers the whole contract: whether both criteria can hold is for the verify gate to find out."
+}

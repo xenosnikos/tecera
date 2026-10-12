@@ -24,6 +24,7 @@ import {
   type Repl,
   type Reservation,
   type TeceraEvent,
+  type Tool,
   type ToolBridge,
   type WriteAuthorization,
   type WriteIntent,
@@ -323,3 +324,13 @@ export class FakeWriteGuard {
 
 /** A guard that is always live and allows every write. */
 export const liveWriteGuard = (): FencedWriteGuard => new FakeWriteGuard().guard;
+
+/**
+ * `t` re-declared with risk 'irreversible', for tests of the approval machinery (grants, checkpoints,
+ * resume). D6: a write-risk tool is never held for approval (the broker refuses any Suspend on it), so
+ * those tests hold an irreversible action instead; reusing a real tool's implementation keeps its effect
+ * observable.
+ */
+export function irreversibleDouble<T extends Tool>(t: T): T {
+  return { ...t, risk: 'irreversible' };
+}

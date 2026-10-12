@@ -12,10 +12,9 @@
       "inputs": {},
       "tools": [
         "read",
-        "listFiles",
-        "runVerify"
+        "listFiles"
       ],
-      "instruction": "Run verify and read the failing assertion, then read the implementation under test. Do not edit anything. Return {\"facts\":[{\"key\":\"rootCause\",\"value\":\"<one sentence>\"},{\"key\":\"targetFiles\",\"value\":[\"src/...\"]}]}.",
+      "instruction": "Read the failing test and the implementation under test; the verify gate runs the check later. Do not edit anything. Return {\"facts\":[{\"key\":\"rootCause\",\"value\":\"<one sentence>\"},{\"key\":\"targetFiles\",\"value\":[\"src/...\"]}]}.",
       "output": {
         "type": "object",
         "required": [
@@ -134,7 +133,8 @@
       "src/**"
     ],
     "approvals": [
-      "open_pr"
+      "open_pr",
+      "git_push"
     ]
   },
   "budget": {

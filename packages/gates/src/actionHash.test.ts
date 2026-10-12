@@ -1,12 +1,18 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { canonicalJson, commitActionHash as contractsCommitActionHash, sha256 } from '@tecera/contracts';
-import { actionHash, commitActionHash } from './actionHash.js';
+import { canonicalJson, commitActionHash, prActionHash as contractsPrActionHash, sha256 } from '@tecera/contracts';
+import { actionHash, prActionHash } from './actionHash.js';
+import * as gates from './index.js';
 import { isTerminalExit, refSafe } from './index.js';
 
 describe('commitActionHash (the loop binding)', () => {
-  it('is the contracts function, and matches the documented formula on a fixed vector', () => {
-    expect(commitActionHash).toBe(contractsCommitActionHash);
+  it('the gates export the contracts prActionHash and no commit-approval hash (commits take no approval)', () => {
+    expect(prActionHash).toBe(contractsPrActionHash);
+    expect('commitActionHash' in gates).toBe(false);
+    expect(prActionHash({ intentionId: 'i1', stepId: 'pr', attempt: 0, sha: 'abc' })).toBe(commitActionHash({ intentionId: 'i1', stepId: 'pr', attempt: 0, candidateD1: 'abc' }));
+  });
+
+  it('matches the documented formula on a fixed vector', () => {
     // Formula from the kernel report, computed independently of canonicalJson: sorted keys, no spaces.
     const literal = '{"attempt":0,"candidateD1":"abc","intentionId":"i1","stepId":"c"}';
     const vector = createHash('sha256').update(literal, 'utf8').digest('hex');

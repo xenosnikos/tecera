@@ -1,8 +1,8 @@
 {
   "worker": [
     {
-      "expect": "Run verify and read the failing assertion",
-      "text": "```js\nconst v = await runVerify();\nconst t = await readFile('test/slugify.test.js');\nconst s = await readFile('src/slugify.js');\nconsole.log('verify exit', v.exitCode, 'test bytes', t.bytes, 'src bytes', s.bytes);\nreturn { facts: [\n  { key: 'rootCause', value: 'slugify replaces each run of separators with one dash per character instead of collapsing the run' },\n  { key: 'targetFiles', value: ['src/slugify.js'] },\n  { key: 'baselineVerifyExit', value: v.exitCode },\n] };\n```",
+      "expect": "Read the failing test and the implementation under test",
+      "text": "```js\nconst t = await readFile('test/slugify.test.js');\nconst s = await readFile('src/slugify.js');\nconsole.log('test bytes', t.bytes, 'src bytes', s.bytes);\nreturn { facts: [\n  { key: 'rootCause', value: 'slugify replaces each run of separators with one dash per character instead of collapsing the run' },\n  { key: 'targetFiles', value: ['src/slugify.js'] },\n] };\n```",
       "usage": {
         "input": 2400,
         "output": 180

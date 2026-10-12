@@ -4,12 +4,16 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { newIntention, sha256, writeActionHash, type CapabilitySet, type JsonObject as JO, type ToolResult, type Effect, type Hook, type Inputs, type JsonObject, type Plan, type SpanEvent, type Tool, type WorkerStepRequest } from '@tecera/contracts';
 import { Broker } from '../broker/broker.js';
-import { createEditTool } from '../tools/edit.js';
+import { createEditTool as writeRiskEditTool, type EditToolOptions } from '../tools/edit.js';
+import { irreversibleDouble } from './fakes.js';
 import { createReadTool } from '../tools/read.js';
 import { FakeLedger, FakeLLM, FakeRepl, FakeWriteGuard, liveWriteGuard } from './fakes.js';
 import type { TraceEntry } from './span.js';
 import { invoke, isTainted, resume, type InvokeOptions, type ResumeDeps } from './invoke.js';
 import { StepWorker } from './stepWorker.js';
+
+/** D6: a write-risk tool is never held for approval; the approval tests here hold an irreversible double of edit. */
+const createEditTool = (o?: EditToolOptions) => irreversibleDouble(writeRiskEditTool(o));
 
 /**
  * Wave 4, lane I4: completed-child replay re-authorizes READS (Codex sprint-3 invoke New finding 4),

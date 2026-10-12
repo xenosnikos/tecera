@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import type { LLMRequest, LLMResponse } from '@tecera/contracts';
 import { AnthropicLLM } from './anthropic.js';
 import { REDACTION_FAILED, SECRET_OUTPUT_REFUSED } from './base.js';
+import { unescapeAll } from './decode.js';
 import { createProvider, foreignCheck, ForeignCheckError } from './factory.js';
 import { OpenAILLM } from './openai.js';
 import { makeRedactor, type Redactor } from './redact.js';
@@ -103,6 +104,40 @@ describe('finding 1: every outgoing response field and warning is sanitized; sec
       expect(r.error).toBe(SECRET_OUTPUT_REFUSED);
       expectClean(r, CANARY, oKey);
     }
+  });
+
+  it('a secret with only some characters percent-encoded (one, every other, short runs) is found in output, message text and schema', async () => {
+    const pct = (ch: string): string => [...Buffer.from(ch)].map((b) => `%${b.toString(16).padStart(2, '0')}`).join('');
+    const partial = (secret: string): Record<string, string> => ({
+      one: pct(secret[0]!) + secret.slice(1),
+      oneUpper: secret.slice(0, 3) + pct(secret[3]!).toUpperCase() + secret.slice(4),
+      everyOther: [...secret].map((c, i) => (i % 2 ? pct(c) : c)).join(''),
+      runsOfFive: [...secret].map((c, i) => (i % 7 < 5 ? pct(c) : c)).join(''),
+      punctuation: secret.replace(/[_-]/g, (c) => pct(c).toUpperCase()),
+      twice: pct('%') + pct(secret[0]!).slice(1) + secret.slice(1),
+    });
+    for (const [secret, kind] of [[CANARY, 'canary'], [oKey, 'key']] as const) {
+      for (const [name, form] of Object.entries(partial(secret))) {
+        expect(form.includes(secret), name).toBe(false);
+        expect(unescapeAll(unescapeAll(form)), name).toBe(secret);
+        // output: refused, nothing of it returned
+        const out = new FixtureFetch([{ status: 200, body: { type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [{ type: 'text', text: `note ${form}` }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } } }]);
+        const r = await anthropic(out).complete(req());
+        expectEnvelope(r);
+        expect(r.error, `${kind} ${name}`).toBe(SECRET_OUTPUT_REFUSED);
+        expect(JSON.stringify(r).includes(form), `${kind} ${name}`).toBe(false);
+        // message text and schema: never sent as written
+        for (const over of [{ messages: [{ role: 'user' as const, content: `see ${form}` }] }, { schema: { ...SCHEMA, description: `use ${form}` } }]) {
+          const ff = new FixtureFetch(['anthropic/ok']);
+          await anthropic(ff).complete(req(over));
+          for (const call of ff.calls) expect(JSON.stringify(call).includes(form), `${kind} ${name} ${Object.keys(over)[0]}`).toBe(false);
+        }
+      }
+    }
+    // ordinary percent text is still just text
+    const ok = new FixtureFetch([{ status: 200, body: { type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [{ type: 'text', text: 'coverage is 50%25 at /a%20b?q=%E2%9C%93 and 100%' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } } }]);
+    expect((await anthropic(ok).complete(req())).finishReason).toBe('stop');
+    expect(unescapeAll('%E2%9C%93 %FF%41 %E2%9C')).toBe('✓ %FFA %E2%9C');
   });
 
   it('a secret with JSON metacharacters echoed escaped is caught on the decoded value (content and raw)', async () => {

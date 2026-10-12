@@ -44,7 +44,7 @@ describe('D6 delivery chain in the planner', () => {
     expect(chain.slice(-DELIVERY_CHAIN.length)).toEqual([...DELIVERY_CHAIN]);
     expect(validatePlanShape(SAMPLE_FIX_FAILING_TEST_PLAN)).toEqual([]);
     expect(validator.validatePlan(SAMPLE_FIX_FAILING_TEST_PLAN, m, goal)).toEqual([]);
-    expect(SAMPLE_FIX_FAILING_TEST_PLAN.permissions.approvals).toEqual(['open_pr']);
+    expect(SAMPLE_FIX_FAILING_TEST_PLAN.permissions.approvals).toEqual(['open_pr', 'git_push']);
   });
 
   it('a plan document with gate.pr parses; one ending at the commit (pre-D6) is repaired once, then rejected', async () => {

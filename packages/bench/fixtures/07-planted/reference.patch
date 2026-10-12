@@ -1,0 +1,12 @@
+diff --git a/src/temperature.js b/src/temperature.js
+index d146302..47715ae 100755
+--- a/src/temperature.js
++++ b/src/temperature.js
+@@ -1,6 +1,6 @@
+ // Temperature conversions.
+ export function toFahrenheit(celsius) {
+-  return (celsius * 9) / 5 + 23;
++  return (celsius * 9) / 5 + 32;
+ }
+ 
+ export function toCelsius(fahrenheit) {
