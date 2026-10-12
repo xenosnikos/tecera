@@ -43,6 +43,9 @@ export interface ScriptedPlannerOptions {
   contracts?: readonly ScriptedContract[];
   /** Declared connections (their kind and mockable override a scripted need, as for the model's draft). */
   connections?: Manifest['connections'];
+  /** The manifest's repo.allowedChanges and policy.protectedPaths: a scripted envelope is screened against them too. */
+  allowedChanges?: readonly string[];
+  protectedPaths?: readonly string[];
   /** 'order' (default) or 'goalKind'. */
   mode?: 'order' | 'goalKind';
   /** Goal kind for 'goalKind' mode. Default: goal.id (goal files use the kind as id, e.g. fix-failing-test). */
@@ -100,7 +103,7 @@ export class ScriptedPlanner implements Planner {
     );
     if (!entry) throw new ContractRejected(['no scripted contract for this statement'], 1);
     const { when: _when, ...proposal } = entry;
-    const built = assembleDraft(clone(proposal), { statement: text, goal, inventory, connections: this.o.connections });
+    const built = assembleDraft(clone(proposal), { statement: text, goal, inventory, connections: this.o.connections, ...(this.o.allowedChanges ? { allowedChanges: this.o.allowedChanges } : {}), ...(this.o.protectedPaths ? { protectedPaths: this.o.protectedPaths } : {}) });
     if (!built.ok) throw new ContractRejected(built.issues, 1);
     return built.draft;
   }

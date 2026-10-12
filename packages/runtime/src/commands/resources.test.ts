@@ -10,6 +10,7 @@ import { LocalProvisioner, RESOURCES_ENV, stopStub, TEARDOWN_REFUSED } from '../
 import { parseArgs } from '../cli/args.js';
 import { makeContext } from '../cli/context.js';
 import { Out } from '../cli/io.js';
+import { DECISION_NONINTERACTIVE_ENV } from '../decisionGuard.js';
 import { resourcesCommand, type ResourcesCommandOptions } from './resources.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -34,7 +35,8 @@ function project() {
   const dir = tmp('tecera-resources-cmd-');
   cpSync(SAMPLE, dir, { recursive: true, filter: (src) => !/node_modules|ledger\.sqlite|[\\/]runs([\\/]|$)/.test(src) });
   const root = join(tmp('tecera-resources-root-'), 'resources');
-  return { dir, root, env: { PATH: process.env.PATH, HOME: process.env.HOME, USER: 'tester', [RESOURCES_ENV]: root } as Record<string, string | undefined> };
+  // The suite runs without a terminal: release and transfer need the explicit non-interactive opt-out (decisionGuard.ts).
+  return { dir, root, env: { PATH: process.env.PATH, HOME: process.env.HOME, USER: 'tester', [RESOURCES_ENV]: root, [DECISION_NONINTERACTIVE_ENV]: '1' } as Record<string, string | undefined> };
 }
 
 let n = 0;

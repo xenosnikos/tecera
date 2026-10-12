@@ -422,7 +422,9 @@ describe('verify environment: SAFE_ENV only, unsafe requests refused', () => {
     const o = await new HostVerifyRunner(env).run({ cwd: dir, command: 'env', timeoutSec: 10, envAllowlist: ['PATH', 'HOME', 'CI'] });
     expect(o.exitCode).toBe(0);
     const names = o.stdout.split('\n').map((l) => l.split('=')[0]).filter(Boolean).sort();
-    for (const n of names) expect(['HOME', 'PATH', 'PWD', 'SHLVL', 'OLDPWD', '_']).toContain(n);
+    for (const n of names) expect(['HOME', 'PATH', 'PWD', 'SHLVL', 'OLDPWD', '_', 'TECERA_SANDBOX']).toContain(n);
+    // the one name the host adds itself: the sandbox marker the decision guard reads
+    expect(o.stdout).toMatch(/^TECERA_SANDBOX=verify$/m);
     expect(o.stdout).not.toContain('test-anthropic-credential');
     expect(o.stdout).not.toContain('TECERA_CANARY_V_abcdef01');
     expect(o.stdout).not.toContain('hidden-value');

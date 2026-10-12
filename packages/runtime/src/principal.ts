@@ -11,8 +11,11 @@ import type { Runtime } from './runtime.js';
  * What still holds without tokens:
  * - separation of duty: the ledger refuses an approver equal to the requester (exit 8) and any non-human
  *   approver; requests are made by the loop (an agent), so a grant is always a human other than it;
- * - agents cannot reach this command: the host pre-tool hook refuses `tecera approve|deny|plans|memory`
- *   from a mediated shell (hook.ts), and `--yes` never approves anything;
+ * - a mediated agent shell cannot reach these commands: the Claude Code pre-tool hook refuses
+ *   `tecera approve|deny|plans|memory` (hook.ts), and `--yes` never approves anything. Hosts without that
+ *   hook have only the commands' own accident guard (decisionGuard.ts: agent-host markers, a terminal on
+ *   stdin), which a process with a shell can get around. Neither is authentication: the id is a recorded
+ *   claim;
  * - the approval's session, run and action hash come from the ledger, never from the caller.
  */
 

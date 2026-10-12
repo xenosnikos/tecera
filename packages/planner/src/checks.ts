@@ -28,7 +28,7 @@ import { safeLine } from './render.js';
  */
 
 /** Tools the broker offers in Phase 1 (see docs/security.md §3). */
-export const DEFAULT_TOOL_CATALOG: readonly string[] = ['read', 'listFiles', 'edit', 'runVerify'];
+export const DEFAULT_TOOL_CATALOG: readonly string[] = ['read', 'listFiles', 'edit', 'delete', 'runVerify'];
 /** Tools that cannot change the worktree: the contracts set (runVerify is NOT in it: a test run can write). */
 export { READ_ONLY_TOOLS };
 

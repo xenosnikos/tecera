@@ -26,7 +26,10 @@ import {
   simulatedProvenance,
   weakestFidelity,
   commitActionHash,
+  describeUnexpected,
   isWritingStep,
+  statedEnvelope,
+  unexpectedChanges,
   READ_ONLY_TOOLS,
   meteredCall,
   prActionHash,
@@ -64,8 +67,10 @@ import {
   type Fidelity,
   type GapResolution,
   type HumanCriterionAnswer,
+  type PathChange,
   type PlanningContext,
   type ProvisionedResource,
+  type StatedEnvelope,
   type Provisioner,
   type ProvisioningAllowance,
   type ApprovalGrant,
@@ -158,6 +163,32 @@ export interface WorktreeRequirement {
   reset: string[];
 }
 
+/**
+ * Every intention of a goal after the first works on its own branch, created at the run's pinned base: the
+ * worktree the earlier intention left (its commit, its uncommitted files) is never the one the new plan starts
+ * from. The loop asks LoopPorts.prepareIntention for it before any step of the intention is dispatched.
+ */
+export interface IntentionPreparationRequest {
+  runId: string;
+  goalId: string;
+  /** The intention about to run. */
+  intentionId: string;
+  /** The goal's previous intention in this run (dropped, failed or done): the state that must not be inherited. */
+  previousIntentionId: string;
+  /** Position of the intention among the goal's intentions in this run (2 for the first re-plan). */
+  ordinal: number;
+  signal?: AbortSignal;
+}
+
+/** What the runtime prepared: the branch the intention commits to, cut from `baseSha`, under lease generation `fencingToken`. */
+export interface IntentionPreparation {
+  branch: string;
+  baseSha: string;
+  fencingToken?: number;
+  /** Key of the runtime's durable preparation record. */
+  evidenceKey?: string;
+}
+
 /** One file a worker step changed (LoopPorts.worktreeChanges). Binary files count 0 lines. */
 export interface WorktreeChange {
   path: string;
@@ -233,6 +264,24 @@ export interface LoopPorts {
    * only as closeOut evidence; absent or throwing = the question carries `changed` without a summary.
    */
   worktreeChanges?(a: { runId: string; intentionId: string; stepId: string; from: string; to: string }): Promise<WorktreeChange[]>;
+  /**
+   * Every path that differs between two checkpoints of the worktree (`from` may be 'base', the run's base
+   * commit), host-computed: untracked files, deletions and both sides of a rename included, each with the
+   * operation it amounts to against the base commit (create, modify, delete), plus every git-ignored file
+   * that differs from the run's baseline ('ignored'). A file the base does not have and that is gone again
+   * is no change. When the accepted contract states a
+   * change-path envelope, or the step declares its change paths, the loop refuses a writing worker step whose
+   * changes fall outside them; without this port such a step cannot be closed out (terminal, 'human').
+   */
+  stepChanges?(a: { runId: string; intentionId: string; stepId: string; from: string; to: string }): Promise<PathChange[]>;
+  /**
+   * Prepare the leased worktree for a later intention of a goal (IntentionPreparationRequest): no step of
+   * another intention is running when it is called. It must be idempotent (a restart calls it again for an
+   * intention whose preparation was never confirmed) and must throw rather than leave the worktree on the
+   * previous intention's state. With this port wired, such an intention dispatches nothing until it returned;
+   * a failure drops the goal for a human. Absent: intentions share the goal's first branch, as before.
+   */
+  prepareIntention?(a: IntentionPreparationRequest): Promise<IntentionPreparation>;
   /** Applied to every event payload before it reaches the ledger (e.g. makeRedactor(secrets).redactJson). */
   redact?: (value: Json) => Json;
   /**
@@ -293,6 +342,8 @@ export interface LoopStatus {
    * confirmWorktreeRestored(intentionId, checkpointId). Survives restarts (recorded on intention.advanced).
    */
   requiredWorktreeState?: Record<string, WorktreeRequirement>;
+  /** Intentions that wait for the worktree to be prepared onto their own branch (the next tick prepares them). */
+  awaitingPreparation?: Record<string, { goalId: string; previousIntentionId: string; ordinal: number }>;
   /** Classification when the loop stopped on an accounting failure ('ledger') or a budget refusal. */
   failure?: TerminalFailure;
 }
@@ -451,6 +502,10 @@ export class Loop {
   private readonly cpState = new Map<string, { checkpointId?: string; uncheckpointed: Set<string> }>();
   /** Intentions blocked until the runtime restores their worktree (S2). */
   private readonly awaitingWorktree = new Map<string, WorktreeRequirement>();
+  /** Later intentions of a goal blocked until the worktree is prepared onto their own branch. */
+  private readonly awaitingPreparation = new Map<string, { previousIntentionId: string; ordinal: number }>();
+  /** The branch each prepared intention commits to (GateContext.branch). */
+  private readonly intentionBranch = new Map<string, string>();
   /** The commit each intention's gate.commit recorded (sha) and the candidate it committed (d1). */
   private readonly committed = new Map<string, { sha: string; d1?: string; evidenceKey?: string }>();
   /** Candidates (D1) a review.passed approved, per intention. */
@@ -664,7 +719,7 @@ export class Loop {
 
   /** Dispatchable steps, minus intentions blocked on a worktree restore. */
   private dispatchable(): ReturnType<IntentionSet['dispatchable']> {
-    return this.intentions.dispatchable().filter((b) => !this.awaitingWorktree.has(b.intention.id));
+    return this.intentions.dispatchable().filter((b) => !this.awaitingWorktree.has(b.intention.id) && !this.awaitingPreparation.has(b.intention.id));
   }
 
   /**
@@ -739,6 +794,8 @@ export class Loop {
   /** One pulse: dispatch every dispatchable step concurrently and wait for them. */
   async tick(): Promise<boolean> {
     if (this.stopped) return false;
+    await this.preparePending();
+    if (this.stopped) return false;
     const batch = this.dispatchable();
     if (batch.length === 0) return false;
     await Promise.all(batch.map((b) => this.dispatch(b.intention.id, b.step.id)));
@@ -762,6 +819,7 @@ export class Loop {
     const h = [...this.held.values()].find((x) => x.requestId === requestId);
     if (!h) throw new Error(`no held step for approval ${requestId}`);
     if (this.awaitingWorktree.has(h.intentionId)) throw new Error(`intention ${h.intentionId} waits for its worktree to be restored (confirmWorktreeRestored) before anything resumes`);
+    if (this.awaitingPreparation.has(h.intentionId)) throw new Error(`intention ${h.intentionId} waits for its work branch to be prepared before anything resumes`);
     if (grant.requestId !== requestId) throw new Error(`grant is for ${grant.requestId}, not ${requestId}`);
     const view = await requireApproval(this.p.ledger, requestId);
     if (!view) throw new Error(`approval ${requestId} is unknown to the ledger`);
@@ -840,6 +898,8 @@ export class Loop {
     const attemptNow = new Map<string, number>();
     /** Worktree restores required by an earlier restore and not yet confirmed (a crash in between must not forget them). */
     const pendingWt = new Map<string, WorktreeRequirement>();
+    /** Intentions pushed behind a branch preparation that no later event confirmed. */
+    const pendingPrep = new Map<string, { previousIntentionId: string; ordinal: number }>();
     let deadline: number | undefined;
     let firstAt: number | undefined;
     /** Goal-level approval requests (sign-off, capability ask), the requests a criteria.accepted names, the consumed ones. */
@@ -877,6 +937,13 @@ export class Loop {
             pendingWt.set(it.id, { checkpointId: wr.checkpointId, stepId: wr.stepId, attempt: typeof wr.attempt === 'number' ? wr.attempt : it.attempt, reason: typeof wr.reason === 'string' ? wr.reason : 'worktree restore required', reset: Array.isArray(wr.reset) ? wr.reset.filter((x): x is string => typeof x === 'string') : [] });
           }
           if (e.kind === 'intention.advanced' && typeof pl.worktreeRestored === 'string' && pendingWt.get(it.id)?.checkpointId === pl.worktreeRestored) pendingWt.delete(it.id);
+          const need = pl.preparation as { previousIntentionId?: unknown; ordinal?: unknown } | undefined;
+          if (e.kind === 'intention.pushed' && need && typeof need.previousIntentionId === 'string' && typeof need.ordinal === 'number') pendingPrep.set(it.id, { previousIntentionId: need.previousIntentionId, ordinal: need.ordinal });
+          const done = pl.prepared as { branch?: unknown } | undefined;
+          if (e.kind === 'intention.advanced' && done && typeof done.branch === 'string' && done.branch) {
+            pendingPrep.delete(it.id);
+            this.intentionBranch.set(it.id, done.branch);
+          }
           if (e.kind === 'intention.advanced' && pl.sameAttempt === true && typeof pl.retry === 'string' && typeof pl.attempt === 'number') this.noChangeRetried.add(`${heldKey(it.id, pl.retry)}#${pl.attempt}`);
         }
       } else if (e.kind.startsWith('step.') && iid && sid) {
@@ -949,6 +1016,9 @@ export class Loop {
       }
       this.workerExecs.set(i.id, execs);
       this.cpState.set(i.id, cp);
+      // The branch preparation is reconciled before anything of the intention is recovered or dispatched.
+      const prep = pendingPrep.get(i.id);
+      if (prep && this.isActive(i)) this.awaitingPreparation.set(i.id, prep);
     }
 
     // Goal-level holds still open: a sign-off not yet turned into criteria.accepted, a capability ask not consumed.
@@ -967,9 +1037,13 @@ export class Loop {
       if (!stale) continue;
       for (const k of [...this.held.keys()]) if (k.startsWith(`${snap.id}:`)) this.held.delete(k);
       this.awaitingWorktree.delete(snap.id);
+      pendingPrep.delete(snap.id);
       const dropped = clearHold({ ...snap, status: 'dropped' });
       this.intentions.update(dropped);
-      await this.emit('intention.dropped', { intention: dropped as unknown as Json, cause: 'criteria.amended', reason: stale, recovered: true }, this.traceFor(snap.id));
+      // Its PR approval (requested, maybe granted) delivers nothing any more.
+      const withdrawn: Json[] = [];
+      for (const [requestId, r] of scan.requests) if (r.intentionId === snap.id && r.owner === 'gate') withdrawn.push({ requestId, state: await this.withdrawDelivery(requestId, snap.id, r.stepId, 'criteria.amended') });
+      await this.emit('intention.dropped', { intention: dropped as unknown as Json, cause: 'criteria.amended', reason: stale, recovered: true, ...(withdrawn.length ? { delivery: withdrawn } : {}) }, this.traceFor(snap.id));
       notes.push({ intentionId: snap.id, stepId: '', kind: 'goal', goalId: snap.goalId, action: 'dropped', reason: stale });
     }
 
@@ -1108,6 +1182,7 @@ export class Loop {
       deadline: this.deadline,
       dispatchable: this.dispatchable().length,
       ...(this.awaitingWorktree.size ? { requiredWorktreeState: Object.fromEntries([...this.awaitingWorktree].map(([k, v]) => [k, { ...v, reset: [...v.reset] }])) } : {}),
+      ...(this.awaitingPreparation.size ? { awaitingPreparation: Object.fromEntries([...this.awaitingPreparation].map(([k, v]) => [k, { goalId: this.intentions.get(k)?.goalId ?? '', ...v }])) } : {}),
     };
   }
 
@@ -1758,9 +1833,14 @@ export class Loop {
         if (extra.length && !(await this.capabilitiesReady(goal, ctx.contract!, extra))) return;
       }
       const intention = newIntention({ id: this.ids(), goalId: goal.id, plan: chosen, commitment: goal.commitment });
+      // A later intention of the goal never starts on what an earlier one left in the worktree: it waits for
+      // its own branch, cut from the run's base (recorded on intention.pushed, so a restart still waits).
+      const earlier = this.intentions.all().filter((x) => x.goalId === goal.id);
+      const preparation = this.p.prepareIntention && earlier.length ? { previousIntentionId: earlier[earlier.length - 1]!.id, ordinal: earlier.length + 1 } : undefined;
       this.intentions.add(intention, chosen);
       if (ctx?.contractHash) this.intentionContract.set(intention.id, ctx.contractHash);
-      await this.emit('intention.pushed', { intention: intention as unknown as Json, ...(ctx?.contractHash ? { contractHash: ctx.contractHash } : {}) }, this.traceFor(intention.id));
+      if (preparation) this.awaitingPreparation.set(intention.id, preparation);
+      await this.emit('intention.pushed', { intention: intention as unknown as Json, ...(ctx?.contractHash ? { contractHash: ctx.contractHash } : {}), ...(preparation ? { preparation } : {}) }, this.traceFor(intention.id));
     } catch (err) {
       if (err instanceof LoopStopped || this.stopped) throw err;
       if (isBudgetError(err)) await this.dropGoal(goal, `budget: ${msgOf(err)}`, undefined, { terminal: true, failure: 'budget' });
@@ -2110,6 +2190,15 @@ export class Loop {
     return null;
   }
 
+  /**
+   * The change-path envelope stated for a step of intention `i`: the accepted contract's and the step's own
+   * declared subset (contracts statedEnvelope). null = none was stated (repo.allowedChanges alone applies).
+   */
+  private async envelopeOf(i: Intention, step: Step): Promise<StatedEnvelope | null> {
+    const contract = this.contractual.has(i.goalId) ? (await this.acceptance(i.goalId)).view.accepted?.contract : undefined;
+    return statedEnvelope(contract ?? null, step);
+  }
+
   /** GateContext fields under a contract: the contract and inventory; for gate.pr the proofs, answers and pending resources. */
   private async contractFields(i: Intention, step: Step): Promise<Partial<GateContext>> {
     if (!this.contractual.has(i.goalId)) return {};
@@ -2301,10 +2390,14 @@ export class Loop {
     const i = this.intentions.get(stale.id)!;
     if (i.status === 'done' || i.status === 'dropped' || i.status === 'failed') return;
     for (const [stepId, ac] of this.running) if (stepId.startsWith(`${i.id}:`)) ac.abort();
+    const delivery = [...this.held.values()].filter((h) => h.intentionId === i.id && h.owner === 'gate');
     for (const k of [...this.held.keys()]) if (k.startsWith(`${i.id}:`)) this.held.delete(k);
+    this.awaitingPreparation.delete(i.id);
     const dropped = clearHold(transitionIntention(i, 'dropped'));
     this.intentions.update(dropped);
-    await this.emit('intention.dropped', { intention: dropped as unknown as Json, cause }, this.traceFor(i.id));
+    const withdrawn: Json[] = [];
+    for (const h of delivery) withdrawn.push({ requestId: h.requestId, state: await this.withdrawDelivery(h.requestId, i.id, h.stepId, cause) });
+    await this.emit('intention.dropped', { intention: dropped as unknown as Json, cause, ...(withdrawn.length ? { delivery: withdrawn } : {}) }, this.traceFor(i.id));
     const goal = this.goals.get(i.goalId);
     if (goal && goal.status === 'open') {
       // Loop-safety: every interrupted intention of a goal counts against maxAttempts, exactly as a failed
@@ -2319,6 +2412,73 @@ export class Loop {
       // Re-deliberate: the goal still stands, the plan did not.
       const adopted = await this.lastEvent('goal.adopted', goal.id);
       if (adopted) await this.deliberate(goal, adopted);
+    }
+  }
+
+  /**
+   * A dropped intention delivers nothing: its PR approval is withdrawn. A pending request is denied on the
+   * approvals table by Tecera (approval.denied, `superseded`), so nobody can grant it afterwards. A request a
+   * human already granted cannot be taken back; it stays bound to the dropped intention's PR step and commit
+   * (prActionHash), which no other intention can present, and is never consumed. Returns the row's state.
+   */
+  private async withdrawDelivery(requestId: string, intentionId: string, stepId: string, cause: string): Promise<string> {
+    let state: string;
+    try {
+      state = (await requireApproval(this.p.ledger, requestId))?.state ?? 'unknown';
+    } catch {
+      return 'unknown';
+    }
+    if (state !== 'pending') return state;
+    const reason = `superseded: intention ${intentionId} was dropped (${cause})`;
+    try {
+      await this.p.ledger.deny(requestId, this.system, reason, this.now());
+    } catch {
+      // decided or expired meanwhile: report what the table holds now
+      return (await requireApproval(this.p.ledger, requestId).catch(() => null))?.state ?? 'unknown';
+    }
+    await this.emit('approval.denied', { requestId, reason, superseded: true }, this.traceFor(intentionId, stepId), { actor: this.system });
+    return 'denied';
+  }
+
+  /**
+   * Prepare every waiting intention whose predecessors are drained (no step of another intention still runs in
+   * the one worktree). The port's result is recorded on intention.advanced (`prepared`); only then may a step
+   * of the intention be dispatched, and the gates are handed its branch. A lost lease leaves the intention
+   * waiting (the next process reconciles it); any other failure drops the goal for a human.
+   */
+  private async preparePending(): Promise<void> {
+    for (const [id, need] of [...this.awaitingPreparation]) {
+      if (this.stopped || this.leaseLost()) return;
+      const i = this.intentions.get(id);
+      if (!i || !this.isActive(i)) {
+        this.awaitingPreparation.delete(id);
+        continue;
+      }
+      if (this.contractStale(i)) {
+        await this.interrupt(i, 'criteria.amended');
+        continue;
+      }
+      if ([...this.running.keys()].some((k) => !k.startsWith(`${id}:`))) continue;
+      const goal = this.goals.get(i.goalId);
+      let done: IntentionPreparation;
+      try {
+        if (!this.p.prepareIntention) throw new Error('this wiring cannot prepare a work branch');
+        done = await this.p.prepareIntention({ runId: this.p.runId, goalId: i.goalId, intentionId: id, previousIntentionId: need.previousIntentionId, ordinal: need.ordinal });
+        if (!done || typeof done.branch !== 'string' || !done.branch || typeof done.baseSha !== 'string' || !done.baseSha) throw new Error('the preparation named no branch or base');
+      } catch (err) {
+        if (err instanceof LoopStopped || this.stopped || this.leaseLost()) return;
+        this.awaitingPreparation.delete(id);
+        const unprepared = clearHold(transitionIntention(this.intentions.get(id)!, 'dropped'));
+        this.intentions.update(unprepared);
+        await this.emit('intention.dropped', { intention: unprepared as unknown as Json, cause: 'preparation.failed', reason: msgOf(err) }, this.traceFor(id));
+        if (goal && goal.status === 'open') await this.dropGoal(goal, `intention ${id} could not be given its own work branch: ${msgOf(err)}`, undefined, { terminal: true, failure: 'human' });
+        continue;
+      }
+      if (this.stopped || this.leaseLost()) return;
+      const prepared = { branch: done.branch, baseSha: done.baseSha, previousIntentionId: need.previousIntentionId, ordinal: need.ordinal, ...(typeof done.fencingToken === 'number' ? { fencingToken: done.fencingToken } : {}), ...(done.evidenceKey ? { evidenceKey: done.evidenceKey } : {}) };
+      await this.emit('intention.advanced', { intention: this.intentions.get(id) as unknown as Json, prepared }, this.traceFor(id));
+      this.intentionBranch.set(id, done.branch);
+      this.awaitingPreparation.delete(id);
     }
   }
 
@@ -2366,6 +2526,7 @@ export class Loop {
     try {
       if (this.leaseLost()) return;
       if (this.awaitingWorktree.has(intentionId)) return; // S2: nothing runs until the worktree is restored
+      if (this.awaitingPreparation.has(intentionId)) return; // nothing runs on the previous intention's worktree
       // D8: no step of a contract-bound intention runs unless its contract is the accepted one, now.
       if (this.contractStale(i)) {
         await this.interrupt(i, 'criteria.amended');
@@ -2495,6 +2656,7 @@ export class Loop {
         if (!i || !this.isActive(i)) return `intention ${intentionId} is ${i?.status ?? 'unknown'}`;
         if (i.stepStatus[stepId] !== 'running') return `step ${stepId} is ${i.stepStatus[stepId] ?? 'unknown'}, not running`;
         if (this.awaitingWorktree.has(intentionId)) return `intention ${intentionId} waits for a worktree restore`;
+        if (this.awaitingPreparation.has(intentionId)) return `intention ${intentionId} waits for its work branch`;
         return null;
       },
       authorizeWrite: (): WriteAuthorization => ({ kind: 'allowed' }),
@@ -2515,6 +2677,7 @@ export class Loop {
       intention: i,
       step,
       worktree: this.p.worktree ?? '',
+      ...(this.intentionBranch.has(i.id) ? { branch: this.intentionBranch.get(i.id)! } : {}),
       candidate,
       signal,
       ...(approval && step.kind === 'gate.pr' ? { approval } : {}),
@@ -2525,6 +2688,7 @@ export class Loop {
 
   private async execute(intentionId: string, step: Step, mode: ExecMode): Promise<void> {
     if (this.leaseLost()) return; // no mutation without the lease (resume and pre-approved paths included)
+    if (this.awaitingPreparation.has(intentionId)) return; // on every path: never on the previous intention's worktree
     let i = this.intentions.get(intentionId)!;
     if (this.contractStale(i)) {
       // D8 on every path (dispatch, resume, pre-approved): nothing runs for a contract that is not the accepted one.
@@ -2673,7 +2837,7 @@ export class Loop {
         else this.criterionProofs.delete(ctx.intention.id);
         await this.emit(
           passed ? 'verify.passed' : 'verify.failed',
-          { exitCode: r.exitCode, evidenceKey: r.evidenceKey, fingerprint: fingerprint ?? null, attempt: ctx.intention.attempt, workerExec: exec, terminal, reason: reason ?? null, ...(failure ? { failure } : {}), ...(noProgress ? { noProgress: true } : {}), ...(criteria ? { criteria: criteria as unknown as Json } : {}), ...(r.failedCriteria?.length ? { failedCriteria: r.failedCriteria } : {}) },
+          { exitCode: r.exitCode, evidenceKey: r.evidenceKey, fingerprint: fingerprint ?? null, attempt: ctx.intention.attempt, workerExec: exec, terminal, reason: reason ?? null, ...(failure ? { failure } : {}), ...(noProgress ? { noProgress: true } : {}), ...(criteria ? { criteria: criteria as unknown as Json } : {}), ...(r.failedCriteria?.length ? { failedCriteria: r.failedCriteria } : {}), ...(!passed && r.unexpected?.length ? { unexpected: r.unexpected.slice(0, MAX_FAILURE_ITEMS).map((c) => ({ path: c.path, op: c.op })) } : {}) },
           trace,
         );
         return { kind: 'gate.verify', exitCode: r.exitCode, evidenceKey: r.evidenceKey, terminal, ...(reason ? { reason } : {}), ...(failure ? { failure } : {}) };
@@ -2832,6 +2996,41 @@ export class Loop {
       changed = typeof before === 'string' ? before !== checkpoint : null;
       if (typeof before === 'string') change = await this.changeSummary(intentionId, step, before, checkpoint, changed === true);
     }
+    // The change-path envelope, at close-out: what the host finds changed must lie inside the step's declared
+    // subset of the accepted envelope. Deterministic, and before any decider is asked.
+    if (result.kind === 'worker' && result.outcome.kind === 'returned' && isWritingStep(plan, step)) {
+      const env = await this.envelopeOf(i, step);
+      if (env) {
+        const before = this.stepBefore.get(heldKey(intentionId, step.id));
+        if (!this.p.stepChanges || typeof before !== 'string' || !checkpoint) {
+          await this.failStep(i, plan, step, `the changes of ${step.id} cannot be checked against its change-path envelope (${!this.p.stepChanges ? 'this wiring computes no changed paths' : 'the step has no baseline checkpoint'})`, { terminal: true, failure: 'human' });
+          return;
+        }
+        // Two views: what this step changed, against its own subset; and everything that differs from the
+        // base now, against the contract's envelope, so a path an earlier attempt left behind is found even
+        // when this execution touched nothing.
+        const whole = statedEnvelope(env.layers.length > 1 || env.source === 'contract' ? { envelope: env.layers[env.layers.length - 1]! } : null, null);
+        const listed = async (from: string): Promise<PathChange[]> => {
+          const l = await this.p.stepChanges!({ runId: this.p.runId, intentionId, stepId: step.id, from, to: checkpoint! });
+          if (!Array.isArray(l)) throw new Error('no change list');
+          return l.filter((c) => c && typeof c.path === 'string');
+        };
+        let unexpected: PathChange[];
+        try {
+          const own = unexpectedChanges(env, before === checkpoint ? [] : await listed(before));
+          const total = whole ? unexpectedChanges(whole, await listed('base')) : [];
+          unexpected = [...own, ...total.filter((t) => !own.some((o) => o.path === t.path && o.op === t.op))];
+        } catch (err) {
+          await this.failStep(i, plan, step, `the changed paths of ${step.id} could not be computed: ${msgOf(err)}`, { terminal: true, failure: 'human' });
+          return;
+        }
+        if (unexpected.length) {
+          const where = env.source === 'step' ? `the declared changes of step ${step.id}` : 'the accepted change-path envelope';
+          await this.failStep(i, plan, step, `changed paths outside ${where}: ${describeUnexpected(unexpected)}`, { unexpected });
+          return;
+        }
+      }
+    }
     const expectsChange = editsFiles(plan, step);
     const evidence = step.kind === 'worker' ? this.closeOutEvidence(intentionId, step, result, change) : {};
     const closeOut = await this.ask('closeOut', { state: { ...(closeOutState(step, result, { expectsChange, ...(changed !== undefined ? { changed } : {}) }) as JsonObject), ...evidence } });
@@ -2879,16 +3078,21 @@ export class Loop {
     let gate: TeceraEvent | undefined;
     let last: TeceraEvent | undefined;
     const seen: TeceraEvent[] = [];
-    for await (const e of this.p.ledger.events({ runId: this.p.runId, kinds: ['verify.passed', 'verify.failed', 'review.passed', 'review.rejected', 'intention.advanced'] })) seen.push(e);
+    for await (const e of this.p.ledger.events({ runId: this.p.runId, kinds: ['verify.passed', 'verify.failed', 'review.passed', 'review.rejected', 'intention.advanced', 'step.failed'] })) seen.push(e);
     for (const e of ledgerOrder(seen, this.p.runId)) {
       if (e.trace.intentionId !== i.id) continue;
+      // A worker step the host refused for paths outside its envelope counts like a gate outcome; any other step failure does not.
+      if (e.kind === 'step.failed') {
+        if (Array.isArray((e.payload as JsonObject).unexpected)) gate = e;
+        continue;
+      }
       if (e.kind === 'verify.passed' || e.kind === 'verify.failed' || e.kind === 'review.passed' || e.kind === 'review.rejected') gate = e;
       else if (e.kind === 'intention.advanced') {
         const a = e.payload as JsonObject;
         if (a.attempt === i.attempt && a.sameAttempt !== true && typeof a.retry === 'string') last = gate && gate.trace.stepId === a.retry ? gate : undefined;
       }
     }
-    if (!last || (last.kind !== 'verify.failed' && last.kind !== 'review.rejected')) return undefined;
+    if (!last || (last.kind !== 'verify.failed' && last.kind !== 'review.rejected' && last.kind !== 'step.failed')) return undefined;
     const p = last.payload as JsonObject;
     if (p.terminal === true) return undefined;
     const red = (v: Json): Json => (this.p.redact ? this.p.redact(v) : v);
@@ -2914,8 +3118,17 @@ export class Loop {
     };
     const attempt = typeof p.attempt === 'number' ? p.attempt : Math.max(1, i.attempt - 1);
     const reason = typeof p.reason === 'string' && p.reason ? text(p.reason, MAX_EVIDENCE_TEXT) : undefined;
+    const unexpected = (Array.isArray(p.unexpected) ? p.unexpected : [])
+      .filter((x): x is JsonObject => !!x && typeof x === 'object' && !Array.isArray(x) && typeof (x as JsonObject).path === 'string')
+      .slice(0, MAX_FAILURE_ITEMS)
+      .map((x) => ({ path: text(x.path as string, 300), op: text(typeof x.op === 'string' ? x.op : 'change', 20) }));
+    const undo = 'Paths outside what may change were changed. Put each one back: delete a file that should not exist with the delete tool (read it first; the tool takes the digest), and restore a file that must stay as it was. Change only the paths this step may change.';
     let out: FailureContext;
-    if (last.kind === 'verify.failed') {
+    if (last.kind === 'step.failed') {
+      out = { kind: 'envelope', attempt, unexpected, ...(reason ? { reason } : {}), instruction: undo, untrusted: true };
+    } else if (last.kind === 'verify.failed' && unexpected.length) {
+      out = { kind: 'envelope', attempt, unexpected, ...(reason ? { reason } : {}), instruction: undo, untrusted: true };
+    } else if (last.kind === 'verify.failed') {
       const failed = Array.isArray(p.failedCriteria) ? p.failedCriteria.filter((x): x is string => typeof x === 'string').slice(0, MAX_FAILURE_ITEMS) : [];
       const criteria: FailedCriterionContext[] = [];
       if (failed.length) {
@@ -3240,7 +3453,7 @@ export class Loop {
    * most 2 × maxAttempts times; each run is one worker execution under its own maxIterations / maxDepth /
    * timeout limits, and the run deadline and budgets bound them all.
    */
-  private async failStep(stale: Intention, plan: Plan, step: Step, reason: string, opts: { blocked?: boolean; terminal?: boolean; failure?: TerminalFailure; recorded?: boolean; noChange?: boolean }): Promise<void> {
+  private async failStep(stale: Intention, plan: Plan, step: Step, reason: string, opts: { blocked?: boolean; terminal?: boolean; failure?: TerminalFailure; recorded?: boolean; noChange?: boolean; unexpected?: PathChange[] }): Promise<void> {
     let i = this.intentions.get(stale.id)!;
     const blocked = opts.blocked === true;
     const terminal = opts.terminal === true || opts.failure !== undefined;
@@ -3254,7 +3467,7 @@ export class Loop {
     this.held.delete(heldKey(i.id, step.id));
     this.intentions.update(i);
     const failedAttempt = i.attempt;
-    if (!opts.recorded) await this.emit('step.failed', { step: step.id, reason, blocked, terminal, ...failure, ...(opts.noChange ? { noChange: true } : {}) }, this.traceFor(i.id, step.id));
+    if (!opts.recorded) await this.emit('step.failed', { step: step.id, reason, blocked, terminal, ...failure, ...(opts.noChange ? { noChange: true } : {}), ...(opts.unexpected?.length ? { unexpected: opts.unexpected.slice(0, MAX_FAILURE_ITEMS).map((c) => ({ path: c.path, op: c.op })) } : {}) }, this.traceFor(i.id, step.id));
     // Continue from the latest state: a sibling step may have completed, failed or been held while the event
     // was appended, and writing the snapshot read before it would undo that. An intention that ended
     // meanwhile stays ended (the step.failed above is its record).

@@ -62,8 +62,8 @@ node --permission --allow-fs-read=<scratch>/child --disallow-code-generation-fro
 ```
 `spawn` options: `cwd` = an empty directory inside a fresh scratch dir under the system temp directory
 (never the worktree, never a Windows mount); `env` = the manifest allowlist intersected with a fixed safe
-list, with `PATH` empty, `HOME` and `TMPDIR` in the scratch dir and `LANG=C.UTF-8` forced, `NODE_OPTIONS`
-absent; `stdio` = three pipes (frames travel as newline-delimited JSON on stdin/stdout, never Node IPC);
+list, with `PATH` empty, `HOME` and `TMPDIR` in the scratch dir, `LANG=C.UTF-8` and `TECERA_SANDBOX=repl`
+forced (a verify command gets `TECERA_SANDBOX=verify`), `NODE_OPTIONS` absent; `stdio` = three pipes (frames travel as newline-delimited JSON on stdin/stdout, never Node IPC);
 `detached: true`; `windowsHide: true`.
 
 OS controls. Only `sandbox.profile: "process"` is implemented; `bwrap` and `docker` are accepted by the
@@ -76,14 +76,16 @@ host has it:
 
 `prlimit --as=<…> --nofile=64 --core=0` is added when present; it is a backstop, not one of the three
 controls. There is no CPU quota, no process-count rlimit and no seccomp filter. Printed output and stderr
-are capped at 1 MiB each; crossing a cap ends the exec and kills the group. The per-exec wall clock comes
-from `sandbox.execTimeoutSec`; on expiry the negative pgid gets `SIGKILL` and the host checks that the
-group is gone.
+are capped at 1 MiB each; crossing a cap ends the exec and kills the group. An exec has two bounded
+phases: startup (at most 10 s from spawn until the child's `hello`), then the per-exec wall clock from
+`sandbox.execTimeoutSec`, counted from `hello`. On expiry the negative pgid gets `SIGKILL` and the host
+checks that the group is gone. `sandbox.kill` evidence is written only when a signal was really delivered;
+an exec that ended any other way without a result records `sandbox.ended`.
 
 In-child runtime (`entry.mjs`): receives one `program` frame, builds
 `vm.createContext(Object.create(null), {codeGeneration: {strings:false, wasm:false}})`, compiles with
 `vm.compileFunction(body, paramNames, {parsingContext})`, and passes only: `invoke(inputs, opts)`, one stub
-per scoped tool (`read`, `edit`, `listFiles`, `runVerify`, plus a tool per provisioned or mocked
+per scoped tool (`read`, `edit`, `delete`, `listFiles`, `runVerify`, plus a tool per provisioned or mocked
 capability), `__history__` (read-only handle: `len()`, `slice()`, `search()`), `checkpoint(key, value)`,
 `console` (bounded, routed to supervisor as `log` frames), `JSON`/`Math`/intrinsics. Stubs are created
 inside the context so no host prototypes leak. Each exec is a fresh process; only `checkpoint` values
@@ -132,6 +134,8 @@ fields; the broker ignores all text when authorizing.
 
 Sub-invoke: a recursion limit (`maxDepth` from the manifest, at most 8), budget reservation before
 execution, effective capabilities = intersection, widening rejected, new child with the narrowed scope.
+Its iteration, depth and execution limits are the configuration intersected with the narrowed
+capabilities, not the configuration alone; a limit that is negative, fractional or not finite is refused.
 Cancellation: `cancel` → 500 ms grace → SIGKILL of the process group. An exec does not settle while a
 tool call is in flight; a call or process that cannot be accounted for taints the exec and quarantines
 its REPL.
@@ -147,6 +151,17 @@ is recorded as `{kind:'human', id, method:'local', authenticated:false, source}`
 event and in an `approval.identity` evidence row (`runtime/src/principal.ts`,
 `runtime/src/commands/approve.ts`). `--yes` never approves anything.
 
+An accident guard runs before each of these commands reads anything (`runtime/src/decisionGuard.ts`). It
+refuses with exit 8 when the environment carries an agent-host marker (`CLAUDECODE`,
+`CLAUDE_CODE_ENTRYPOINT`, any `CODEX_*` variable, or Tecera's own `TECERA_SANDBOX`, which the worker child
+and every verify command carry) or when stdin is not a terminal. A person who decides without a terminal
+(their own script, CI they control) sets `TECERA_DECISION_NONINTERACTIVE=1`. The conditions the guard saw
+(terminal or not, marker names, whether the opt-out was set) are recorded as `guard` on
+`approval.granted`, `approval.denied` and `criteria.amended`. This is not authentication: a process with a
+shell can allocate a pseudo-terminal and unset variables. It stops a decision made by accident from inside
+an agent host or a script. An agent host that filters the environment of its tools should deny
+`TECERA_DECISION_NONINTERACTIVE`, so an agent does not inherit the opt-out.
+
 What the ledger enforces on a grant (`ledger/src/sqlite.ts`):
 
 - the request must be pending, unexpired and of the session the ledger recorded for it; the session, run
@@ -160,7 +175,9 @@ What the ledger enforces on a grant (`ledger/src/sqlite.ts`):
   a grant is spent at most once.
 
 A PR approval's action hash is `prActionHash({intentionId, stepId, attempt, sha})`: the PR step of one
-intention and attempt, for exactly the committed sha (`gates/src/actionHash.ts`).
+intention and attempt, for exactly the committed sha (`gates/src/actionHash.ts`). An approval requested for
+an intention that was later replaced therefore cannot deliver its replacement's commit; while still pending
+it is also denied on the approvals table when the intention is dropped.
 
 What it does not guarantee: the `human` kind and the name are whatever the caller of the CLI supplies. Any
 local process that can run `tecera` in the business case can approve under any name. Keeping an agent
@@ -184,6 +201,12 @@ REPLACE` cannot rewrite a row.
 
 There is no separate `runs` table: a run's state is derived from its events.
 
+`verifyChain` reads events and evidence in one snapshot and requires both to be numbered contiguously from
+1, so a row removed from the middle or a renumbered tail is reported. A lease that expired or was released
+cannot be renewed: its holder must acquire it again and gets a new fencing token. The worktree lease is
+renewed every sixth of its lifetime and treated as lost locally an eighth of the lifetime before the
+ledger would let anyone else take it.
+
 The hash chain is unkeyed. It detects a recorded row being rewritten; it does not stop a party with write
 access to the database file from appending well-formed events, or from dropping the triggers and
 truncating the tail. Decisions that matter (achievement, approval, sign-off) are therefore derived from
@@ -206,6 +229,26 @@ digest):
 | S9 delivery | after the PR grant was consumed | the grant is never spent again and nothing is delivered twice; the run stops for a human |
 
 Ledger write failure at any step blocks the transition; duplicate appends are refused by `events.idem_key`.
+
+Replacing an intention (an amended contract, a dropped plan) is a transition of its own, between S8 and a new
+S2. The new intention gets its own branch (`<branchPrefix><goal>.<n>`, `gates/src/intentionBranch.ts`) and
+runs nothing until the worktree is on it:
+
+| Step | Crash or lost lease here | On restart |
+|---|---|---|
+| old intention dropped | before its PR approval was withdrawn | the drop is repeated from the ledger; a pending request is denied by Tecera (`approval.denied`, `superseded`), a granted one stays bound to the old intention's PR step and commit and is never consumed |
+| intent recorded (`intention-prepare:<run>:<intention>`: old and new intention, base commit, branch, the old branch's commit, lease token) | before the branch exists | nothing moved; the new intention is still waiting; the next run finds the intent and performs exactly that transition |
+| branch created at the base, HEAD moved, tree reset | before the completion record | the branch is at the base, so the steps are repeated (they are idempotent) and the completion is written under the new lease token |
+| completion recorded (`intention-prepared:…`) | before the loop recorded it | the preparation is run again, finds its own record, and the loop records it; only then is a step of the new intention dispatched |
+
+The lease is re-checked immediately before each of the three repository mutations. The old branch must
+still point at the commit the intent recorded, before and after; a branch of the new name that exists
+anywhere but at the base is refused. A preparation that fails for any reason other than a lost lease drops
+the goal for a human. The commit gate still requires HEAD to be the base commit (`head-not-base`): it
+commits to the branch the completion record names and refuses a context that names another one, or one
+that names a branch without a record. Because the branch is part of the candidate fingerprint, the verify,
+criterion and review evidence of the old intention (keyed by fingerprint) is never reused for the new one,
+even when the two changes are byte-identical.
 
 ## 5. Verify and review gates
 
@@ -235,6 +278,26 @@ the goal; `.only|.skip|.todo|xit|xdescribe|fit` additions; new or changed symlin
 content; files > 2 MB; hard links; `package.json` script changes; under an acceptance contract, a change
 to a file or package script that a criterion's check command runs. An unknown change status is a
 violation.
+
+Change-path envelope (`contracts/src/envelope.ts`, `gates/src/envelope.ts`): when the accepted contract
+states one (or, without one, when every writing step of the plan declared its `changes`), every created,
+modified or deleted path of the candidate must be allowed by it. An exact entry matches only that path; a
+glob matches only at the depth it names. The verify gate refuses before any check runs (a failure the
+worker may fix: exit 1, the paths in the result and the evidence) and the commit gate refuses with
+`outside-envelope: <path> (<operation>)` (exit 8). Neither reads the review verdict. The same check runs
+earlier, at the worker's write and delete tools and when a writing step returns (`loop/src/loop.ts`, on
+the host-computed paths since the step began and since the base, ignored files included). It limits
+which paths change, not what an allowed file contains.
+
+The delete tool (`worker/src/tools/delete.ts`) removes one regular file under the rules of a write: the
+worktree lock, no symlink in the path, never `.git/` or `.tecera/`, the capability allowlist and the
+protected paths (a protected test cannot be deleted), the directory chain opened by descriptor and
+identity-checked, the lease fence re-checked immediately before the removal, quarantine on a failed
+post-check. It is bound to the content the worker read (the digest `read` returned, or the exact
+content): a file that changed since is not removed. Directories and recursive deletion are refused. It
+is write-risk and never suspends for an approval. Removing a file the base commit does not have is not an
+envelope operation (it changes nothing against the base); deleting a base file needs `delete` in the
+envelope.
 
 Mutation-after-review: the snapshot (`policy/src/snapshot.ts`) is `sha256` over head, tracked diff, index
 diff and every untracked/ignored file's name and hash; recorded at freeze (D1), after review (D2), after
@@ -284,6 +347,7 @@ run with no open approval is a known gap.
 | `tamper.symlink_hardlink` | symlink to `../../`; hard link | gate fail (ext4 path) | policy/integration |
 | `tamper.ignored_file` | writes `.env` / ignored binary | snapshot includes; gate fail | policy/integration |
 | `tamper.git_hook` | repo `.husky/pre-commit` and `core.hooksPath` | hooks never run; tree equality holds | runtime/e2e |
+| `tamper.unrequested_file` | a planted instruction gets an extra file written inside `allowedChanges`; the reviewer approves anything | refused at the tool call, at step close-out and at verify/commit, each naming the path; nothing committed | runtime/e2e |
 | `review.mutation_after` | fake tool mutates source during review | D1≠D2 → human | runtime/e2e |
 | `review.same_provider` | reviewer == writer provider | refuses to start | policy/unit |
 | `review.planted_verdict` | diff contains approve JSON; echo provider | reject | policy/unit |

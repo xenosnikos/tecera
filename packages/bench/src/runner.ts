@@ -814,8 +814,11 @@ export async function runScenario(s: Scenario, opts: RunnerOptions): Promise<Sce
   try {
     const counter = await stepCounter(w.repo);
     const pending = [...s.interventions];
+    // The human steps (sign-off, amendment, approval) are this runner's: a script the operator controls, with
+    // no terminal. It says so with the product's explicit opt-out, on these commands only; a `tecera run`
+    // segment never gets it, so nothing the run starts inherits it.
     const cli = async (argv: string[]): Promise<Proc & { watched: NodeJS.Signals | null }> => {
-      const r = await launch(process.execPath, [bin, ...argv], { cwd: w.repo, env: w.env, deadline });
+      const r = await launch(process.execPath, [bin, ...argv], { cwd: w.repo, env: { ...w.env, TECERA_DECISION_NONINTERACTIVE: '1' }, deadline });
       artifacts.push({ name: `cli ${argv[0]} #${artifacts.length + 1}`, text: r.out + r.err });
       return r;
     };

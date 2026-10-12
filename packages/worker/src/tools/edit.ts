@@ -1,10 +1,10 @@
 import { requireWriteGuard, type Json, type ToolContext, type ToolRequest, type ToolResult, type WriteGuard } from '@tecera/contracts';
-import { assertLease, assertMethod, assertWorktree, authorizeWriteVia, fail, ok, signalOf, ToolInputError, type AuthorizingTool } from './common.js';
+import { assertLease, assertMethod, assertWorktree, authorizeWriteVia, fail, ok, signalOf, ToolInputError, type AuthorizingTool, type ChangeAuthorizer } from './common.js';
 import { matchesAny, matchesProtected } from './glob.js';
 import { resolveInWorktree, writeInWorktree, type Resolved, type WriteOptions } from './paths.js';
 
 /**
- * edit: the only repo-writing tool. Refuses without a worktree or a lease fencing token, refuses paths
+ * edit: writes files (delete.ts removes them; no other tool changes the repository). Refuses without a worktree or a lease fencing token, refuses paths
  * outside capabilities.paths.write or inside capabilities.paths.protected (evaluated on the RESOLVED
  * worktree-relative path, protected globs case-insensitively), refuses any symlink in the path, hardlinked
  * targets and .git/.tecera, and writes through descriptor-relative O_NOFOLLOW opens (see paths.ts).
@@ -20,6 +20,8 @@ import { resolveInWorktree, writeInWorktree, type Resolved, type WriteOptions } 
 
 export interface EditToolOptions {
   maxBytes?: number;
+  /** A further check on the resolved path of every write (the step's declared change paths). Throws to refuse. */
+  authorizeChange?: ChangeAuthorizer;
   /** Test seam: runs after the path check, before the directory chain is opened (race tests). */
   beforeOpen?: (r: Resolved) => Promise<void>;
   /** Test seam: runs after the current content was read through the verified descriptor (race tests). */
@@ -50,10 +52,11 @@ function countOccurrences(hay: string, needle: string): number {
   return n;
 }
 
-function authorizeRel(rel: string, ctx: ToolContext): void {
+function authorizeRel(rel: string, ctx: ToolContext, extra?: ChangeAuthorizer): void {
   const prot = matchesProtected(rel, ctx.capabilities.paths.protected);
   if (prot) throw new ToolInputError(`${rel} is protected by ${prot}`);
   if (!matchesAny(rel, ctx.capabilities.paths.write)) throw new ToolInputError(`${rel} is outside the write allowlist`);
+  extra?.(rel, 'write', ctx);
 }
 
 function preconditions(req: ToolRequest, ctx: ToolContext): EditArgs {
@@ -77,7 +80,7 @@ function writeOptions(maxBytes: number, mode: 'replace' | 'write', ctx: ToolCont
     maxBytes,
     mode,
     guard,
-    authorize: (rel) => authorizeRel(rel, ctx),
+    authorize: (rel) => authorizeRel(rel, ctx, o.authorizeChange),
     beforeWrite: (w) => authorizeWriteVia(guard, ctx, w),
     ...(signal ? { signal } : {}),
     ...(o.beforeOpen ? { beforeOpen: o.beforeOpen } : {}),
@@ -103,7 +106,7 @@ export function createEditTool(o: EditToolOptions = {}): AuthorizingTool {
     async authorize(req: ToolRequest, ctx: ToolContext): Promise<void> {
       const a = preconditions(req, ctx);
       const r = await resolveInWorktree(ctx.worktree, a.path, { forWrite: true });
-      authorizeRel(r.rel, ctx);
+      authorizeRel(r.rel, ctx, o.authorizeChange);
     },
     async call(req: ToolRequest, ctx: ToolContext, guard?: WriteGuard): Promise<ToolResult> {
       try {

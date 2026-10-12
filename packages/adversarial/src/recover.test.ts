@@ -239,7 +239,8 @@ describe('recover (security.md §6, §4 recovery matrix)', () => {
         }
       };
       const r = await flow.segment({
-        leaseTtlMs: 900,
+        // the renewals are stalled on purpose below; the TTL only has to be short enough for the thief's 10 s of tries
+        leaseTtlMs: 3_000,
         editToolSeams: { [seam]: pause },
         wrap: (inner) => async (ctx) => {
           const l = ctx.ledger as Ledger;

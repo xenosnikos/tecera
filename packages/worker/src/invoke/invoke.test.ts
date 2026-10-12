@@ -110,7 +110,14 @@ describe('invoke', () => {
       throw new Error('bug');
     });
     const out2 = await invoke(goal, opts(new FakeLLM([]), { hooks: [thrower] }));
-    expect(out2).toMatchObject({ kind: 'aborted', reasons: [{ code: 'hookError', hookId: 'thrower' }] });
+    // It throws at every stage it sees: the abort at Enter and the failed Exit record are two exact reasons.
+    expect(out2).toMatchObject({
+      kind: 'aborted',
+      reasons: [
+        { code: 'hookError', hookId: 'thrower', reason: 'hook failed: hook thrower threw at Invoke/Enter: bug' },
+        { code: 'hookError', hookId: 'thrower', reason: 'hook failed: hook thrower threw at Invoke/Exit: bug' },
+      ],
+    });
     // without the abort, ReplaceOutput skips the model entirely
     const out3 = await invoke(goal, opts(new FakeLLM([]), { hooks: [replace] }));
     expect(out3).toMatchObject({ kind: 'returned', value: { summary: 'hijack' } });

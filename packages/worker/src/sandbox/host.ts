@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { appendFileSync } from 'node:fs';
 import { chown, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -33,6 +34,7 @@ import { SuspendExec, sandboxError, type SandboxCode } from './errors.js';
 import { FrameError, FrameReader, decodeFrame, scanDepth } from './frames.js';
 import { ExecHandleTable, HandleLimitError, HandleMint, VIEW_METHODS, isHandleRef, promoteStrings, type HandleEntry } from './handles.js';
 import { groupAlive, killTree, type KillTreeResult } from './killTree.js';
+import { LIMIT_KEYS, limitProblem } from './limits.js';
 import { quarantineWorktree, worktreeQuarantine } from './quarantine.js';
 import { assertSandboxSettings, assertScratchDir, buildChildProfile, resolveIsolation, type IsolationControl, type IsolationProbe, type ResolvedIsolation, type SandboxSettings } from './profile.js';
 
@@ -72,6 +74,19 @@ import { assertSandboxSettings, assertScratchDir, buildChildProfile, resolveIsol
  *    the supervisor-owned redactor first. Secret patterns are always redacted; known secrets via `redactor`.
  *  - A returned or checkpointed value never carries a dead handle: view handles of this exec are
  *    materialized into their values (bounded by `maxMaterializeChars`), tool handles become '[tool:<id>]'.
+ *
+ * Phases and what is recorded about an ending:
+ *  - An exec has a bounded STARTUP phase (spawn until the child's `hello`, `startupTimeoutMs`) and an
+ *    EXECUTION phase (the program's own budget, counted from `hello`), under one overall deadline of
+ *    startup bound + execution budget from the spawn. Wrapper and node startup, slow under host load, is
+ *    not charged to the program; a child that never says hello ends as 'startup-timeout', not as a timeout
+ *    of a program that never ran.
+ *  - Every exec carries `trace.settlement`: the exact cause it ended for, the phase it was in, whether a
+ *    kill signal was actually delivered, the child's exit status and monotonic times of spawn, hello,
+ *    program, result, exit, close and settlement. An exec that did not end with a program result also writes
+ *    one evidence record with that settlement: 'sandbox.kill' when the child was killed by the supervisor,
+ *    'sandbox.ended' when it was not (it exited by itself, or never existed). `trace.killed` is set only for
+ *    a real kill.
  */
 
 export interface SubInvokeRequest {
@@ -90,7 +105,8 @@ export interface CheckpointRecord {
 }
 
 export interface SandboxEvidence {
-  kind: 'isolation.degraded' | 'sandbox.violation' | 'sandbox.kill' | 'sandbox.env_dropped' | 'sandbox.outstanding' | 'sandbox.tainted' | 'sandbox.late_settle';
+  /** 'sandbox.kill': the supervisor killed the child. 'sandbox.ended': the exec ended without a result and without a kill. */
+  kind: 'isolation.degraded' | 'sandbox.violation' | 'sandbox.kill' | 'sandbox.ended' | 'sandbox.env_dropped' | 'sandbox.outstanding' | 'sandbox.tainted' | 'sandbox.late_settle';
   execNo?: number;
   body: Json;
 }
@@ -120,6 +136,11 @@ export interface ChildProcessReplOptions {
   maxPrintedBytes?: number;
   maxStderrBytes?: number;
   cancelGraceMs?: number;
+  /**
+   * Bound on the startup phase: from the spawn until the child says hello. Default 10 s. The program's
+   * execution budget starts at hello, so the overall deadline of an exec is this bound plus that budget.
+   */
+  startupTimeoutMs?: number;
   /** Bound on waiting for in-flight calls after termination. Default 5 s. */
   drainMs?: number;
   /** Bound on waiting for checkpoint/evidence sinks. Default 5 s. */
@@ -136,6 +157,85 @@ export interface ChildProcessReplOptions {
   testKillOverride?: (r: KillTreeResult) => KillTreeResult;
   /** Test seam: replace child_process.spawn (e.g. a scripted child). Never set in production. */
   testSpawn?: typeof spawn;
+}
+
+/**
+ * Diagnostic: when this names an absolute file, every exec that ends without a program result appends its
+ * (redacted) settlement there as one JSON line. Read once per REPL from the supervisor's environment; unset
+ * in normal operation. For finding out why an exec ended on a host where the ledger of the run is gone.
+ */
+export const SETTLE_LOG_ENV = 'TECERA_SANDBOX_SETTLE_LOG';
+
+/**
+ * Why an exec ended (its first settlement). One value per cause:
+ *  - 'result' | 'suspended': the program finished, or a call suspended it;
+ *  - 'startup-timeout': no hello within the startup bound (the child was still running);
+ *  - 'exit-before-hello': the child exited, by code or signal, before it said hello (hello never arrived);
+ *  - 'timeout': the program ran past its execution budget;
+ *  - 'exit-before-result': the child exited after hello without reporting a result;
+ *  - 'child-crash': the child reported a crash of its own harness; 'oom': it ran out of heap;
+ *  - 'cancel': the caller's signal aborted the exec;
+ *  - 'evidence-sink-rejected' | 'checkpoint-sink-rejected' | 'bridge-failed' | 'host-call-failed': a
+ *    supervisor callback threw or rejected (a HUNG sink is not a cause: it is found after the exec has
+ *    ended and is reported in `sinks.hung` and as a taint);
+ *  - 'spawn': the child could not be set up or started; 'frame': a supervisor frame could not be encoded;
+ *  - 'output-flood' | 'stderr-flood'; 'violation:<code>': the child broke the protocol or a limit (a frame
+ *    that is out of order, such as a late hello, is 'violation:E_FRAME');
+ *  - 'dispose' | 'disposed' | 'quarantined' | 'invalid-request' | 'invalid-program': ended or refused by the
+ *    REPL itself.
+ */
+export type SettleCause =
+  | 'result'
+  | 'suspended'
+  | 'startup-timeout'
+  | 'exit-before-hello'
+  | 'timeout'
+  | 'exit-before-result'
+  | 'child-crash'
+  | 'oom'
+  | 'cancel'
+  | 'evidence-sink-rejected'
+  | 'checkpoint-sink-rejected'
+  | 'bridge-failed'
+  | 'host-call-failed'
+  | 'spawn'
+  | 'frame'
+  | 'output-flood'
+  | 'stderr-flood'
+  | `violation:${string}`
+  | 'dispose'
+  | 'disposed'
+  | 'quarantined'
+  | 'invalid-request'
+  | 'invalid-program';
+
+/** How one exec ended, on `ExecTrace.settlement` and in the 'sandbox.kill' / 'sandbox.ended' evidence. */
+export interface ExecSettlement {
+  cause: SettleCause;
+  /** Where the exec was when it ended: before a child existed, waiting for hello, or running the program. */
+  phase: 'setup' | 'startup' | 'execution';
+  /** The message of the ending (redacted, bounded). Absent for 'result'. */
+  detail?: string;
+  /** The supervisor delivered a kill signal to a child that had not exited by itself. */
+  killed: boolean;
+  /** A kill signal reached the process group at all (also true when only leftovers of an exited child were swept). */
+  signalSent: boolean;
+  /** The process group is gone. */
+  gone: boolean;
+  exit?: { code: number | null; signal: string | null };
+  /** The bounds in force, in ms: startup, execution, and their sum from the spawn. */
+  limits: { startupMs: number; execMs: number; deadlineMs: number };
+  /** Monotonic ms since the exec began; a key is absent when that never happened. */
+  at: { spawn?: number; hello?: number; program?: number; result?: number; exit?: number; close?: number; settle?: number; kill?: number };
+  /** How long the drain of in-flight calls and the wait for sinks took, in ms. */
+  drainMs?: number;
+  sinksMs?: number;
+  /** Sinks that rejected, and sinks still open at the sink bound (ids as in TaintReport.outstanding). */
+  sinks?: { rejected: string[]; hung: string[] };
+  /** Bytes the child wrote to stdout after the exec had ended (dropped unread). */
+  lateStdoutBytes?: number;
+  /** End of the child's stderr (redacted) when it did not end with a result. */
+  stderrTail?: string;
 }
 
 export interface CallTrace {
@@ -157,7 +257,10 @@ export interface ExecTrace {
   checkpoints: string[];
   handles: number;
   violations: Array<{ code: string; message: string }>;
+  /** Set only when the supervisor actually killed the child (a signal was delivered and ended it). */
   killed?: { cause: string; gone: boolean };
+  /** How the exec ended: exact cause, phase, signal delivery, exit status and times. Set by the finalizer. */
+  settlement?: ExecSettlement;
   /** In-flight calls when the program finished, and calls that did not terminate within drainMs. */
   outstanding?: { atResult: number; abandoned: number };
   /** Set when the exec left something unresolved (see TaintReport). */
@@ -219,6 +322,8 @@ interface UnresolvedOp {
 /** What an exec session reports to its REPL. Resolves true when the taint evidence was recorded. */
 interface SessionOwner {
   taint(report: TaintReport, ops: UnresolvedOp[]): Promise<boolean>;
+  /** Called once per exec with its (redacted) settlement, right before the exec reports. */
+  settled(execNo: number, s: ExecSettlement): void;
 }
 
 /** ToolBridge with the exec's cancellation signal (proposed contracts change: ToolBridge gains `signal?`). */
@@ -228,7 +333,6 @@ const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/;
 const METHOD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 const HOST_NAMES = new Set(['invoke', 'checkpoint', 'console']);
 const RESERVED_TOOLS = new Set<string>(Object.values(HOST_FUNCTIONS));
-const LIMIT_KEYS: ReadonlyArray<keyof Limits> = ['usd', 'tokens', 'calls', 'wallMs', 'depth', 'iterations'];
 const VIEW_DESCRIPTION = 'large value served by the supervisor: len(), slice(start, end), search(text)';
 const MAX_SEARCH_HITS = 100;
 const CHILD_VIOLATION_CODES = new Set(['E_LIMIT', 'E_FRAME', 'E_HANDLE']);
@@ -294,7 +398,8 @@ export class ChildProcessRepl implements Repl {
   /** Process groups that survived SIGKILL. */
   private readonly survivors = new Set<number>();
   private taintReport: TaintReport | undefined;
-  private readonly owner: SessionOwner = { taint: (r, ops) => this.onTaint(r, ops) };
+  private readonly settleLog: string | undefined;
+  private readonly owner: SessionOwner = { taint: (r, ops) => this.onTaint(r, ops), settled: (execNo, s) => this.onSettled(execNo, s) };
 
   constructor(private readonly opts: ChildProcessReplOptions) {
     assertSandboxSettings(opts.sandbox);
@@ -302,6 +407,18 @@ export class ChildProcessRepl implements Repl {
     this.mint = new HandleMint(opts.runId, opts.handleKey);
     this.redactor = opts.redactor ?? makeRedactor([]);
     assertScratchDir(opts.tmpRoot ?? tmpdir());
+    const log = process.env[SETTLE_LOG_ENV];
+    this.settleLog = typeof log === 'string' && log.startsWith('/') ? log : undefined;
+  }
+
+  /** Diagnostic settle log (SETTLE_LOG_ENV): best effort, never affects the exec. */
+  private onSettled(execNo: number, s: ExecSettlement): void {
+    if (!this.settleLog || s.cause === 'result') return;
+    try {
+      appendFileSync(this.settleLog, `${JSON.stringify({ at: new Date().toISOString(), pid: process.pid, runId: this.opts.runId, execNo, ...(this.opts.worktree ? { worktree: this.opts.worktree } : {}), settlement: s })}\n`);
+    } catch {
+      /* diagnostics only */
+    }
   }
 
   get degraded(): { reason: string; missing: IsolationControl[] } | undefined {
@@ -320,7 +437,7 @@ export class ChildProcessRepl implements Repl {
 
   private onTaint(report: TaintReport, ops: UnresolvedOp[]): Promise<boolean> {
     if (!this.taintReport) this.taintReport = { reason: report.reason, outstanding: [], processes: [] };
-    if (this.opts.worktree) quarantineWorktree(this.opts.worktree, { source: 'repl', reason: report.reason, outstanding: [...report.outstanding], processes: [...report.processes] });
+    if (this.opts.worktree) quarantineWorktree(this.opts.worktree, { source: 'repl', reason: report.reason, outstanding: [...report.outstanding], processes: [...report.processes], origin: `run ${this.opts.runId}${ops[0] ? ` exec ${ops[0].execNo}` : ''}` });
     for (const g of report.processes) this.survivors.add(g);
     for (const op of ops) {
       if (this.unresolved.has(op.id)) continue;
@@ -370,7 +487,8 @@ export class ChildProcessRepl implements Repl {
     // A fresh REPL on a worktree an earlier REPL or verify run left tainted refuses too.
     const wt = worktreeQuarantine(this.opts.worktree);
     if (wt) {
-      const out = await session.refuse('E_TAINTED', `worktree quarantined: ${wt.source} work on it was left unresolved (${wt.reason}); the supervisor must prove it settled and re-check the tree first`, 'quarantined');
+      const where = wt.matched && wt.matched.relation !== 'same' ? ` (recorded for ${wt.matched.path}, ${wt.matched.relation === 'ancestor' ? 'which contains this worktree' : 'inside this worktree'})` : '';
+      const out = await session.refuse('E_TAINTED', `worktree quarantined: ${wt.source} work on it was left unresolved${wt.origin ? ` by ${wt.origin}` : ''} (${wt.reason})${where}; the supervisor must prove it settled and re-check the tree first`, 'quarantined');
       const report: TaintReport = { reason: wt.reason, outstanding: [...wt.outstanding], processes: [...wt.processes] };
       return { ...out, tainted: report, trace: { ...out.trace, tainted: report } };
     }
@@ -445,12 +563,21 @@ function emptyTrace(execNo: number, isolation: ResolvedIsolation): ExecTrace {
   };
 }
 
-type SettleCause = 'result' | 'suspended' | string;
+const monotonic = (): number => performance.now();
 
 class ExecSession {
   private readonly table: ExecHandleTable;
   private readonly ac = new AbortController();
   private readonly started = Date.now();
+  private readonly t0 = monotonic();
+  /** Monotonic ms since t0 of each lifecycle point, written once. */
+  private readonly at: ExecSettlement['at'] = {};
+  private phase: ExecSettlement['phase'] = 'setup';
+  private startupTimer: NodeJS.Timeout | undefined;
+  private execLimitMs = 0;
+  private settleDetail: string | undefined;
+  private lateStdoutBytes = 0;
+  private readonly rejectedSinks: string[] = [];
   private readonly trace: ExecTrace;
   private readonly sinks = new Map<Promise<void>, string>();
   private readonly inflight = new Map<number, { id: string; kind: 'call' | 'invoke'; label: string; p: Promise<void> }>();
@@ -483,6 +610,7 @@ class ExecSession {
   private readonly drainMs: number;
   private readonly sinkTimeoutMs: number;
   private readonly maxMaterialize: number;
+  private readonly startupMs: number;
   private readonly onAbort = () => this.cancel();
 
   constructor(
@@ -501,6 +629,7 @@ class ExecSession {
     this.drainMs = opts.drainMs ?? 5_000;
     this.sinkTimeoutMs = opts.sinkTimeoutMs ?? 5_000;
     this.maxMaterialize = opts.maxMaterializeChars ?? 4 * 1024 * 1024;
+    this.startupMs = opts.startupTimeoutMs !== undefined && opts.startupTimeoutMs > 0 ? opts.startupTimeoutMs : 10_000;
     this.trace = emptyTrace(req.execNo, isolation);
   }
 
@@ -514,25 +643,35 @@ class ExecSession {
       Promise.resolve().then(() => sink(safe)),
       `evidence sink failed (${e.kind})`,
       `evidence:${e.kind}`,
+      'evidence-sink-rejected',
     );
   }
 
-  private trackSink(work: Promise<unknown>, what: string, label: string): Promise<void> {
+  private trackSink(work: Promise<unknown>, what: string, label: string, cause: SettleCause): Promise<void> {
+    const id = `x${this.req.execNo}-sink:${label}#${++this.sinkSeq}`;
     const p: Promise<void> = work.then(
       () => undefined,
-      (err: unknown) => this.handlerFailed(`${what}: ${errMessage(err)}`),
+      (err: unknown) => {
+        this.rejectedSinks.push(id);
+        this.handlerFailed(`${what}: ${errMessage(err)}`, cause);
+      },
     );
-    this.sinks.set(p, `x${this.req.execNo}-sink:${label}#${++this.sinkSeq}`);
+    this.sinks.set(p, id);
     void p.finally(() => this.sinks.delete(p));
     return p;
   }
 
   /** Any callback failure terminates the exec as a raise (or is recorded when it is already finishing). */
-  private handlerFailed(message: string): void {
+  private handlerFailed(message: string, cause: SettleCause): void {
     const m = this.redactor.redactText(message, { maxChars: 2000 });
     this.trace.handlerFailures.push(m);
     if (!this.handlerFailure) this.handlerFailure = m;
-    this.stop('E_INTERNAL', m, 'handler-failure');
+    this.stop('E_INTERNAL', m, cause);
+  }
+
+  /** Record the monotonic time of a lifecycle point, once. */
+  private mark(k: keyof ExecSettlement['at']): void {
+    if (this.at[k] === undefined) this.at[k] = Math.round(monotonic() - this.t0);
   }
 
   /** Host call id for the call accepted as number `seq` of this exec. */
@@ -545,7 +684,7 @@ class ExecSession {
       .then(work)
       .then(
         () => undefined,
-        (err: unknown) => this.handlerFailed(`host call handler failed: ${errMessage(err)}`),
+        (err: unknown) => this.handlerFailed(`host call handler failed: ${errMessage(err)}`, 'host-call-failed'),
       )
       .finally(() => this.inflight.delete(seq));
     this.inflight.set(seq, { id: this.callId(seq), kind, label, p });
@@ -561,13 +700,13 @@ class ExecSession {
    * exit: sinks already started (e.g. degraded-isolation evidence) are awaited, bounded, and anything
    * still open taints the exec and stays in the REPL's quarantine registry. Never a shortcut return.
    */
-  refuse(code: SandboxCode, message: string, cause: string): Promise<ExecOutput> {
+  refuse(code: SandboxCode, message: string, cause: SettleCause): Promise<ExecOutput> {
     this.stop(code, message, cause);
     return this.done;
   }
 
   /** Public termination (dispose). The exec's run() promise settles after drain and cleanup. */
-  terminate(code: SandboxCode, message: string, cause: string): void {
+  terminate(code: SandboxCode, message: string, cause: SettleCause): void {
     this.stop(code, message, cause);
   }
 
@@ -610,8 +749,16 @@ class ExecSession {
         this.stop('E_CANCELLED', 'cancelled before start', 'cancel');
         return await this.done;
       }
+      this.execLimitMs = limitMs;
       this.spawnChild(profile.command, profile.args, profile.spawnOptions);
-      this.timers.push(setTimeout(() => this.stop('E_TIMEOUT', `exec exceeded ${limitMs} ms wall clock; process group killed`, 'timeout'), limitMs));
+      this.mark('spawn');
+      this.phase = 'startup';
+      // Startup is bounded on its own: the execution budget starts when the child says hello (onLine).
+      this.startupTimer = setTimeout(
+        () => this.stop('E_TIMEOUT', `sandbox child did not start within ${this.startupMs} ms (no hello); process group killed. The program did not run`, 'startup-timeout'),
+        this.startupMs,
+      );
+      this.timers.push(this.startupTimer);
       return await this.done;
     } catch (e) {
       // Setup failures (scratch, profile, env, spawn) become a named raise; never a rejection.
@@ -700,11 +847,18 @@ class ExecSession {
       (line) => this.onLine(line),
       (e) => this.violation(e.code, e.message),
     );
-    child.stdout?.on('data', (c: Buffer) => this.reader?.push(c));
+    child.stdout?.on('data', (c: Buffer) => {
+      // After the exec has ended nothing is read any more; what still arrives is counted, not parsed.
+      if (this.finished) this.lateStdoutBytes += c.length;
+      else this.reader?.push(c);
+    });
     child.stderr?.on('data', (c: Buffer) => this.onStderr(c));
     // The exit status is recorded at 'exit'. finalize() waits for 'exit' (waitExit, killTree), not for
     // 'close', which comes only after the stdio pipes have drained and may be later than the report.
-    child.once('exit', (code, sig) => this.recordExit(code, sig));
+    child.once('exit', (code, sig) => {
+      this.mark('exit');
+      this.recordExit(code, sig);
+    });
     child.on('close', (code, sig) => this.onClose(code, sig));
   }
 
@@ -729,6 +883,7 @@ class ExecSession {
   }
 
   private onClose(code: number | null, sig: NodeJS.Signals | null): void {
+    this.mark('close');
     this.recordExit(code, sig);
     if (this.finished) return;
     if (this.cancelRequested) return this.stop('E_CANCELLED', 'exec cancelled', 'cancel');
@@ -739,7 +894,9 @@ class ExecSession {
     // Redact the whole stderr first, then take the tail: a cut never splits a secret. The child died on its
     // own, possibly mid-write: its trailing token is uncertain (interrupted) and is suppressed.
     const tail = redactCapped(this.redactor, err, Number.MAX_SAFE_INTEGER, { interrupted: true }).text.slice(-500).trim();
-    this.stop('E_CRASH', `child exited (code=${code}, signal=${sig}) before returning a result${tail ? `: ${tail}` : ''}`, 'crash');
+    // A child that never said hello never received the program: the wrapper or node itself failed to start.
+    if (!this.helloSeen) return this.stop('E_CRASH', `sandbox child exited (code=${code}, signal=${sig}) before it started (no hello)${tail ? `: ${tail}` : ''}. The program did not run`, 'exit-before-hello');
+    this.stop('E_CRASH', `child exited (code=${code}, signal=${sig}) before returning a result${tail ? `: ${tail}` : ''}`, 'exit-before-result');
   }
 
   /** Encode and write a frame. A reply that cannot be framed (size, depth, serialization) becomes an error frame. */
@@ -780,7 +937,15 @@ class ExecSession {
     if (!this.helloSeen) {
       if (f.t !== 'hello') return this.violation('E_FRAME', `expected hello, got ${f.t}`);
       this.helloSeen = true;
+      this.mark('hello');
+      if (this.startupTimer) clearTimeout(this.startupTimer);
+      this.phase = 'execution';
       this.child?.stdin?.write(this.programLine + '\n');
+      this.mark('program');
+      // The execution budget counts from here. Hello arrived inside the startup bound, so this timer ends no
+      // later than the overall deadline (startup bound + execution budget from the spawn).
+      const limitMs = this.execLimitMs;
+      this.timers.push(setTimeout(() => this.stop('E_TIMEOUT', `exec exceeded ${limitMs} ms wall clock; process group killed`, 'timeout'), limitMs));
       return;
     }
     switch (f.t) {
@@ -804,11 +969,12 @@ class ExecSession {
       case 'result':
         if (f.execNo !== this.req.execNo) return this.violation('E_FRAME', `result for exec ${f.execNo}, expected ${this.req.execNo}`);
         this.outstandingAtResult = this.inflight.size;
+        this.mark('result');
         return this.settle(f.result, 'result');
       case 'crash': {
         const msg = this.boundedText(String(f.error.message), 2000, CHILD_LIMITS.crashChars);
         if (CHILD_VIOLATION_CODES.has(f.error.name)) return this.violation(f.error.name as SandboxCode, `child latched a limit violation: ${msg}`);
-        return this.stop('E_CRASH', `child crashed: ${this.redactor.redactText(String(f.error.name), { maxChars: 200 })}: ${msg}`, 'crash');
+        return this.stop('E_CRASH', `child crashed: ${this.redactor.redactText(String(f.error.name), { maxChars: 200 })}: ${msg}`, 'child-crash');
       }
     }
   }
@@ -856,7 +1022,7 @@ class ExecSession {
       if (e instanceof SuspendExec) return this.suspend(e.pending);
       // A throwing bridge is a supervisor fault (ledger, broker), not a tool failure: terminate.
       this.trace.calls.push({ callId: request.callId, tool: entry.tool, method: f.method, ok: false, code: 'E_INTERNAL' });
-      return this.handlerFailed(`tool bridge failed on ${entry.tool}.${f.method}: ${errMessage(e)}`);
+      return this.handlerFailed(`tool bridge failed on ${entry.tool}.${f.method}: ${errMessage(e)}`, 'bridge-failed');
     }
     if (this.finished) return;
     // Everything below handles untrusted, possibly huge or deep data: any failure is an E_TOOL reply.
@@ -990,13 +1156,23 @@ class ExecSession {
     }
     const limits: Partial<Limits> = {};
     for (const [k, v] of Object.entries(f.narrow?.limits ?? {})) {
-      if (!LIMIT_KEYS.includes(k as keyof Limits) || typeof v !== 'number') {
+      // Unknown names, and values that are not finite, negative or (for a count) fractional: refused, never clamped.
+      const why = limitProblem(k, v);
+      if (why) {
         this.trace.invokes.push({ callId: f.callId, ok: false, tools: requestedTools ?? [], code: 'E_DENIED' });
-        return this.violation('E_DENIED', `sub-invoke requested unknown limit ${k}`);
+        return this.violation('E_DENIED', LIMIT_KEYS.includes(k as keyof Limits) ? `sub-invoke requested an invalid limit: ${why}` : `sub-invoke requested unknown limit ${k}`);
       }
-      limits[k as keyof Limits] = v;
+      limits[k as keyof Limits] = v as number;
     }
-    if (f.narrow?.depth !== undefined) limits.depth = f.narrow.depth;
+    if (f.narrow?.depth !== undefined) {
+      const why = limitProblem('depth', f.narrow.depth);
+      if (why) {
+        this.trace.invokes.push({ callId: f.callId, ok: false, tools: requestedTools ?? [], code: 'E_DENIED' });
+        return this.violation('E_DENIED', `sub-invoke requested an invalid limit: ${why}`);
+      }
+      // `narrow.depth` and `narrow.limits.depth` name the same ceiling: the smaller one applies.
+      limits.depth = Math.min(limits.depth ?? Infinity, f.narrow.depth);
+    }
     const requested: Partial<CapabilitySet> = { ...(requestedTools ? { tools: requestedTools } : {}), ...(Object.keys(limits).length ? { limits: limits as Limits } : {}) };
     if (widens(parent, requested)) {
       const extra = (requestedTools ?? []).filter((t) => !parent.tools.includes(t));
@@ -1044,7 +1220,7 @@ class ExecSession {
     const rec: CheckpointRecord = { execNo: this.req.execNo, key: f.key, value };
     const prev = this.checkpointChain;
     const work = prev.then(() => (this.handlerFailure ? undefined : sink(rec)));
-    this.checkpointChain = this.trackSink(work, `checkpoint sink failed (${f.key})`, `checkpoint:${f.key}`);
+    this.checkpointChain = this.trackSink(work, `checkpoint sink failed (${f.key})`, `checkpoint:${f.key}`, 'checkpoint-sink-rejected');
   }
 
   private onLog(text: string): void {
@@ -1103,13 +1279,15 @@ class ExecSession {
     this.timers.push(setTimeout(() => this.stop('E_CANCELLED', 'exec cancelled; grace expired, process group killed', 'cancel'), this.opts.cancelGraceMs ?? 500));
   }
 
-  private stop(code: SandboxCode, message: string, cause: string): void {
+  private stop(code: SandboxCode, message: string, cause: SettleCause): void {
+    if (!this.finished) this.settleDetail = `${code}: ${message}`;
     this.settle({ kind: 'raise', exception: sandboxError(code, message) }, cause);
   }
 
   private settle(result: ExecResult, cause: SettleCause): void {
     if (this.finished) return;
     this.finished = true;
+    this.mark('settle');
     this.ac.abort();
     for (const t of this.timers) clearTimeout(t);
     this.reader?.stop();
@@ -1129,21 +1307,49 @@ class ExecSession {
     let out: ExecResult = result;
     const child = this.child;
     let gone = true;
+    let signalSent = false;
+    let killed = false;
     if (child?.pid) {
       // A child that delivered its result exits on its own; give it a moment so the trace shows a clean exit.
       if (cause === 'result' && child.exitCode === null && child.signalCode === null) await waitExit(child, 250);
       const k0 = await killTree(child.pid, { child }).catch((): KillTreeResult => ({ gone: false, signalled: false }));
       const k = this.opts.testKillOverride ? this.opts.testKillOverride(k0) : k0;
       gone = k.gone;
+      signalSent = k.signalled;
+      if (signalSent) this.mark('kill');
       // A child that has exited by now has its status in the trace before the trace is reported.
       this.recordExit(child.exitCode, child.signalCode);
-      if (cause !== 'result') {
-        this.trace.killed = { cause, gone: k.gone };
-        this.evidence({ kind: 'sandbox.kill', execNo: this.req.execNo, body: { cause, gone: k.gone } });
-      }
+      // A kill happened when the signal reached a child that had not already exited by itself: one that
+      // exited with a code of its own was only swept (the signal found, at most, its unreaped remains).
+      killed = signalSent && (this.trace.exit === undefined || this.trace.exit.signal !== null);
+      if (cause !== 'result' && killed) this.trace.killed = { cause, gone: k.gone };
+    }
+    const tail = cause === 'result' || !this.stderrBytes ? '' : redactCapped(this.redactor, Buffer.concat(this.stderr).toString('utf8'), Number.MAX_SAFE_INTEGER, { interrupted: true }).text.slice(-500).trim();
+    const settlement: ExecSettlement = {
+      cause,
+      phase: this.phase,
+      ...(cause !== 'result' && this.settleDetail ? { detail: this.redactor.redactText(this.settleDetail, { maxChars: 1000 }) } : {}),
+      killed: cause !== 'result' && killed,
+      signalSent,
+      gone,
+      ...(this.trace.exit ? { exit: { ...this.trace.exit } } : {}),
+      limits: { startupMs: this.startupMs, execMs: this.execLimitMs, deadlineMs: this.startupMs + this.execLimitMs },
+      at: this.at,
+      ...(tail ? { stderrTail: tail } : {}),
+    };
+    this.trace.settlement = settlement;
+    // One record per exec that ended without a program result, named for what happened: a kill, or not.
+    if (cause !== 'result') {
+      this.evidence({
+        kind: settlement.killed ? 'sandbox.kill' : 'sandbox.ended',
+        execNo: this.req.execNo,
+        body: { cause, gone, signalled: settlement.killed, signalSent, phase: settlement.phase, ...(settlement.detail ? { detail: settlement.detail } : {}), ...(settlement.exit ? { exit: settlement.exit } : {}), limits: settlement.limits, at: { ...this.at }, ...(tail ? { stderrTail: tail } : {}) },
+      });
     }
     // Drain: no exec settles while a bridge call or sub-invoke is still running.
+    const drainFrom = monotonic();
     const drained = await within(Promise.allSettled([...this.inflight.values()].map((x) => x.p)), this.drainMs);
+    settlement.drainMs = Math.round(monotonic() - drainFrom);
     const abandonedCalls = drained ? [] : [...this.inflight.values()];
     const abandoned = abandonedCalls.length;
     if (this.outstandingAtResult || abandoned) {
@@ -1151,13 +1357,17 @@ class ExecSession {
       this.evidence({ kind: 'sandbox.outstanding', execNo: this.req.execNo, body: { atResult: this.outstandingAtResult, abandoned, ids: abandonedCalls.map((x) => x.id) } });
     }
     // Sinks (checkpoints, evidence including the kill/outstanding records above), bounded.
+    const sinksFrom = monotonic();
     const sinksDone = await within(Promise.allSettled([this.checkpointChain, ...this.sinks.keys()]), this.sinkTimeoutMs);
+    settlement.sinksMs = Math.round(monotonic() - sinksFrom);
     const openSinks = sinksDone ? [] : [...this.sinks.entries()];
     if (!sinksDone) {
       const m = `checkpoint/evidence sink did not settle within ${this.sinkTimeoutMs} ms`;
       this.trace.handlerFailures.push(m);
       if (!this.handlerFailure) this.handlerFailure = m;
     }
+    if (this.rejectedSinks.length || openSinks.length) settlement.sinks = { rejected: [...this.rejectedSinks], hung: openSinks.map(([, id]) => id) };
+    if (this.lateStdoutBytes) settlement.lateStdoutBytes = this.lateStdoutBytes;
 
     // Taint: anything still unresolved now may still be writing. The REPL takes over tracking it.
     let tainted: TaintReport | undefined;
@@ -1213,6 +1423,7 @@ class ExecSession {
     this.trace.durationMs = Date.now() - this.started;
     this.table.clear();
     const trace = this.redactor.redactJson(this.trace) as unknown as ExecTrace;
+    if (trace.settlement) this.owner.settled(this.req.execNo, trace.settlement);
     this.resolveDone({ ...out, printed, trace, ...(tainted ? { tainted: { reason: tainted.reason, outstanding: [...tainted.outstanding], processes: [...tainted.processes], recorded: tainted.recorded === true } } : {}) });
   }
 

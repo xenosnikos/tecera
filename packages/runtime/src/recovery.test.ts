@@ -35,7 +35,8 @@ const PKG = resolve(HERE, '..');
 const REPO = resolve(HERE, '../../..');
 const SAMPLE = join(REPO, 'samples/fix-failing-test');
 const FIXTURES = resolve(HERE, '../test-fixtures/fix-failing-test');
-const LEASE_TTL_MS = 1500;
+// long enough that a stalled event loop under load does not lose the lease by itself; the tests wait it out
+const LEASE_TTL_MS = 4000;
 
 const temps: string[] = [];
 const orphans: number[] = [];
@@ -78,12 +79,21 @@ function git(dir: string, ...args: string[]): string {
   return execFileSync('git', ['-C', dir, '-c', 'user.email=t@example.com', '-c', 'user.name=t', '-c', 'core.hooksPath=/dev/null', ...args], { env: { PATH: process.env.PATH ?? '', HOME: dir, GIT_CONFIG_GLOBAL: '/dev/null' } }).toString('utf8');
 }
 
+/**
+ * The human decision commands refuse without a terminal (decisionGuard.ts). This suite makes them as the local
+ * human from a test process: the explicit opt-out, on those commands only, never on `tecera run`.
+ */
+const humanEnv = (argv: readonly string[]): Record<string, string> =>
+  argv[0] === 'approve' || argv[0] === 'deny' || (argv[0] === 'criteria' && (argv[1] === 'accept' || argv[1] === 'amend')) || (argv[0] === 'resources' && (argv[1] === 'release' || argv[1] === 'transfer')) || ((argv[0] === 'plans' || argv[0] === 'memory') && ['graduate', 'reject', 'retract'].includes(argv[1] ?? ''))
+    ? { TECERA_DECISION_NONINTERACTIVE: '1' }
+    : {};
+
 let idn = 0;
 async function cli(cwd: string, argv: string[], opts: MainOptions = {}): Promise<{ code: number; out: string; err: string }> {
   let out = '';
   let err = '';
   const { env: extraEnv, ...rest } = opts;
-  const code = await main(argv, { cwd, env: { ...ENV, ...(extraEnv ?? {}) }, stdout: (s) => (out += s), stderr: (s) => (err += s), isTTY: false, ids: (p) => `${p}_c${++idn}`, ...rest });
+  const code = await main(argv, { cwd, env: { ...ENV, ...humanEnv(argv), ...(extraEnv ?? {}) }, stdout: (s) => (out += s), stderr: (s) => (err += s), isTTY: false, ids: (p) => `${p}_c${++idn}`, ...rest });
   return { code, out, err };
 }
 

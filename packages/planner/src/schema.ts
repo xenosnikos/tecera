@@ -43,6 +43,12 @@ export const StepDocSchema = z
     output: jsonObject.optional(),
     /** Per-step narrowing of permissions.tools (worker steps only). Absent = the plan's tools. */
     tools: unique(z.array(toolName).max(32), 'tools').optional(),
+    /** The paths this worker step may create, modify or delete: a subset of the accepted envelope. Absent = all of it. */
+    changes: z
+      .array(z.object({ path: z.string().min(1).max(400), ops: z.array(z.enum(['create', 'modify', 'delete'])).min(1).max(3) }).strict())
+      .min(1)
+      .max(200)
+      .optional(),
   })
   .strict();
 
@@ -119,6 +125,12 @@ export const PLAN_DOCUMENT_JSON_SCHEMA: JsonObject = {
           inputs: anyJsonObject,
           output: anyJsonObject,
           tools: nameList(32, NAME_RE.source),
+          changes: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 200,
+            items: { type: 'object', additionalProperties: false, required: ['path', 'ops'], properties: { path: str({ minLength: 1, maxLength: 400 }), ops: { type: 'array', minItems: 1, maxItems: 3, items: { type: 'string', enum: ['create', 'modify', 'delete'] } } } },
+          },
         },
       },
     },
@@ -213,6 +225,10 @@ export const PLAN_WIRE_JSON_SCHEMA: JsonObject = wClosed({
       inputsJson: wNullable(wStr(), 'Step inputs as JSON object text (e.g. "{\"path\":\"src/a.js\"}"), or null for none.'),
       outputJson: wNullable(wStr(), 'Worker steps: the JSON schema of the return value as JSON object text, or null.'),
       tools: wNullable(wStrings(), 'Worker steps: a subset of permissions.tools to narrow to, or null for the plan tools.'),
+      changes: wNullable(
+        { type: 'array', items: wClosed({ path: wStr('A path or narrow glob inside the accepted change-path envelope.'), ops: { type: 'array', items: { type: 'string', enum: ['create', 'modify', 'delete'] } } }) },
+        'Worker steps that write: the paths this step may create, modify or delete, a subset of the accepted envelope. Null for the whole envelope, and for steps that do not write.',
+      ),
     }),
   },
   allowedModels: {
@@ -253,6 +269,7 @@ const WireStepSchema = z
     inputsJson: wireJson,
     outputJson: wireJson,
     tools: z.array(z.string().max(128)).max(64).nullish(),
+    changes: z.array(z.object({ path: z.string().max(400), ops: z.array(z.string().max(16)).max(3) }).strict()).max(200).nullish(),
   })
   .strict();
 const wireInt = z.number().nullish();
@@ -311,6 +328,7 @@ export function wireToDocument(v: unknown): { ok: true; doc: Record<string, unkn
       step['inputs'] = s.inputsJson != null ? json(s.inputsJson, `steps.${i}.inputsJson`, true) : {};
       if (s.outputJson != null) step['output'] = json(s.outputJson, `steps.${i}.outputJson`, true);
       if (s.tools != null) step['tools'] = [...s.tools];
+      if (s.changes != null && s.changes.length) step['changes'] = s.changes.map((c) => ({ path: c.path, ops: [...c.ops] }));
       return step;
     });
     const allowedModels: Record<string, unknown> = {};
@@ -383,6 +401,7 @@ export function toPlan(
     if (s.output !== undefined) step.output = s.output;
     if (s.instruction !== undefined) step.instruction = s.instruction;
     if (s.tools !== undefined) step.tools = [...s.tools];
+    if (s.changes !== undefined) step.changes = s.changes.map((c) => ({ path: c.path, ops: [...c.ops] }));
     return step;
   });
   const context: BeliefPattern[] = doc.context.map((c) => {

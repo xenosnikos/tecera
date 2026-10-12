@@ -9,7 +9,7 @@ export { DEFAULT_CONTRACT_GLOBS, criterionTargets, criterionScriptDirs, packageS
 export type { ContractGuard, CriterionTargets, PackageScripts } from './contractTamper.js';
 export { parseVerdict, extractClaudeResult, extractCodexResult } from './verdict.js';
 export type { Verdict } from './verdict.js';
-export { validatePlan, contractPlanProblems, deliveryChainProblems, DELIVERY_CHAIN, PR_APPROVALS } from './validatePlan.js';
+export { validatePlan, contractPlanProblems, deliveryChainProblems, stepChangesProblems, DELIVERY_CHAIN, PR_APPROVALS } from './validatePlan.js';
 export { stopDecision, stopDecisionForRuns, activeRunsOf, heldByOpenApprovals, evaluateStopEvents, evaluateStopLedger, RESUMABLE_EXIT_CODES } from './stop.js';
 export type { ActiveRunRef, StopRunCheck, StopEvaluation } from './stop.js';
 export type { PlanValidationOptions } from './validatePlan.js';

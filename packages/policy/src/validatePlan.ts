@@ -1,6 +1,6 @@
-import { contractHash, contractProblem, isWritingStep, resolveGap, type AchievementGoal, type Criterion, type Budget, type CapabilityRecord, type Manifest, type Plan, type PlanningContext, type ProvisioningAllowance, type Step } from '@tecera/contracts';
+import { changeWithin, contractHash, contractProblem, envelopeProblem, isWritingStep, resolveGap, type AchievementGoal, type ChangePath, type Criterion, type Budget, type CapabilityRecord, type Manifest, type Plan, type PlanningContext, type ProvisioningAllowance, type Step } from '@tecera/contracts';
 import { writesWithin } from './diffBoundary.js';
-import { matchesAny } from './glob.js';
+import { globWithin, matchesAny, matchesProtected } from './glob.js';
 import { APPROVAL_ONLY_ACTIONS, OBSOLETE_WRITE_APPROVALS, PR_GATE_ACTIONS, classify, type PermissionsDoc } from './permissions.js';
 import { allowanceOf } from './provisioning.js';
 
@@ -74,6 +74,38 @@ export function validatePlan(plan: Plan, m: Manifest, opts: PlanValidationOption
   }
   if (kinds.has('subgoal')) errors.push('subgoal steps are not supported yet');
   errors.push(...contractPlanProblems(plan, m, opts.context, opts.goal));
+  errors.push(...stepChangesProblems(plan, m, opts.context?.contract?.envelope));
+  return errors;
+}
+
+/**
+ * A step's declared change paths (step.changes) may only narrow: every entry must lie inside the accepted
+ * contract's envelope or, when the contract states none, inside repo.allowedChanges; never on a protected
+ * path; and only a step that can write declares any. A plan cannot give itself a path the requestor did
+ * not sign off: widening the envelope takes an amendment of the contract.
+ */
+export function stepChangesProblems(plan: Plan, m: Manifest, envelope?: readonly ChangePath[]): string[] {
+  const errors: string[] = [];
+  for (const s of plan.steps) {
+    if (s.changes === undefined) continue;
+    const shape = envelopeProblem(s.changes);
+    if (shape) {
+      errors.push(`step ${s.id} changes: ${shape}`);
+      continue;
+    }
+    if (!isWritingStep(plan, s)) errors.push(`step ${s.id} declares changes but has no tool that writes`);
+    for (const e of s.changes) {
+      const prot = matchesProtected(e.path, m.policy.protectedPaths);
+      if (prot) errors.push(`step ${s.id} changes: ${e.path} is a protected path (${prot})`);
+      if (envelope) {
+        const why = changeWithin(e, envelope);
+        if (why) errors.push(`step ${s.id} changes: ${why}; a plan can narrow the envelope, only an amended contract can widen it`);
+      } else {
+        const inside = e.path.includes('*') ? m.repo.allowedChanges.some((a) => globWithin(e.path, a)) : matchesAny(e.path, m.repo.allowedChanges) !== null;
+        if (!inside) errors.push(`step ${s.id} changes: ${e.path} is outside allowedChanges`);
+      }
+    }
+  }
   return errors;
 }
 

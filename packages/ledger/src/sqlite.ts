@@ -31,6 +31,23 @@ import { SCHEMA_POST_SQL, SCHEMA_SQL } from './schema.js';
 type Row = Record<string, unknown>;
 
 /**
+ * Where a test may hold a write transaction open: right after its write lock is taken, before the row it
+ * decides on is read ('<op>:locked'), and inside approve() between the audit event and the grant
+ * ('approve:audited').
+ */
+export type LedgerBarrierPoint = 'reserve:locked' | 'approve:locked' | 'approve:audited' | 'consume:locked' | 'lease:locked' | 'renew:locked' | 'release:locked';
+
+export interface SqliteLedgerOptions {
+  /** Clock for lease times and checkpoint stamps. Default Date.now. */
+  now?: () => number;
+  /**
+   * Test seam: called synchronously inside the write transaction at each LedgerBarrierPoint, so a test can
+   * hold one connection inside its critical section while another contends. Never set in production.
+   */
+  testBarrier?: (point: LedgerBarrierPoint) => void;
+}
+
+/**
  * SQLite-backed ledger. Every mutation runs in an IMMEDIATE transaction (the write lock is taken before the
  * read), so several connections on one file never interleave a read-then-write: the chain head is read from
  * the database inside the transaction, never from a per-connection cache. Events, evidence and checkpoints
@@ -38,8 +55,12 @@ type Row = Record<string, unknown>;
  */
 export class SqliteLedger implements Ledger {
   private readonly db: Database.Database;
+  private readonly now: () => number;
+  private readonly barrier: (point: LedgerBarrierPoint) => void;
 
-  constructor(path: string) {
+  constructor(path: string, opts: SqliteLedgerOptions = {}) {
+    this.now = opts.now ?? Date.now;
+    this.barrier = opts.testBarrier ?? (() => undefined);
     this.db = new Database(path);
     this.db.exec(SCHEMA_SQL);
     this.migrate();
@@ -163,39 +184,49 @@ export class SqliteLedger implements Ledger {
     for (const row of this.db.prepare(sql).all(params) as Row[]) yield rowToEvent(row);
   }
 
+  /**
+   * Both chains are read inside one transaction, so the verdict describes a single snapshot of the database
+   * (a writer committing between the two reads cannot make an evidence row point past the events read).
+   * Sequence numbers must run 1..N without a gap in both: the event hash does not cover `seq`, so without
+   * this check a renumbered log would still verify.
+   */
   async verifyChain(): Promise<ChainVerdict> {
-    let prev = GENESIS_HASH;
-    let n = 0;
-    const hashes = new Map<number, string>();
-    for (const row of this.db.prepare('SELECT * FROM events ORDER BY seq ASC').all() as Row[]) {
-      const e = rowToEvent(row);
-      if (row.prev_hash !== prev || chainHash(prev, e) !== row.hash) return { ok: false, brokenAtSeq: row.seq as number };
-      prev = row.hash as string;
-      hashes.set(row.seq as number, prev);
-      n++;
-    }
-    let evPrev = GENESIS_HASH;
-    let expectN = 0;
-    for (const row of this.db.prepare('SELECT * FROM evidence ORDER BY (n IS NULL), n, rowid').all() as Row[]) {
-      expectN++;
-      const key = row.key as string;
-      const seq = row.seq as number;
-      const broken = (reason: string): ChainVerdict => ({ ok: false, brokenAtSeq: seq, brokenEvidenceKey: key, reason });
-      if (row.n !== expectN) return broken('evidence sequence has a gap or an unchained row');
-      if (row.prev_hash !== evPrev) return broken('evidence chain link broken');
-      let body: Json;
-      try {
-        body = JSON.parse(row.body as string) as Json;
-      } catch {
-        return broken('evidence body is not JSON');
+    const read = this.db.transaction((): ChainVerdict => {
+      let prev = GENESIS_HASH;
+      let n = 0;
+      const hashes = new Map<number, string>();
+      for (const row of this.db.prepare('SELECT * FROM events ORDER BY seq ASC').all() as Row[]) {
+        n++;
+        if (row.seq !== n) return { ok: false, brokenAtSeq: row.seq as number, reason: `events sequence has a gap at seq ${n} (found ${String(row.seq)})` };
+        const e = rowToEvent(row);
+        if (row.prev_hash !== prev || chainHash(prev, e) !== row.hash) return { ok: false, brokenAtSeq: row.seq as number };
+        prev = row.hash as string;
+        hashes.set(row.seq as number, prev);
       }
-      if (digestOf(body) !== row.digest) return broken('evidence body does not match its digest');
-      const eventHash = seq > 0 ? hashes.get(seq) : GENESIS_HASH;
-      if (eventHash === undefined || row.event_hash !== eventHash) return broken('evidence is not bound to the event at its seq');
-      if (evidenceHash(evPrev, { n: expectN, key, kind: row.kind as string, runId: row.run_id as string, digest: row.digest as string, seq, eventHash }) !== row.hash) return broken('evidence hash mismatch');
-      evPrev = row.hash as string;
-    }
-    return { ok: true, length: n };
+      let evPrev = GENESIS_HASH;
+      let expectN = 0;
+      for (const row of this.db.prepare('SELECT * FROM evidence ORDER BY (n IS NULL), n, rowid').all() as Row[]) {
+        expectN++;
+        const key = row.key as string;
+        const seq = row.seq as number;
+        const broken = (reason: string): ChainVerdict => ({ ok: false, brokenAtSeq: seq, brokenEvidenceKey: key, reason });
+        if (row.n !== expectN) return broken('evidence sequence has a gap or an unchained row');
+        if (row.prev_hash !== evPrev) return broken('evidence chain link broken');
+        let body: Json;
+        try {
+          body = JSON.parse(row.body as string) as Json;
+        } catch {
+          return broken('evidence body is not JSON');
+        }
+        if (digestOf(body) !== row.digest) return broken('evidence body does not match its digest');
+        const eventHash = seq > 0 ? hashes.get(seq) : GENESIS_HASH;
+        if (eventHash === undefined || row.event_hash !== eventHash) return broken('evidence is not bound to the event at its seq');
+        if (evidenceHash(evPrev, { n: expectN, key, kind: row.kind as string, runId: row.run_id as string, digest: row.digest as string, seq, eventHash }) !== row.hash) return broken('evidence hash mismatch');
+        evPrev = row.hash as string;
+      }
+      return { ok: true, length: n };
+    });
+    return read.deferred();
   }
 
   async evidence(e: { key: string; kind: string; runId: string; body: Json }): Promise<EvidenceRecord> {
@@ -279,6 +310,7 @@ export class SqliteLedger implements Ledger {
   async reserve(pool: string, amount: number, runId: string, idemKey: string): Promise<Reservation> {
     if (!(amount >= 0)) throw new LedgerError('reservation amount must be >= 0', 'budget');
     const tx = this.db.transaction((): Reservation => {
+      this.barrier('reserve:locked');
       const dup = this.db.prepare('SELECT * FROM reservations WHERE idem_key = ?').get(idemKey) as Row | undefined;
       if (dup) return { id: dup.id as string, pool: dup.pool as string, amount: dup.amount as number, runId: dup.run_id as string };
       const cap = this.db.prepare('SELECT cap, enforce FROM budgets WHERE run_id = ? AND pool = ?').get(runId, pool) as Row | undefined;
@@ -301,9 +333,14 @@ export class SqliteLedger implements Ledger {
     if (r.changes !== 1) throw new LedgerError(`reservation ${reservationId} not in reserved state`, 'budget');
   }
 
+  /**
+   * Lease times are read from the clock AFTER the write lock is held: a connection that waited for the lock
+   * decides on the time it actually runs at, never on one taken before the wait.
+   */
   async lease(resource: string, holder: string, ttlMs: number): Promise<Lease | null> {
-    const now = Date.now();
     const tx = this.db.transaction((): Lease | null => {
+      this.barrier('lease:locked');
+      const now = this.now();
       const cur = this.db.prepare('SELECT * FROM leases WHERE resource = ?').get(resource) as Row | undefined;
       if (cur && (cur.expires_at as number) > now && cur.holder !== holder) return null;
       const token = cur ? (cur.fencing_token as number) + 1 : 1;
@@ -314,16 +351,34 @@ export class SqliteLedger implements Ledger {
     return tx.immediate();
   }
 
+  /**
+   * Only a lease that is still live can be renewed. One that has expired (or was released) is gone even when
+   * nobody else has acquired the resource yet: its holder must take a new lease, with a new fencing token.
+   */
   async renew(lease: Lease, ttlMs: number): Promise<Lease> {
-    const expiresAt = Date.now() + ttlMs;
-    const r = this.db.prepare('UPDATE leases SET expires_at = ? WHERE resource = ? AND holder = ? AND fencing_token = ?').run(expiresAt, lease.resource, lease.holder, lease.fencingToken);
-    if (r.changes !== 1) throw new LedgerError(`lease on ${lease.resource} is no longer held by ${lease.holder}`, 'lease');
-    return { ...lease, expiresAt };
+    const tx = this.db.transaction((): Lease | string => {
+      this.barrier('renew:locked');
+      const now = this.now();
+      const cur = this.db.prepare('SELECT * FROM leases WHERE resource = ?').get(lease.resource) as Row | undefined;
+      if (!cur || cur.holder !== lease.holder || cur.fencing_token !== lease.fencingToken) return `lease on ${lease.resource} is no longer held by ${lease.holder}`;
+      if ((cur.expires_at as number) <= now) return `lease on ${lease.resource} is no longer held by ${lease.holder}: it expired before the renewal`;
+      const expiresAt = now + ttlMs;
+      const r = this.db.prepare('UPDATE leases SET expires_at = ? WHERE resource = ? AND holder = ? AND fencing_token = ?').run(expiresAt, lease.resource, lease.holder, lease.fencingToken);
+      if (r.changes !== 1) return `lease on ${lease.resource} is no longer held by ${lease.holder}`;
+      return { ...lease, expiresAt };
+    });
+    const r = tx.immediate();
+    if (typeof r === 'string') throw new LedgerError(r, 'lease');
+    return r;
   }
 
   async release(lease: Lease): Promise<void> {
-    // Keep the row so the fencing token stays monotonic across holders; just expire it.
-    this.db.prepare('UPDATE leases SET expires_at = 0 WHERE resource = ? AND holder = ? AND fencing_token = ?').run(lease.resource, lease.holder, lease.fencingToken);
+    const tx = this.db.transaction((): void => {
+      this.barrier('release:locked');
+      // Keep the row so the fencing token stays monotonic across holders; just expire it.
+      this.db.prepare('UPDATE leases SET expires_at = 0 WHERE resource = ? AND holder = ? AND fencing_token = ?').run(lease.resource, lease.holder, lease.fencingToken);
+    });
+    tx.immediate();
   }
 
   async requestApproval(r: ApprovalRequest): Promise<ApprovalRequest> {
@@ -368,6 +423,7 @@ export class SqliteLedger implements Ledger {
       }
     }
     const tx = this.db.transaction((): { grant: ApprovalGrant } | { error: string } => {
+      this.barrier('approve:locked');
       const row = this.db.prepare('SELECT * FROM approvals WHERE request_id = ?').get(requestId) as Row | undefined;
       if (!row) return { error: `unknown approval request ${requestId}` };
       if (row.state !== 'pending') return { error: `approval ${requestId} is ${row.state}` };
@@ -385,6 +441,7 @@ export class SqliteLedger implements Ledger {
         const clash = this.db.prepare('SELECT 1 FROM events WHERE id = ? OR (? IS NOT NULL AND idem_key = ?)').get(auditEvent.id, auditEvent.idemKey ?? null, auditEvent.idemKey ?? null);
         if (clash) return { error: `approval ${requestId}: audit event id or idemKey already recorded` };
         grantedSeq = this.insertEvent(auditEvent).seq;
+        this.barrier('approve:audited');
       }
       const u = this.db
         .prepare(`UPDATE approvals SET state = 'granted', approver_kind = ?, approver_id = ?, granted_at = ?, granted_seq = ? WHERE request_id = ? AND state = 'pending'`)
@@ -444,6 +501,7 @@ export class SqliteLedger implements Ledger {
 
   async consume(requestId: string, actionHash: string, sessionId: string, idemKey: string, at: number): Promise<void> {
     const tx = this.db.transaction((): string | null => {
+      this.barrier('consume:locked');
       const row = this.db.prepare('SELECT * FROM approvals WHERE request_id = ?').get(requestId) as Row | undefined;
       const why = !row
         ? 'unknown request'
@@ -485,7 +543,7 @@ export class SqliteLedger implements Ledger {
   async checkpoint(runId: string, key: string, state: JsonObject): Promise<string> {
     const id = randomUUID();
     const normalized = normalizeJson(state);
-    this.db.prepare('INSERT INTO checkpoints (id, run_id, key, state, digest, at) VALUES (?, ?, ?, ?, ?, ?)').run(id, runId, key, canonicalJson(normalized), digestOf(normalized), Date.now());
+    this.db.prepare('INSERT INTO checkpoints (id, run_id, key, state, digest, at) VALUES (?, ?, ?, ?, ?, ?)').run(id, runId, key, canonicalJson(normalized), digestOf(normalized), this.now());
     return id;
   }
 

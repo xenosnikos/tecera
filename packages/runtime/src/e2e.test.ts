@@ -52,6 +52,15 @@ function git(dir: string, ...args: string[]): string {
   }).toString('utf8');
 }
 
+/**
+ * The human decision commands refuse without a terminal (decisionGuard.ts). This suite makes them as the local
+ * human from a test process: the explicit opt-out, on those commands only, never on `tecera run`.
+ */
+const humanEnv = (argv: readonly string[]): Record<string, string> =>
+  argv[0] === 'approve' || argv[0] === 'deny' || (argv[0] === 'criteria' && (argv[1] === 'accept' || argv[1] === 'amend')) || (argv[0] === 'resources' && (argv[1] === 'release' || argv[1] === 'transfer')) || ((argv[0] === 'plans' || argv[0] === 'memory') && ['graduate', 'reject', 'retract'].includes(argv[1] ?? ''))
+    ? { TECERA_DECISION_NONINTERACTIVE: '1' }
+    : {};
+
 let idn = 0;
 async function cli(cwd: string, argv: string[], opts: MainOptions = {}): Promise<{ code: number; out: string; err: string }> {
   let out = '';
@@ -59,7 +68,7 @@ async function cli(cwd: string, argv: string[], opts: MainOptions = {}): Promise
   const { env: extraEnv, ...rest } = opts;
   const code = await main(argv, {
     cwd,
-    env: { ...ENV, ...(extraEnv ?? {}) },
+    env: { ...ENV, ...humanEnv(argv), ...(extraEnv ?? {}) },
     stdout: (s) => (out += s),
     stderr: (s) => (err += s),
     isTTY: false,
@@ -768,7 +777,7 @@ return { facts: [{ key: 'changedFiles', value: ['src/slugify.js', 'src/notes.js'
       const renew = l.renew.bind(l);
       (l as { renew: Ledger['renew'] }).renew = (lease, ttl) => (stall ? new Promise(() => undefined) : renew(lease, ttl));
       return createWiring({
-        leaseTtlMs: 900,
+        leaseTtlMs: 3_000,
         editToolSeams: {
           afterRead: async (r) => {
             if (r.rel !== 'src/slugify.js') return;
@@ -806,7 +815,7 @@ return { facts: [{ key: 'changedFiles', value: ['src/slugify.js', 'src/notes.js'
       const renew = l.renew.bind(l);
       (l as { renew: Ledger['renew'] }).renew = (lease, ttl) => (stall ? new Promise(() => undefined) : renew(lease, ttl));
       return createWiring({
-        leaseTtlMs: 900,
+        leaseTtlMs: 3_000,
         commitTestHooks: {
           beforeCommit: async () => {
             stall = true;

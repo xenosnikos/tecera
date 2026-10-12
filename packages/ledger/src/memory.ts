@@ -56,6 +56,11 @@ export class MemoryLedger implements Ledger {
   private readonly approvals = new Map<string, Approval>();
   private readonly consumeIdems = new Set<string>();
   private readonly checkpoints = new Map<string, JsonObject>();
+  private readonly now: () => number;
+
+  constructor(opts: { /** Clock for lease times. Default Date.now. */ now?: () => number } = {}) {
+    this.now = opts.now ?? Date.now;
+  }
 
   /** The guarded insert: the only way an event enters the log. */
   private insertEvent(n: TeceraEvent, seq = this.log.length + 1): StoredEvent {
@@ -120,7 +125,9 @@ export class MemoryLedger implements Ledger {
 
   async verifyChain(): Promise<ChainVerdict> {
     let prev = GENESIS_HASH;
-    for (const e of this.log) {
+    for (let i = 0; i < this.log.length; i++) {
+      const e = this.log[i]!;
+      if (e.seq !== i + 1) return { ok: false, brokenAtSeq: e.seq, reason: `events sequence has a gap at seq ${i + 1} (found ${e.seq})` };
       if (e.prevHash !== prev || chainHash(prev, e) !== e.hash) return { ok: false, brokenAtSeq: e.seq };
       prev = e.hash;
     }
@@ -218,7 +225,7 @@ export class MemoryLedger implements Ledger {
   }
 
   async lease(resource: string, holder: string, ttlMs: number): Promise<Lease | null> {
-    const now = Date.now();
+    const now = this.now();
     const cur = this.leases.get(resource);
     if (cur && cur.expiresAt > now && cur.holder !== holder) return null;
     const l: Lease = { resource, holder, fencingToken: cur ? cur.fencingToken + 1 : 1, expiresAt: now + ttlMs };
@@ -229,7 +236,10 @@ export class MemoryLedger implements Ledger {
   async renew(lease: Lease, ttlMs: number): Promise<Lease> {
     const cur = this.leases.get(lease.resource);
     if (!cur || cur.holder !== lease.holder || cur.fencingToken !== lease.fencingToken) throw new LedgerError(`lease on ${lease.resource} is no longer held by ${lease.holder}`, 'lease');
-    cur.expiresAt = Date.now() + ttlMs;
+    // An expired or released lease is gone even when nobody else has acquired the resource yet.
+    const now = this.now();
+    if (cur.expiresAt <= now) throw new LedgerError(`lease on ${lease.resource} is no longer held by ${lease.holder}: it expired before the renewal`, 'lease');
+    cur.expiresAt = now + ttlMs;
     return { ...cur };
   }
 
@@ -369,6 +379,15 @@ export class MemoryLedger implements Ledger {
       const body = normalizeJson(r.body);
       this.insertEvidence({ key: r.key, kind: r.kind, runId: r.runId, digest: digestOf(body), body, seq: this.log.length });
     }
+  }
+
+  /** Test hook: renumber or drop stored events in place (what bypassed triggers would allow), to prove verifyChain sees it. */
+  tamperEventsForTest(change: { renumber?: (seq: number) => number; dropSeq?: number }): void {
+    if (change.dropSeq !== undefined) {
+      const i = this.log.findIndex((e) => e.seq === change.dropSeq);
+      if (i >= 0) this.log.splice(i, 1);
+    }
+    if (change.renumber) for (const e of this.log) e.seq = change.renumber(e.seq);
   }
 
   /** Test hook: mutate a stored evidence body in place (what a bypassed trigger would allow), to prove verifyChain sees it. */

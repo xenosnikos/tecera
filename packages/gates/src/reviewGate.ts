@@ -3,7 +3,9 @@ import { AccountingFailure, digest, meteredCall, type Json, type LLMEffort, type
 import { parseVerdict, type Verdict } from '@tecera/policy';
 import { buildCandidateTree, fileManifest, snapshotCandidate, type Candidate } from './candidate.js';
 import { claim, defaultIds, errMsg, GateMemo, ignoredBaseline, keyPart, latestVerify, obj, redactorFrom, safeText, writeEvidence } from './evidence.js';
+import { envelopeView } from './envelope.js';
 import { hostGit, UnsafeRepo } from './gitx.js';
+import { workBranchOf } from './intentionBranch.js';
 import type { GateFailure, ReviewReason, ReviewResult, StepContext } from './types.js';
 import { gateWorktree } from './verifyGate.js';
 
@@ -68,6 +70,8 @@ export interface ReviewGateOptions {
   worktree?: string;
   /** Diff base (manifest.repo.base). */
   base: string;
+  /** manifest.repo.branchPrefix (default 'tecera/'): where a prepared intention's branch must lie. */
+  branchPrefix?: string;
   redactor?: Redactor;
   secrets?: readonly SecretInput[];
   /** Model name sent to the reviewer. Defaults to reviewer.model, then reviewer.id. */
@@ -217,10 +221,15 @@ export class ReviewGate {
     if (keyPart(this.redactor, ctx.runId) !== ctx.runId) return refuse('incomplete-packet', 'the run id carries a registered secret: its review cannot be keyed without leaking it (fail closed)');
     const dir = wt.dir;
     const baseline = await ignoredBaseline(ledger, this.memo, ctx.runId);
+    // An intention prepared onto its own branch is reviewed under that branch: its D1 is its own, so a
+    // verdict recorded for an earlier intention of the run is never reused for it.
+    const wb = await workBranchOf(ledger, this.redactor, this.o.branchPrefix ?? 'tecera/', ctx);
+    if (!wb.ok) return refuse('incomplete-packet', `work branch: ${wb.reason}`);
+    const scope = wb.prepared ? { branch: wb.branch } : {};
 
     let snap: Candidate;
     try {
-      snap = await snapshotCandidate(dir, base, { ignoredBaseline: baseline, signal });
+      snap = await snapshotCandidate(dir, base, { ignoredBaseline: baseline, signal, ...scope });
     } catch (err) {
       return refuse(err instanceof UnsafeRepo ? 'unsafe-repo' : 'incomplete-packet', errMsg(err));
     }
@@ -264,12 +273,34 @@ export class ReviewGate {
 
     const clean = (s: string) => this.redactor.redactText(s);
     const nonce = this.nonce();
+    // What was asked for, as the requestor accepted it, and what the host found outside it. The requestor's
+    // own words are data to the reviewer like everything else in the packet.
+    const envelope = envelopeView(ctx, snap);
+    meta.envelope = { source: envelope.source, paths: envelope.entries.length, unexpected: envelope.unexpected.map((c) => ({ path: c.path, op: c.op })) };
+    const accepted = ctx.contract
+      ? [
+          'Accepted criteria (the requestor signed these off):',
+          wrapUntrusted('CRITERIA', clean(ctx.contract.criteria.map((k) => `- ${k.id}: ${k.statement} [${k.check.kind === 'command' ? `command: ${k.check.command}` : `human: ${k.check.prompt}`}]`).join('\n')), nonce),
+          'Out of scope (must not be part of the change):',
+          wrapUntrusted('OUT_OF_SCOPE', clean(ctx.contract.outOfScope.length ? ctx.contract.outOfScope.map((x) => `- ${x}`).join('\n') : '(nothing listed)'), nonce),
+        ]
+      : [];
+    const allowed = [
+      envelope.source === 'manifest'
+        ? 'Change-path envelope: none was stated; the repository\'s allowed-changes globs are the only boundary.'
+        : `Change-path envelope (${envelope.source === 'contract' ? 'accepted with the criteria' : 'declared by the plan'}; path and allowed operations):`,
+      ...(envelope.source === 'manifest' ? [] : [wrapUntrusted('ENVELOPE', clean(envelope.entries.map((e) => `- ${e.path}: ${e.ops.join(', ')}`).join('\n')), nonce)]),
+      `Paths the host found changed outside the envelope: ${envelope.unexpected.length}${envelope.unexpected.length ? ' (the change cannot be committed with these, whatever your verdict)' : ''}`,
+      ...(envelope.unexpected.length ? [wrapUntrusted('UNEXPECTED', clean(envelope.unexpected.map((c) => `- ${c.path} (${c.op})`).join('\n')), nonce)] : []),
+    ];
     const messages: LLMMessage[] = [
       { role: 'system', content: SYSTEM },
       {
         role: 'user',
         content: [
           `Goal: ${clean(ctx.goal.statement)}`,
+          ...accepted,
+          ...allowed,
           `Changed paths (${packet.covered.length}, all included in full below):`,
           wrapUntrusted('PATHS', clean(packet.covered.join('\n')), nonce),
           ...(packet.ignoredChanges.length ? ['Ignored files changed (not committed):', wrapUntrusted('IGNORED', clean(packet.ignoredChanges.join('\n')), nonce)] : []),
@@ -337,7 +368,7 @@ export class ReviewGate {
     let d2: string;
     let snapshotError: string | null = null;
     try {
-      d2 = (await snapshotCandidate(dir, base, { ignoredBaseline: baseline })).fingerprint;
+      d2 = (await snapshotCandidate(dir, base, { ignoredBaseline: baseline, ...scope })).fingerprint;
     } catch (err) {
       // Never return the error text as a fingerprint: the sentinel differs from every D1; the text goes to evidence.
       d2 = 'unreadable';

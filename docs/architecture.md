@@ -43,8 +43,35 @@ assumed. The planner seat drafts it; model output is screened (no generic "tests
 criteria that import packages the repository lacks or need the network) and recorded as `criteria.drafted`.
 A free-text request holds until the requestor accepts the contract through a local approval bound to
 its hash (`accept_criteria`, approver not the requester); a goal file that carries criteria is accepted
-by the file. An amendment after acceptance (`criteria.amended`) makes the running plan stale and forces a
+by the file.
+
+A contract may also state a **change-path envelope**: a list of repository paths, or narrow globs whose
+first segment is a literal directory, each with the operations allowed on it (`create`, `modify`,
+`delete`, relative to the base commit). The planner drafts it with the criteria (existing files the work
+must touch, new files the criteria imply), a goal file carries it as `envelope:`, and it is part of the
+contract hash, so it is signed off with the criteria and only an amendment can widen it. A plan may
+declare a subset per writing step (`changes`) and is rejected if a step names a path or an operation
+outside the accepted envelope. The envelope is enforced deterministically in three places: the worker's
+write and delete tools refuse a path outside the step's subset; when a writing step returns, the host
+computes what changed (untracked and ignored files, deletions, both sides of a rename) since the step
+began and since the base, and fails the step if anything lies outside; and the verify and commit gates
+refuse a final candidate with an unexpected path, whatever the reviewer's verdict. The review packet
+lists the accepted criteria, the out-of-scope items, the envelope and the unexpected paths the host found.
+`repo.allowedChanges` stays the outer boundary. A contract that states no envelope keeps the hash it
+always had and is held to `repo.allowedChanges` alone, exactly as before; the gates record that as
+envelope source `manifest`. An amendment after acceptance (`criteria.amended`) makes the running plan stale and forces a
 re-plan against the new hash.
+
+Every intention has its own work branch. The first intention of a goal in a run commits to
+`<branchPrefix><goal>`; the n-th to `<branchPrefix><goal>.<n>` (a goal id never contains a dot, so the two
+cannot collide). When an intention is replaced (an amendment, or a reconsideration that drops the plan), its
+running steps are cancelled, its pending pull-request approval is denied on the approvals table, and before
+any step of the new intention is dispatched the leased worktree is put on the new branch, created at the
+base commit the run pinned when it started. Nothing of the old intention is carried over: not its commit,
+not its uncommitted or ignored files, and not its evidence, because the new branch is part of every
+candidate fingerprint of the new intention. The old branch keeps its commit for audit. The transition is
+recorded before anything moves (old intention, new intention, base, branch, lease generation) and completed
+idempotently, so a restart finishes it before any worker runs.
 
 The criteria name the **capabilities** they need. Connections declared in the manifest are probed for
 real; what a plan needs is resolved through one ladder, `use → provision → mock → ask`:
@@ -79,7 +106,9 @@ the PR opens marked provisional, the run exits 10, and the Stop hook keeps block
 
 - **Writes.** A worker may write inside `repo.allowedChanges` on its leased work branch without approval.
   Every write is fenced by the lease, logged, and refused on protected paths (tests, configuration, CI,
-  lockfiles, Tecera's own files).
+  lockfiles, Tecera's own files) and, under a change-path envelope, on every path the step did not declare.
+  A worker can also delete one file at a time (`delete`): the same rules, and only a file whose content it
+  has read.
 - **Verify.** The goal's check and every command criterion run in a separate contained process with a
   scrubbed environment and no network, on the same frozen candidate. A host that cannot contain the
   check does not run it. A run that mutates the candidate, overflows its
@@ -87,8 +116,9 @@ the PR opens marked provisional, the run exits 10, and the Stop hook keeps block
   reviewer's findings as untrusted, redacted inputs.
 - **Review.** Mandatory, by a different vendor than every writer, compared by provider and key
   fingerprint. The verdict must be exactly `{verdict, findings}`; `approve` requires empty findings.
-- **Commit.** To `tecera/<goal>`, staged from host-read bytes so repository hooks and filters never run,
-  bound to the reviewed content.
+- **Commit.** To the intention's work branch (`tecera/<goal>`, or `tecera/<goal>.<n>` for a re-planned
+  intention), staged from host-read bytes so repository hooks and filters never run, bound to the reviewed
+  content. The commit's parent is always the base commit: a worktree whose HEAD is anything else is refused.
 - **Pull request.** The only human approval on the delivery path (a free-text request also holds once
   for sign-off of its acceptance contract, and a human criterion is asked at this hold). The grant is
   bound to the commit, to one approver who is not the requester, and to an expiry; it is consumed exactly

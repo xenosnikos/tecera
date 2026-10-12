@@ -33,10 +33,10 @@ function simple(id: string, spans: SpanEvent['span'][], handle: (e: SpanEvent, v
 const toolCallInput = (e: SpanEvent) => e.input as { tool?: string; method?: string; args?: Json[]; path?: string };
 
 /**
- * A file write on the work branch through the repository's own write tool (the protectedPaths hook decides
- * where it may land). Only that tool: a method another tool happens to call `write` or `edit` is not one.
+ * A file write or deletion on the work branch through the repository's own tools (the protectedPaths hook
+ * decides where it may land). Only those tools: a method another tool happens to call `write` or `edit` is not one.
  */
-const isWrite = (tool: string | undefined): boolean => tool === 'edit';
+const isWrite = (tool: string | undefined): boolean => tool === 'edit' || tool === 'delete';
 
 export interface MandatoryDeps {
   permissions: PermissionsDoc;
@@ -95,7 +95,7 @@ export function mandatoryHooks(m: Manifest, deps: MandatoryDeps): Hook[] {
       if (!path) return [];
       const problem = pathProblem(path);
       if (problem) return [{ type: 'Abort', code: 'protected', reason: `${problem}: ${path}` }];
-      const writes = method === 'write' || method === 'edit' || method === 'delete' || tool === 'edit';
+      const writes = method === 'write' || method === 'edit' || method === 'delete' || isWrite(tool);
       const prot = matchesProtected(path, view.capabilities.paths.protected);
       if (prot && writes) return [{ type: 'Abort', code: 'protected', reason: `${path} is protected by ${prot}` }];
       if (writes && !matchesAny(path, view.capabilities.paths.write)) return [{ type: 'Abort', code: 'protected', reason: `${path} is outside the write allowlist` }];
@@ -140,7 +140,7 @@ export function mandatoryHooks(m: Manifest, deps: MandatoryDeps): Hook[] {
     simple('tamperCheck', ['Invoke', 'ToolCall'], (e) => {
       if (e.span !== 'ToolCall' || e.stage !== 'Enter' || !deps.contract) return [];
       const { tool, method, path } = toolCallInput(e);
-      const writes = method === 'write' || method === 'edit' || method === 'delete' || tool === 'edit';
+      const writes = method === 'write' || method === 'edit' || method === 'delete' || isWrite(tool);
       if (!writes || !path) return [];
       const contract = deps.contract();
       if (!contract) return [];

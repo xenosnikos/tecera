@@ -1,7 +1,8 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { contractHash, contractProblem, type AcceptanceContract, type Budget, type Commitment, type Criterion, type Manifest } from '@tecera/contracts';
+import { canonicalEnvelope, contractHash, contractProblem, type AcceptanceContract, type Budget, type Commitment, type Criterion, type Manifest } from '@tecera/contracts';
+import { envelopeDraftIssues } from '@tecera/planner';
 import { FrontMatterError, splitFrontMatter } from './util/frontmatter.js';
 import { safeReadFile, UnsafePathError } from './util/safefs.js';
 
@@ -17,7 +18,10 @@ import { safeReadFile, UnsafePathError } from './util/safefs.js';
  * requires?}`: `verify` is a command criterion (exit 0 passes, run by the verify gate on the final
  * candidate), `ask` a human criterion (the question a human other than the requester answers at the PR hold),
  * `requires` the capability ids it rests on (manifest `connections` keys or needs the run must provision or
- * mock). A goal file with criteria carries its own acceptance contract (no sign-off under
+ * mock). `envelope:` is the contract's change-path envelope, a one-line flow list of `{path, ops}` (ops:
+ * create, modify, delete): the only paths the delivered change may touch. It needs `criteria:`, is part of the
+ * contract hash, and must lie inside repo.allowedChanges and off the protected paths. Without it the
+ * manifest's allowedChanges is the envelope, as before. A goal file with criteria carries its own acceptance contract (no sign-off under
  * `acceptance.signoff: statement`); one without keeps the single-check path (its check alone).
  */
 
@@ -52,6 +56,8 @@ const GoalFrontSchema = z
     budget: z.object(Object.fromEntries(budgetKeys.map((k) => [k, z.number().positive().optional()])) as Record<(typeof budgetKeys)[number], z.ZodOptional<z.ZodNumber>>).strict().optional(),
     'on-violation': z.enum(['wake-human', 'demote', 'drop']).optional(),
     criteria: z.array(CriterionFrontSchema).min(1).optional(),
+    // The change-path envelope of the contract: [{"path": "src/slug.js", "ops": ["modify"]}, …]
+    envelope: z.array(z.object({ path: z.string().min(1), ops: z.array(z.enum(['create', 'modify', 'delete'])).min(1) }).strict()).min(1).optional(),
   })
   .strict();
 
@@ -107,9 +113,14 @@ export function parseGoalFile(text: string, m: Manifest, path?: string): GoalSpe
       check: k.verify !== undefined ? { kind: 'command' as const, command: k.verify, timeoutSec: k.timeoutSec ?? check.timeoutSec } : { kind: 'human' as const, prompt: k.ask! },
       ...(k.requires?.length ? { requires: [...k.requires] } : {}),
     }));
-    contract = { goalId: d.id, statement: fm.body, criteria, outOfScope: [], assumptions: [] };
+    contract = { goalId: d.id, statement: fm.body, criteria, outOfScope: [], assumptions: [], ...(d.envelope ? { envelope: canonicalEnvelope(d.envelope) } : {}) };
     const why = contractProblem(contract);
     if (why) throw new GoalError(`${path ?? 'goal'}: criteria: ${why}`);
+    // The manifest stays the outer boundary: an envelope cannot name what repo.allowedChanges or the protected paths exclude.
+    const outside = envelopeDraftIssues(contract.envelope, { allowedChanges: m.repo.allowedChanges, protectedPaths: m.policy.protectedPaths });
+    if (outside.length) throw new GoalError(`${path ?? 'goal'}: envelope: ${outside.join('; ')}`);
+  } else if (d.envelope) {
+    throw new GoalError(`${path ?? 'goal'}: envelope: a change-path envelope is part of an acceptance contract; the goal needs criteria`);
   }
   return {
     id: d.id,

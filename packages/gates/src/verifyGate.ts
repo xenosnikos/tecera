@@ -2,6 +2,7 @@ import { resolve } from 'node:path';
 import {
   capabilityInventoryOf,
   criterionEvidenceKey,
+  describeUnexpected,
   LedgerError,
   resourceRegistryOf,
   type AcceptanceContract,
@@ -24,6 +25,8 @@ import { fileManifest, snapshotCandidate, type Candidate } from './candidate.js'
 import { commandCriteria, commandUsesResource, contractOf, criterionFidelity, inventoryById, LOCATED_KINDS, NETWORK_KINDS, resourceEnvName, shellExports, withLedgerMocks } from './criteria.js';
 import { commandDigest, defaultIds, errMsg, GateMemo, IGNORED_BASELINE_VERSION, ignoredBaseline, ignoredBaselineKey, ignoredBaselineOf, keyPart, obj, redactorFrom, safeText, tail, writeEvidence } from './evidence.js';
 import { UnsafeRepo } from './gitx.js';
+import { envelopeView, type EnvelopeView } from './envelope.js';
+import { workBranchOf } from './intentionBranch.js';
 import { EXIT, TOOLING_EXITS, type StepContext, type VerifyOutcomeKind, type VerifyResult } from './types.js';
 
 /**
@@ -181,14 +184,18 @@ export class VerifyGate {
     const gaps = con.ok && con.contract ? this.capabilityGaps(con.contract, view!.inv) : [];
     let r: RunOnce;
     let evidenceKey: string | undefined;
+    let envelope: EnvelopeView | undefined;
     const proofs: CriterionProof[] = [];
     const failed: string[] = [...gaps];
     // Criterion and review records are found under keys every reader derives from the run id (and the
     // criterion id) as they are; an id carrying a registered secret cannot be keyed without leaking it.
     const idSecret = this.secretId(ctx.runId, con.ok && con.contract ? commandCriteria(con.contract).map((k) => k.id) : []);
-    if (!wt.ok || !chk.ok || !con.ok || gaps.length || idSecret) {
+    // The intention's own branch (when it was prepared onto one) is bound into every fingerprint below.
+    const wb = await workBranchOf(this.o.ledger, this.redactor, this.o.manifest.repo.branchPrefix, ctx);
+    const scope = wb.ok && wb.prepared ? wb.branch : undefined;
+    if (!wt.ok || !chk.ok || !con.ok || gaps.length || idSecret || !wb.ok) {
       evidenceKey = `verify-refused:${keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}`)}:${this.ids()}`;
-      const why = !wt.ok ? wt.reason : !chk.ok ? chk.reason : !con.ok ? con.reason : gaps.length ? `criteria ${gaps.join(', ')} require a capability the inventory lacks: nothing can prove them` : idSecret!;
+      const why = !wt.ok ? wt.reason : !chk.ok ? chk.reason : !con.ok ? con.reason : gaps.length ? `criteria ${gaps.join(', ')} require a capability the inventory lacks: nothing can prove them` : idSecret ? idSecret : `work branch: ${(wb as { reason: string }).reason}`;
       r = this.refused(why, { startedAt: this.now(), ...(con.ok && con.hash ? { contractHash: con.hash } : {}) });
     } else {
       const contract = con.contract;
@@ -207,10 +214,14 @@ export class VerifyGate {
           await writeEvidence(this.o.ledger, this.redactor, { key: `verify:${slot}:${prior.n}`, kind: 'gate.verify', runId: ctx.runId, body: { ...stepMeta, outcome: 'interrupted', fingerprint: prior.d1, terminal: false, supersededBy: `verify:${slot}:${n}` } });
         }
         evidenceKey = `verify:${slot}:${n}`;
+        // The change-path envelope first: a candidate with a path outside it is refused before any check
+        // runs, and no verdict about its content can change that. The worker may take the path back and retry.
+        envelope = envelopeView(ctx, before);
+        if (envelope.unexpected.length) return { outcome: 'failed', reason: `changed paths outside the accepted change-path envelope: ${describeUnexpected(envelope.unexpected)}`, exitCode: EXIT.failed };
         // The contract's command criteria run on this same frozen candidate; the goal check runs last.
         if (!contract) return null;
-        return this.criteria(ctx, contract, con.hash!, before.fingerprint, evidenceKey, proofs, failed, view!);
-      });
+        return this.criteria(ctx, contract, con.hash!, before.fingerprint, evidenceKey, proofs, failed, view!, scope);
+      }, scope);
       evidenceKey ??= `verify-refused:${keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}`)}:${this.ids()}`;
       if (prior) r.body.interruptedVerify = { key: prior.key, d1: prior.d1 };
       if (contract) {
@@ -219,9 +230,12 @@ export class VerifyGate {
       }
     }
     if (failed.length) r.body.failedCriteria = [...failed];
+    // (assigned inside the run callback above)
+    const env = envelope as EnvelopeView | undefined;
+    if (env) r.body.envelope = { source: env.source, paths: env.entries.length, unexpected: env.unexpected.map((c) => ({ path: c.path, op: c.op })) };
     await writeEvidence(this.o.ledger, this.redactor, { key: evidenceKey!, kind: 'gate.verify', runId: ctx.runId, body: { ...r.body, ...stepMeta } });
     this.memo.verify.set(`${ctx.runId}:${ctx.intention.id}`, { evidenceKey: evidenceKey!, fingerprint: r.fingerprint, outcome: r.outcome, files: r.body.files, ...(typeof r.body.commandDigest === 'string' ? { commandDigest: r.body.commandDigest } : {}) });
-    const out = this.result(r, evidenceKey!);
+    const out: VerifyResult = { ...this.result(r, evidenceKey!), ...(env?.unexpected.length ? { unexpected: env.unexpected } : {}) };
     // Proofs only for a step that passed as a whole: one per command criterion, all on `fingerprint`.
     if (con.ok && con.contract) return { ...out, criteria: r.outcome === 'passed' ? proofs : [], ...(failed.length ? { failedCriteria: [...failed] } : {}) };
     return out;
@@ -290,13 +304,13 @@ export class VerifyGate {
    * record one gate.verify evidence each. Pushes a proof per criterion that exited 0 on d1 and the id of
    * every one that did not. Returns a Stop for the goal check (failed or terminal), or null to run it.
    */
-  private async criteria(ctx: StepContext, contract: AcceptanceContract, hash: string, d1: string, verifyKey: string, proofs: CriterionProof[], failed: string[], view: RunView): Promise<Stop | null> {
+  private async criteria(ctx: StepContext, contract: AcceptanceContract, hash: string, d1: string, verifyKey: string, proofs: CriterionProof[], failed: string[], view: RunView, scope?: string): Promise<Stop | null> {
     const mt = this.o.manifest.verify.timeoutSec;
     for (const k of commandCriteria(contract)) {
       const use = this.criterionUse(k, view);
       const fidelity = use.fidelity as Fidelity;
       const check: ResolvedCheck = { command: k.check.command, timeoutSec: Math.min(k.check.timeoutSec, mt), source: 'criterion', manifestCommand: this.o.manifest.verify.command, timeoutCapped: k.check.timeoutSec > mt, ...(Object.keys(use.env).length ? { env: use.env } : {}) };
-      const c = await this.runOnce(ctx.worktree, ctx.runId, check, ctx.signal, true);
+      const c = await this.runOnce(ctx.worktree, ctx.runId, check, ctx.signal, true, undefined, scope);
       // The criterion must have seen exactly the frozen candidate, before and after its command.
       const drift = c.outcome !== 'refused' && c.outcome !== 'tooling' && c.fingerprint !== d1;
       const outcome = drift ? 'mutated' : c.outcome;
@@ -423,6 +437,7 @@ export class VerifyGate {
     signal?: AbortSignal,
     useBaseline = true,
     beforeRun?: (before: Candidate) => Promise<Stop | null>,
+    scope?: string,
   ): Promise<RunOnce> {
     const { manifest } = this.o;
     const cap = this.o.tailCap ?? 8 * 1024;
@@ -444,7 +459,7 @@ export class VerifyGate {
 
     let before: Candidate;
     try {
-      before = await snapshotCandidate(worktree, this.base, { ignoredBaseline: baseline, signal });
+      before = await snapshotCandidate(worktree, this.base, { ignoredBaseline: baseline, signal, ...(scope !== undefined ? { branch: scope } : {}) });
     } catch (err) {
       if (err instanceof UnsafeRepo) return this.refused(`unsafe repository: ${err.problems.join('; ')}`, meta);
       return this.tooling('', EXIT.notExecutable, `cannot fingerprint worktree: ${errMsg(err)}`, meta);
@@ -479,7 +494,7 @@ export class VerifyGate {
 
     let after: string;
     try {
-      after = (await snapshotCandidate(worktree, this.base, { ignoredBaseline: baseline })).fingerprint;
+      after = (await snapshotCandidate(worktree, this.base, { ignoredBaseline: baseline, ...(scope !== undefined ? { branch: scope } : {}) })).fingerprint;
     } catch (err) {
       after = `unreadable: ${this.diag(errMsg(err))}`;
     }

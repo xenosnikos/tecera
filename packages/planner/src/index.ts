@@ -34,7 +34,7 @@ export {
   ContractRejected,
   parseContractOutput,
   assembleDraft,
-  contractDraftIssues,
+  contractDraftIssues, envelopeDraftIssues,
   requestorCriteriaIssues,
   commandAlwaysPasses,
   contractPlanIssues,

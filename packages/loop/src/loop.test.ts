@@ -3758,3 +3758,347 @@ describe('D8 on the resume path: a granted hold cannot run a step of a supersede
     expect(b.loop.goal('g_fix')!.status).toBe('open');
   });
 });
+
+describe('a fresh work branch per intention: a later intention waits for its own branch (LoopPorts.prepareIntention)', () => {
+  type Prep = Parameters<NonNullable<LoopPorts['prepareIntention']>>[0];
+  const preparer = (log: Prep[], act: (a: Prep) => void = () => undefined): NonNullable<LoopPorts['prepareIntention']> => async (a) => {
+    log.push(a);
+    act(a);
+    return { branch: `tecera/g_fix.${a.ordinal}`, baseSha: 'b'.repeat(40), fencingToken: 7, evidenceKey: `intention-prepared:r:${a.intentionId}` };
+  };
+  /** Every intention's commit is its own (the real gate names the intention in the commit message). */
+  class BranchGates extends ContractGates {
+    override async commit(ctx: GateContext) {
+      return { ...(await super.commit(ctx)), sha: `sha-${ctx.intention.id}` };
+    }
+  }
+  /** Run to the PR hold of intention A, then amend and accept: intention B is pushed. */
+  async function amendedAtPrHold(extra: Partial<LoopPorts>, ledger?: Ledger) {
+    const b = build({ planner: new ContractPlanner(contractOf()), gates: new BranchGates(), extra, ...(ledger ? { ledger } : {}) });
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal({ ...goalInput, criteria: [passCmd] });
+    const st = await b.loop.runUntilQuiescent();
+    const prA = st.held.find((x) => x.stepId === 'pr')!;
+    const a = st.intentions[0]!;
+    await b.loop.amendCriteria('g_fix', contractOf([passCmd, lintCmd]), 'lint too', { kind: 'human', id: 'nick' });
+    const signoff = b.loop.status().held.find((x) => x.stepId === 'accept_criteria')!;
+    await b.loop.resume(signoff.requestId, await grantWithAudit(b.ledger, signoff.requestId));
+    return { ...b, prA, a };
+  }
+
+  it('commit A, hold before the PR, amend and accept: B dispatches nothing before its branch is prepared, then every gate of B is handed that branch; A\'s pending PR approval is denied on the table', async () => {
+    const log: Prep[] = [];
+    const startedAtPrepare: string[] = [];
+    let ledgerRef: Ledger | undefined;
+    const prepare = preparer(log);
+    const b = await amendedAtPrHold({
+      prepareIntention: async (a) => {
+        for await (const e of ledgerRef!.events({ kinds: ['step.started'] })) if (e.trace.intentionId === a.intentionId) startedAtPrepare.push(e.trace.stepId!);
+        return prepare(a);
+      },
+    });
+    ledgerRef = b.ledger;
+    const pushed = await evs(b.ledger, 'intention.pushed');
+    expect(pushed).toHaveLength(2);
+    const iB = pushed[1]!.trace.intentionId!;
+    expect(pushed[0]!.payload.preparation).toBeUndefined();
+    expect(pushed[1]!.payload.preparation).toEqual({ previousIntentionId: b.a.id, ordinal: 2 });
+    // nothing of B has run, and nothing will until the port answered
+    expect(log).toEqual([]);
+    expect(b.loop.status().awaitingPreparation).toEqual({ [iB]: { goalId: 'g_fix', previousIntentionId: b.a.id, ordinal: 2 } });
+    expect(b.loop.status().dispatchable).toBe(0);
+    const callsBefore = b.worker.calls.length;
+    // A's delivery authority: the pending PR request was denied by Tecera when A was dropped
+    expect((await b.ledger.getApproval(b.prA.requestId))?.state).toBe('denied');
+    const denied = (await evs(b.ledger, 'approval.denied')).find((e) => e.payload.requestId === b.prA.requestId)!;
+    expect(denied.payload).toMatchObject({ superseded: true });
+    expect(denied.actor.kind).toBe('system');
+    await expect(grantWithAudit(b.ledger, b.prA.requestId)).rejects.toThrow(/is denied/);
+
+    const st = await b.loop.runUntilQuiescent();
+    expect(log).toEqual([{ runId: 'r', goalId: 'g_fix', intentionId: iB, previousIntentionId: b.a.id, ordinal: 2 }]);
+    expect(startedAtPrepare).toEqual([]);
+    expect(b.worker.calls.length).toBeGreaterThan(callsBefore);
+    const advanced = (await evs(b.ledger, 'intention.advanced')).find((e) => (e.payload as { prepared?: unknown }).prepared)!;
+    expect(advanced.trace.intentionId).toBe(iB);
+    expect(advanced.payload.prepared).toEqual({ branch: 'tecera/g_fix.2', baseSha: 'b'.repeat(40), previousIntentionId: b.a.id, ordinal: 2, fencingToken: 7, evidenceKey: `intention-prepared:r:${iB}` });
+    const firstStartOfB = (await evs(b.ledger, 'step.started')).find((e) => e.trace.intentionId === iB)! as TeceraEvent & { seq: number };
+    expect(firstStartOfB.seq).toBeGreaterThan((advanced as TeceraEvent & { seq: number }).seq);
+    // A's gates were handed no branch (the goal's first branch); every gate of B got B's
+    const ofA = b.gates.contexts.filter((c) => c.intention.id === b.a.id);
+    const ofB = b.gates.contexts.filter((c) => c.intention.id === iB);
+    expect(ofA.length).toBeGreaterThan(0);
+    expect(ofA.every((c) => c.branch === undefined)).toBe(true);
+    expect(ofB.map((c) => c.step.kind)).toEqual(['gate.verify', 'gate.review', 'gate.verify', 'gate.commit']);
+    expect(ofB.every((c) => c.branch === 'tecera/g_fix.2')).toBe(true);
+    // B holds at its own PR, under its own approval, bound to B's PR step
+    const prB = st.held.find((x) => x.stepId === 'pr')!;
+    expect(prB.intentionId).toBe(iB);
+    expect(prB.requestId).not.toBe(b.prA.requestId);
+    await b.loop.resume(prB.requestId, await grantWithAudit(b.ledger, prB.requestId));
+    await b.loop.runUntilQuiescent();
+    expect(b.gates.contexts[b.gates.contexts.length - 1]).toMatchObject({ branch: 'tecera/g_fix.2', intention: { id: iB } });
+    expect(b.loop.goal('g_fix')!.status).toBe('achieved');
+  });
+
+  it('an approval a human had already granted for A cannot deliver B: it stays unspent, resume refuses it, and the PR gate runs once, for B', async () => {
+    const rules = new RulesReflex();
+    // reconsider keeps the held intention, so the amendment leaves A's hold in place until the grant is used
+    const stubborn = { ask: async (s: never, q: never) => (s === 'reconsider' ? { seam: s, answer: { interrupt: false }, confidence: 1, provider: 'rules', abstained: false } : rules.ask(s, q)) } as unknown as LoopPorts['reflex'];
+    const log: Prep[] = [];
+    const b = build({ planner: new ContractPlanner(contractOf()), gates: new BranchGates(), extra: { reflex: stubborn, prepareIntention: preparer(log) } });
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal({ ...goalInput, criteria: [passCmd] });
+    const prA = (await b.loop.runUntilQuiescent()).held.find((x) => x.stepId === 'pr')!;
+    const grantA = await grantWithAudit(b.ledger, prA.requestId);
+    await b.loop.amendCriteria('g_fix', contractOf([passCmd, lintCmd]), 'lint too', { kind: 'human', id: 'nick' });
+    await b.loop.resume(prA.requestId, grantA); // drops A instead of delivering
+    expect(b.gates.calls.pr).toBe(0);
+    const dropped = (await evs(b.ledger, 'intention.dropped'))[0]!;
+    expect(dropped.payload.cause).toBe('criteria.amended');
+    const signoff = b.loop.status().held.find((x) => x.stepId === 'accept_criteria')!;
+    await b.loop.resume(signoff.requestId, await grantWithAudit(b.ledger, signoff.requestId));
+    const st = await b.loop.runUntilQuiescent();
+    const prB = st.held.find((x) => x.stepId === 'pr')!;
+    expect(log).toHaveLength(1);
+    // A's grant is not a hold of anything any more
+    await expect(b.loop.resume(prA.requestId, grantA)).rejects.toThrow(/no held step/);
+    expect((await b.ledger.getApproval(prA.requestId))?.state).toBe('granted');
+    // presenting A's grant under B's hold is refused before any gate runs: it is bound to A's PR step
+    await expect(b.loop.resume(prB.requestId, { ...grantA, requestId: prB.requestId })).rejects.toThrow();
+    expect(b.gates.calls.pr).toBe(0);
+    await b.loop.resume(prB.requestId, await grantWithAudit(b.ledger, prB.requestId));
+    await b.loop.runUntilQuiescent();
+    expect(b.gates.calls.pr).toBe(1);
+    expect((await b.ledger.getApproval(prA.requestId))?.state).toBe('granted');
+    expect((await b.ledger.getApproval(prB.requestId))?.state).toBe('consumed');
+  });
+
+  it('a restart before the preparation was confirmed: restore keeps B waiting, and the first tick prepares it before any step of B starts', async () => {
+    const first: Prep[] = [];
+    // the process dies inside the preparation: the port never returns
+    const a = await amendedAtPrHold({ prepareIntention: (r) => (first.push(r), never()) });
+    void a.loop.tick();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(first).toHaveLength(1);
+    const iB = (await evs(a.ledger, 'intention.pushed'))[1]!.trace.intentionId!;
+    expect((await evs(a.ledger, 'step.started')).filter((e) => e.trace.intentionId === iB)).toEqual([]);
+
+    const again: Prep[] = [];
+    const b = build({ ledger: a.ledger, planner: new ContractPlanner(contractOf([passCmd, lintCmd])), gates: new BranchGates(), extra: { prepareIntention: preparer(again) } });
+    const st = await b.loop.restore();
+    expect(st.awaitingPreparation).toEqual({ [iB]: { goalId: 'g_fix', previousIntentionId: a.a.id, ordinal: 2 } });
+    expect(st.dispatchable).toBe(0);
+    expect(again).toEqual([]);
+    await b.loop.runUntilQuiescent();
+    expect(again).toEqual([{ runId: 'r', goalId: 'g_fix', intentionId: iB, previousIntentionId: a.a.id, ordinal: 2 }]);
+    expect(b.gates.contexts.filter((c) => c.intention.id === iB).every((c) => c.branch === 'tecera/g_fix.2')).toBe(true);
+    expect(b.gates.contexts.some((c) => c.intention.id === iB && c.step.kind === 'gate.commit')).toBe(true);
+
+    // a later restart finds the confirmation and does not prepare again; the gates still get the branch
+    const third: Prep[] = [];
+    const c = build({ ledger: a.ledger, planner: new ContractPlanner(contractOf([passCmd, lintCmd])), gates: new BranchGates(), extra: { prepareIntention: preparer(third) } });
+    const st3 = await c.loop.restore();
+    expect(st3.awaitingPreparation).toBeUndefined();
+    const prB = st3.held.find((x) => x.stepId === 'pr')!;
+    await c.loop.resume(prB.requestId, await grantWithAudit(a.ledger, prB.requestId));
+    await c.loop.runUntilQuiescent();
+    expect(third).toEqual([]);
+    expect(c.gates.contexts.map((x) => [x.step.kind, x.branch])).toEqual([['gate.pr', 'tecera/g_fix.2']]);
+  });
+
+  it('the fence is lost during the preparation: the loop stops, B stays waiting and nothing of B is dispatched; the next process prepares before it runs', async () => {
+    let token: number | undefined = 3;
+    const a = await amendedAtPrHold({
+      fencingToken: () => token,
+      prepareIntention: async () => {
+        token = undefined; // the lease is gone before the branch moved
+        throw new Error('worktree lease lost');
+      },
+    });
+    const iB = (await evs(a.ledger, 'intention.pushed'))[1]!.trace.intentionId!;
+    const st = await a.loop.runUntilQuiescent();
+    expect(st.state).toBe('stopped');
+    expect(st.stopReason).toMatch(/lease lost/);
+    expect(st.awaitingPreparation?.[iB]).toBeDefined();
+    expect((await evs(a.ledger, 'step.started')).filter((e) => e.trace.intentionId === iB)).toEqual([]);
+    expect(a.loop.goal('g_fix')!.status).toBe('open');
+    expect((await evs(a.ledger, 'goal.dropped'))).toEqual([]);
+
+    const again: Prep[] = [];
+    const b = build({ ledger: a.ledger, planner: new ContractPlanner(contractOf([passCmd, lintCmd])), gates: new BranchGates(), extra: { fencingToken: () => 4, prepareIntention: preparer(again) } });
+    await b.loop.restore();
+    await b.loop.runUntilQuiescent();
+    expect(again.map((x) => x.intentionId)).toEqual([iB]);
+    const prepared = (await evs(a.ledger, 'intention.advanced')).find((e) => (e.payload as { prepared?: unknown }).prepared)! as TeceraEvent & { seq: number };
+    const starts = (await evs(a.ledger, 'step.started')).filter((e) => e.trace.intentionId === iB) as Array<TeceraEvent & { seq: number }>;
+    expect(starts.length).toBeGreaterThan(0);
+    expect(starts.every((e) => e.seq > prepared.seq)).toBe(true);
+  });
+
+  it('a preparation that fails with the lease still held drops the goal for a human; no step of B ever runs', async () => {
+    const a = await amendedAtPrHold({ prepareIntention: async () => { throw new Error('branch tecera/g_fix.2 already exists at 1234, not at the base'); } });
+    const iB = (await evs(a.ledger, 'intention.pushed'))[1]!.trace.intentionId!;
+    await a.loop.runUntilQuiescent();
+    expect((await evs(a.ledger, 'step.started')).filter((e) => e.trace.intentionId === iB)).toEqual([]);
+    const drop = (await evs(a.ledger, 'goal.dropped'))[0]!;
+    expect(drop.payload).toMatchObject({ terminal: true, failure: 'human' });
+    expect(String(drop.payload.reason)).toMatch(/could not be given its own work branch.*already exists/);
+    expect(a.loop.status().awaitingPreparation).toBeUndefined();
+  });
+
+  it('without the port nothing changes: a re-planned intention dispatches at once and the gates get no branch', async () => {
+    const b = await amendedAtPrHold({});
+    expect((await evs(b.ledger, 'intention.pushed'))[1]!.payload.preparation).toBeUndefined();
+    expect(b.loop.status().awaitingPreparation).toBeUndefined();
+    await b.loop.runUntilQuiescent();
+    expect(b.gates.contexts.every((c) => c.branch === undefined)).toBe(true);
+  });
+});
+
+describe('change-path envelope at step close-out: host-computed changed paths against the declared subset', () => {
+  type Changes = Awaited<ReturnType<NonNullable<LoopPorts['stepChanges']>>>;
+  const ENVELOPE = [{ path: 'src/slug.js', ops: ['modify' as const] }];
+  const enveloped = (): AcceptanceContract => ({ ...contractOf(), envelope: ENVELOPE });
+  /**
+   * Checkpoints that differ after every writing step, and a stepChanges port scripted per close-out (the
+   * loop asks twice for one close-out: the step's own delta, and everything since the base; this fake answers
+   * both with the same list, as if the step were the first to change anything).
+   */
+  function ports(script: Changes[]) {
+    let n = 0;
+    const asked: Array<{ stepId: string; from: string; to: string }> = [];
+    const closeOuts: string[] = [];
+    const extra: Partial<LoopPorts> = {
+      worktreeCheckpoint: async (a) => `tree:${a.stepId}:${a.reason}:${++n}`,
+      stepChanges: async (a) => {
+        asked.push({ stepId: a.stepId, from: a.from, to: a.to });
+        if (!closeOuts.includes(a.to)) closeOuts.push(a.to);
+        return script[Math.min(closeOuts.indexOf(a.to), script.length - 1)]!;
+      },
+    };
+    return { extra, asked };
+  }
+  const start = async (b: ReturnType<typeof build>, contract: AcceptanceContract) => {
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal({ ...goalInput, criteria: contract.criteria }, { contract });
+    return b.loop.runUntilQuiescent();
+  };
+
+  it('a file outside the accepted envelope fails the step with a reason naming it, whatever the worker returned; the retry is told which paths, and passes once they are gone', async () => {
+    const p = ports([[], [{ path: 'src/slug.js', op: 'modify' }, { path: 'src/config.js', op: 'create' }], [{ path: 'src/slug.js', op: 'modify' }]]);
+    const b = build({ plan: readOnlyAnalyze, planner: new ContractPlanner(enveloped()), gates: new ContractGates(), extra: p.extra });
+    // ContractPlanner writes fivePlan: analyze can write too, so it is checked as well (it changed nothing)
+    const st = await start(b, enveloped());
+    const failed = await evs(b.ledger, 'step.failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.trace.stepId).toBe('edit');
+    expect(failed[0]!.payload).toMatchObject({ terminal: false, unexpected: [{ path: 'src/config.js', op: 'create' }] });
+    expect(String(failed[0]!.payload.reason)).toBe('changed paths outside the accepted change-path envelope: src/config.js (create)');
+    // the gates never saw the refused candidate
+    const firstVerify = (await evs(b.ledger, 'verify.started'))[0]! as TeceraEvent & { seq: number };
+    expect(firstVerify.seq).toBeGreaterThan((failed[0] as TeceraEvent & { seq: number }).seq);
+    // the retried step got the host's list as untrusted failure context
+    const retry = b.worker.calls.filter((c) => c.step.id === 'edit');
+    expect(retry).toHaveLength(2);
+    expect(retry[0]!.inputs.failureContext).toBeUndefined();
+    expect(retry[1]!.inputs.failureContext).toMatchObject({ provenance: { trust: 'untrusted' }, value: { kind: 'envelope', attempt: 1, unexpected: [{ path: 'src/config.js', op: 'create' }], untrusted: true } });
+    expect(String((retry[1]!.inputs.failureContext as { value: { instruction: string } }).value.instruction)).toMatch(/delete tool/);
+    expect(st.held.some((h) => h.stepId === 'pr')).toBe(true);
+    // per close-out: the step's own delta (from its baseline) and everything since the base
+    expect(p.asked.map((a) => [a.stepId, a.from === 'base' ? 'base' : 'baseline'])).toEqual([['analyze', 'baseline'], ['analyze', 'base'], ['edit', 'baseline'], ['edit', 'base'], ['edit', 'baseline'], ['edit', 'base']]);
+  });
+
+  it('a path an earlier attempt left behind is found although this execution changed nothing: the step is not waved through as "no change"', async () => {
+    let n = 0;
+    const calls: string[] = [];
+    const b = build({
+      planner: new ContractPlanner(enveloped()),
+      gates: new ContractGates(),
+      extra: {
+        // the tree never changes after the first edit: every later checkpoint is the same id
+        worktreeCheckpoint: async (a) => (a.stepId === 'analyze' ? `tree:a:${++n}` : 'tree:left-behind'),
+        stepChanges: async (a) => {
+          calls.push(a.from === 'base' ? 'base' : 'delta');
+          return a.from === 'base' ? [{ path: 'src/slug.js', op: 'modify' }, { path: 'src/config.js', op: 'create' }] : [];
+        },
+      },
+    });
+    await start(b, enveloped());
+    const failed = await evs(b.ledger, 'step.failed');
+    expect(failed.length).toBeGreaterThan(0);
+    for (const f of failed) expect(String(f.payload.reason)).toBe('changed paths outside the accepted change-path envelope: src/config.js (create)');
+    expect(failed.every((f) => f.payload.noChange !== true)).toBe(true);
+    expect(calls).toContain('base');
+    expect(b.gates.calls.verify).toBe(0);
+  });
+
+  it('every attempt leaving the extra path drops the goal; nothing is verified, reviewed or committed', async () => {
+    const p = ports([[], [{ path: 'src/config.js', op: 'create' }]]);
+    const b = build({ planner: new ContractPlanner(enveloped()), gates: new ContractGates(), extra: p.extra });
+    await start(b, enveloped());
+    expect((await evs(b.ledger, 'step.failed')).map((e) => e.trace.stepId)).toEqual(['edit', 'edit']);
+    expect(b.gates.calls).toEqual({ verify: 0, review: 0, commit: 0, pr: 0 });
+    expect(b.loop.goal('g_fix')!.status).toBe('dropped');
+    expect(String((await evs(b.ledger, 'goal.dropped'))[0]!.payload.reason)).toMatch(/src\/config\.js \(create\)/);
+  });
+
+  it('a deletion, the wrong operation on an allowed path and an ignored file are unexpected too; an allowed change is not', async () => {
+    const p = ports([[], [{ path: 'src/slug.js', op: 'delete' }, { path: 'src/old.js', op: 'delete' }, { path: 'node_modules/.cache/x', op: 'ignored' }, { path: 'src/slug.js', op: 'modify' }]]);
+    const b = build({ planner: new ContractPlanner(enveloped()), gates: new ContractGates(), extra: p.extra });
+    await start(b, enveloped());
+    expect((await evs(b.ledger, 'step.failed'))[0]!.payload.unexpected).toEqual([{ path: 'src/slug.js', op: 'delete' }, { path: 'src/old.js', op: 'delete' }, { path: 'node_modules/.cache/x', op: 'ignored' }]);
+  });
+
+  it('a step is held to its own declared subset: a path the contract allows but the step did not declare is refused, and the reason says so', async () => {
+    const wide = { ...contractOf(), envelope: [{ path: 'src/**', ops: ['create' as const, 'modify' as const] }] };
+    class Declaring extends ContractPlanner {
+      override async write(e: TeceraEvent, bl: BeliefProjection, g: AchievementGoal, m?: unknown, ctx?: PlanningContext): Promise<Plan> {
+        const plan = await super.write(e, bl, g, m, ctx);
+        return { ...plan, steps: plan.steps.map((s) => (s.id === 'edit' ? { ...s, changes: [{ path: 'src/slug.js', ops: ['modify' as const] }] } : s)) };
+      }
+    }
+    const p = ports([[], [{ path: 'src/other.js', op: 'create' }]]);
+    const b = build({ planner: new Declaring(wide), gates: new ContractGates(), extra: p.extra });
+    await start(b, wide);
+    expect(String((await evs(b.ledger, 'step.failed'))[0]!.payload.reason)).toBe('changed paths outside the declared changes of step edit: src/other.js (create)');
+  });
+
+  it('an envelope the host cannot check is never waved through: no stepChanges port, or a port that throws, ends the step for a human', async () => {
+    let n = 0;
+    const noPort = build({ planner: new ContractPlanner(enveloped()), gates: new ContractGates(), extra: { worktreeCheckpoint: async (a) => `tree:${a.stepId}:${++n}` } });
+    await start(noPort, enveloped());
+    expect((await evs(noPort.ledger, 'step.failed'))[0]!.payload).toMatchObject({ terminal: true, failure: 'human' });
+    expect(String((await evs(noPort.ledger, 'step.failed'))[0]!.payload.reason)).toMatch(/cannot be checked against its change-path envelope/);
+    expect(noPort.gates.calls.verify).toBe(0);
+    const throwing = build({ planner: new ContractPlanner(enveloped()), gates: new ContractGates(), extra: { worktreeCheckpoint: async (a) => `tree:${a.stepId}:${++n}`, stepChanges: async () => { throw new Error('git diff-tree failed'); } } });
+    await start(throwing, enveloped());
+    expect((await evs(throwing.ledger, 'step.failed'))[0]!.payload).toMatchObject({ terminal: true, failure: 'human' });
+  });
+
+  it('no envelope stated (contract without one, steps without changes): nothing is asked and nothing changes', async () => {
+    const p = ports([[{ path: 'anything/else.js', op: 'create' }]]);
+    const b = build({ planner: new ContractPlanner(contractOf()), gates: new ContractGates(), extra: p.extra });
+    const st = await start(b, contractOf());
+    expect(p.asked).toEqual([]);
+    expect(await evs(b.ledger, 'step.failed')).toEqual([]);
+    expect(st.held.some((h) => h.stepId === 'pr')).toBe(true);
+  });
+
+  it('a verify the gate refused for unexpected paths records them, and the retried worker is told', async () => {
+    class Refusing extends ContractGates {
+      override async verify(ctx: GateContext) {
+        const r = await super.verify(ctx);
+        return this.calls.verify === 1 ? { ...r, exitCode: 1, criteria: [], unexpected: [{ path: 'src/config.js', op: 'create' as const }], reason: 'changed paths outside the accepted change-path envelope: src/config.js (create)' } : r;
+      }
+    }
+    const p = ports([[]]);
+    const gates = new Refusing();
+    gates.verifyCodes = [1, 0, 0];
+    const b = build({ planner: new ContractPlanner(enveloped()), gates, extra: p.extra });
+    await start(b, enveloped());
+    expect((await evs(b.ledger, 'verify.failed'))[0]!.payload).toMatchObject({ unexpected: [{ path: 'src/config.js', op: 'create' }] });
+    const retried = b.worker.calls.filter((c) => c.step.id === 'edit')[1]!;
+    expect(retried.inputs.failureContext).toMatchObject({ value: { kind: 'envelope', unexpected: [{ path: 'src/config.js', op: 'create' }] } });
+  });
+});

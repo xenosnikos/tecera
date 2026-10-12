@@ -13,6 +13,7 @@ import {
   type TeceraEvent,
 } from '@tecera/contracts';
 import type { Command, CommandContext } from '../cli/context.js';
+import { guardDecision, guardJson } from '../decisionGuard.js';
 import { CliError, EXIT } from '../errors.js';
 import { identityJson, localPrincipal, PrincipalError, type HumanIdentity } from '../principal.js';
 import type { Runtime } from '../runtime.js';
@@ -30,6 +31,9 @@ import { runVerdict } from './run.js';
  *   `tecera approve <request>` (the requester, Tecera, can never grant it; separation of duty is the
  *   ledger's). `tecera run --resume <run>` then plans against the accepted contract.
  * - accept and amend refuse (exit 9) on a ledger whose hash chain does not verify.
+ * - accept and amend are human decisions: both go through the accident guard first (decisionGuard.ts; exit 8
+ *   under an agent-host marker or without a terminal, unless TECERA_DECISION_NONINTERACTIVE=1). It is not
+ *   authentication.
  * - `amend <run> --file contract.json --reason text [--as id]`: a human replaces the contract (a full
  *   AcceptanceContract, or `{criteria, outOfScope?, assumptions?}` stamped with the goal and statement). It is
  *   recorded as criteria.amended {from, to, contract, reason} with the human as actor; any acceptance becomes
@@ -44,9 +48,14 @@ interface RunContract {
   view: AcceptanceView;
 }
 
-async function runContract(c: CommandContext, rt: Runtime, verb: string): Promise<RunContract | number> {
+function runIdArg(c: CommandContext, verb: string): string {
   const runId = c.args.positionals[1];
   if (!runId || !/^[A-Za-z0-9_-]+$/.test(runId)) throw new CliError(`usage: tecera criteria ${verb} <runId>${verb === 'amend' ? ' --file contract.json --reason text' : ''}`, EXIT.usage);
+  return runId;
+}
+
+async function runContract(c: CommandContext, rt: Runtime, verb: string): Promise<RunContract | number> {
+  const runId = runIdArg(c, verb);
   if (!rt.ledgerExists()) {
     c.out.error(`criteria ${verb}: no ledger yet`);
     return EXIT.error;
@@ -114,6 +123,7 @@ const showCommand: Command = async (c) => {
     c.out.say(`  ${k.id}  ${k.statement}`);
     c.out.say(`      ${describeCheck(k)}${k.requires?.length ? ` · requires ${k.requires.join(', ')}` : ''} · ${fidelity.get(k.id) ?? 'not proven yet'}`);
   }
+  for (const e of view.contract.envelope ?? []) c.out.say(`  may ${e.ops.join('/')}: ${e.path}`);
   for (const x of view.contract.outOfScope) c.out.say(`  out of scope: ${x}`);
   for (const x of view.contract.assumptions) c.out.say(`  assumes: ${x}`);
   if (provisional && !proven?.achieved) c.out.say('  provisional: a criterion rests on a mocked capability; the goal is never achieved this way');
@@ -130,6 +140,9 @@ const showCommand: Command = async (c) => {
 };
 
 const acceptCommand: Command = async (c) => {
+  runIdArg(c, 'accept'); // usage errors first (exit 2), wherever the command is run
+  const guard = guardDecision(c, 'criteria accept');
+  if (typeof guard === 'number') return guard;
   const rt = c.runtime();
   const rc = await runContract(c, rt, 'accept');
   if (typeof rc === 'number') return rc;
@@ -171,6 +184,9 @@ const amendCommand: Command = async (c) => {
   const file = c.args.values.file;
   const reason = c.args.values.reason?.trim();
   if (!file || !reason) throw new CliError('usage: tecera criteria amend <runId> --file contract.json --reason text [--as id]', EXIT.usage);
+  runIdArg(c, 'amend');
+  const guard = guardDecision(c, 'criteria amend');
+  if (typeof guard === 'number') return guard;
   const rt = c.runtime();
   const rc = await runContract(c, rt, 'amend');
   if (typeof rc === 'number') return rc;
@@ -201,6 +217,8 @@ const amendCommand: Command = async (c) => {
     criteria: doc.criteria as AcceptanceContract['criteria'],
     outOfScope: doc.outOfScope ?? [],
     assumptions: doc.assumptions ?? [],
+    // An amendment that states no envelope keeps the accepted one: only an explicit list changes it.
+    ...((doc.envelope ?? view.contract.envelope) ? { envelope: doc.envelope ?? view.contract.envelope } : {}),
   };
   const why = contractProblem(contract);
   if (why) throw new CliError(`criteria amend: ${why}`, EXIT.usage);
@@ -215,7 +233,7 @@ const amendCommand: Command = async (c) => {
     runId: rc.runId,
     trace: { goalId: rc.goalId },
     actor: { kind: 'human', id: who.id },
-    payload: payloadOf('criteria.amended', { from: view.current, to, contract, reason }),
+    payload: { ...payloadOf('criteria.amended', { from: view.current, to, contract, reason }), guard: guardJson(guard) },
   });
   c.out.say(`amended    contract of goal ${rc.goalId} (run ${rc.runId}) ${view.current.slice(0, 12)} → ${to.slice(0, 12)} as ${who.id} · event ${ev.id}`);
   c.out.info(`the acceptance is stale: \`tecera run --resume ${rc.runId}\` drops the running plan and holds for a sign-off of the new contract (\`tecera criteria accept ${rc.runId}\`)`);

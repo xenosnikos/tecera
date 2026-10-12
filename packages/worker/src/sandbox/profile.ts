@@ -1,7 +1,7 @@
 import { spawnSync, type SpawnOptions } from 'node:child_process';
 import { accessSync, constants, existsSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
-import { assertEnvAllowlist, scrubEnv } from './env.js';
+import { SANDBOX_MARKER_ENV, assertEnvAllowlist, scrubEnv } from './env.js';
 import { IsolationUnavailable } from './errors.js';
 
 /**
@@ -243,6 +243,7 @@ export function buildChildProfile(sandbox: SandboxSettings, scratchDir: string, 
   const flags = nodeFlags(childDir, sandbox.memoryMb);
   // The REPL child gets PATH empty and HOME/TMPDIR in scratch whatever the allowlist says.
   const { env, dropped } = scrubEnv(sandbox.envAllowlist, process.env, { PATH: '', HOME: homeDir, TMPDIR: homeDir, LANG: 'C.UTF-8' });
+  env[SANDBOX_MARKER_ENV] = 'repl';
   const argv = [...isolation.prefix, process.execPath, ...flags, entryPath];
   return {
     isolation,

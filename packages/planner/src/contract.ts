@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  canonicalEnvelope,
   canonicalJson,
   contractHash,
   contractProblem,
@@ -8,6 +9,7 @@ import {
   type AchievementGoal,
   type CapabilityNeed,
   type CapabilityRecord,
+  type ChangePath,
   type ContractDraft,
   type Criterion,
   type Json,
@@ -18,6 +20,7 @@ import {
   type ProvisioningAllowance,
   type Redactor,
 } from '@tecera/contracts';
+import { globWithin, matchesAny, matchesProtected } from '@tecera/policy';
 import { deepSecretKind, inertDepth, MAX_PLAN_DEPTH, patternRedactor, UNSCANNABLE } from './hygiene.js';
 import { extractFirstJsonObject } from './parse.js';
 import { MAX_TAGS, normalizeTag, type ImpliedNeed } from './quality.js';
@@ -204,6 +207,14 @@ export const CONTRACT_WIRE_JSON_SCHEMA: JsonObject = wClosed({
   },
   outOfScope: wStrings('Things the request does not ask for.'),
   assumptions: wStrings('What the contract assumes without checking.'),
+  envelope: {
+    type: 'array',
+    description: 'The change-path envelope: every repository path the work may touch and how. Existing files it must modify or delete, new files the criteria imply. Empty only when the paths cannot be told from the request and the repository.',
+    items: wClosed({
+      path: wStr('A repository-relative path, or a narrow glob whose first segment is a literal directory (src/reports/*.js).'),
+      ops: { type: 'array', items: { type: 'string', enum: ['create', 'modify', 'delete'] }, description: 'The operations allowed on it.' },
+    }),
+  },
   needs: {
     type: 'array',
     description: 'One entry per capability id named in any criterion requires.',
@@ -236,6 +247,7 @@ const ContractWireSchema = z
       .max(MAX_CRITERIA),
     outOfScope: z.array(z.string().max(MAX_NOTE_CHARS)).max(MAX_CONTRACT_NOTES).nullish(),
     assumptions: z.array(z.string().max(MAX_NOTE_CHARS)).max(MAX_CONTRACT_NOTES).nullish(),
+    envelope: z.array(z.object({ path: z.string().max(400), ops: z.array(z.enum(['create', 'modify', 'delete'])).max(3) }).strict()).max(200).nullish(),
     needs: z
       .array(z.object({ id: z.string().max(64), kind: z.string().max(64), mockable: z.boolean().nullish() }).strict())
       .max(MAX_CONTRACT_NOTES)
@@ -248,6 +260,8 @@ export interface ContractProposal {
   criteria: Criterion[];
   outOfScope?: string[];
   assumptions?: string[];
+  /** The change-path envelope (contracts AcceptanceContract.envelope); absent or empty = none stated. */
+  envelope?: ChangePath[];
   /** The kind (and mockable) of each capability a criterion requires; a declared connection overrides it. */
   needs?: Array<{ id: string; kind: string; mockable?: boolean }>;
 }
@@ -288,7 +302,8 @@ export function parseContractOutput(raw: string): { ok: true; proposal: Contract
     });
     if (issues.length) return { ok: false, issues };
     const needs = (w.data.needs ?? []).map((n) => ({ id: n.id, kind: n.kind, ...(n.mockable != null ? { mockable: n.mockable } : {}) }));
-    return { ok: true, proposal: { criteria, outOfScope: [...(w.data.outOfScope ?? [])], assumptions: [...(w.data.assumptions ?? [])], needs } };
+    const envelope = (w.data.envelope ?? []).map((e) => ({ path: e.path, ops: [...e.ops] }));
+    return { ok: true, proposal: { criteria, outOfScope: [...(w.data.outOfScope ?? [])], assumptions: [...(w.data.assumptions ?? [])], ...(envelope.length ? { envelope } : {}), needs } };
   } catch (err) {
     return { ok: false, issues: [`unparseable contract output (${err instanceof Error ? err.name : 'error'})`] };
   }
@@ -308,6 +323,14 @@ export interface DraftContext {
   redactor?: Redactor;
   /** Capabilities the statement implies (impliedNeeds): the last source of a required capability's kind. */
   implied?: readonly ImpliedNeed[];
+  /**
+   * What a drafted change-path envelope is screened against: the manifest's repo.allowedChanges (every entry
+   * must lie inside it) and policy.protectedPaths (none may name one), and the repository as it is (a path
+   * that may only be modified or deleted must exist; one that may only be created must not).
+   */
+  allowedChanges?: readonly string[];
+  protectedPaths?: readonly string[];
+  fileExists?: (path: string) => boolean;
 }
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
@@ -327,6 +350,7 @@ export function assembleDraft(p: ContractProposal, c: DraftContext): { ok: true;
       criteria,
       outOfScope: [...(p.outOfScope ?? [])],
       assumptions: [...(p.assumptions ?? [])],
+      ...(Array.isArray(p.envelope) && p.envelope.length ? { envelope: canonicalEnvelope(clone(p.envelope)) } : {}),
     };
     const issues: string[] = [];
     const proposed = new Map<string, { kind: string; mockable?: boolean }>();
@@ -359,11 +383,35 @@ export function assembleDraft(p: ContractProposal, c: DraftContext): { ok: true;
 }
 
 /**
+ * Why a drafted envelope may not go to sign-off (empty when it may, or when there is none): inside
+ * repo.allowedChanges (the outer boundary stays the manifest's), off every protected path, and consistent
+ * with the repository: a literal path that may only be modified or deleted exists, one that may only be
+ * created does not. Shape is contracts envelopeProblem (already checked by contractProblem).
+ */
+export function envelopeDraftIssues(envelope: readonly ChangePath[] | undefined, c: Pick<DraftContext, 'allowedChanges' | 'protectedPaths' | 'fileExists'>): string[] {
+  if (!envelope) return [];
+  const issues: string[] = [];
+  envelope.forEach((e, i) => {
+    // A path is echoed only when it is short and made of plain path characters (it is model output).
+    const p = /^[A-Za-z0-9_.*/-]{1,80}$/.test(e.path) ? `${i} (${e.path})` : String(i);
+    const glob = e.path.includes('*');
+    if (c.allowedChanges && !(glob ? c.allowedChanges.some((a) => globWithin(e.path, a)) : matchesAny(e.path, c.allowedChanges) !== null)) issues.push(`envelope path ${p} is outside repo.allowedChanges`);
+    const prot = c.protectedPaths ? matchesProtected(e.path, c.protectedPaths) : null;
+    if (prot) issues.push(`envelope path ${p} is a protected path`);
+    if (glob || !c.fileExists) return;
+    const exists = c.fileExists(e.path);
+    if (!exists && !e.ops.includes('create')) issues.push(`envelope path ${p} allows only ${e.ops.join(' and ')} but does not exist in the repository; allow create, or name the existing file`);
+    if (exists && e.ops.length === 1 && e.ops[0] === 'create') issues.push(`envelope path ${p} allows only create but already exists in the repository; allow modify`);
+  });
+  return issues;
+}
+
+/**
  * Why `draft` may not go to sign-off (empty when it may): contracts contractProblem, goal id and statement
  * as stamped, bounds, capability ids, commands that can fail, needs that match the criteria, a complete
  * secret scan, and every requestor criterion of the goal kept (requestorCriteriaIssues). Never throws.
  */
-export function contractDraftIssues(draft: ContractDraft, c: Pick<DraftContext, 'goal' | 'statement' | 'redactor'>): string[] {
+export function contractDraftIssues(draft: ContractDraft, c: Pick<DraftContext, 'goal' | 'statement' | 'redactor' | 'allowedChanges' | 'protectedPaths' | 'fileExists'>): string[] {
   try {
     const issues: string[] = [];
     const k = draft?.contract;
@@ -374,6 +422,7 @@ export function contractDraftIssues(draft: ContractDraft, c: Pick<DraftContext, 
     if (k.criteria.length > MAX_CRITERIA) issues.push(`contract has ${k.criteria.length} criteria; at most ${MAX_CRITERIA}`);
     if (k.outOfScope.length > MAX_CONTRACT_NOTES || k.assumptions.length > MAX_CONTRACT_NOTES) issues.push(`outOfScope and assumptions hold at most ${MAX_CONTRACT_NOTES} items each`);
     for (const x of [...k.outOfScope, ...k.assumptions]) if (x.length > MAX_NOTE_CHARS) issues.push(`an outOfScope or assumptions item is longer than ${MAX_NOTE_CHARS} characters`);
+    issues.push(...envelopeDraftIssues(k.envelope, c));
     for (const x of k.criteria) {
       const id = safeSegment(x.id);
       if (!CRITERION_ID_RE.test(x.id)) issues.push(`criterion ${id}: ids are at most 64 characters`);

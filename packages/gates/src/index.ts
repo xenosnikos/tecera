@@ -97,6 +97,7 @@ export function createGates(o: CreateGatesOptions): Gates {
     ledger: o.ledger,
     worktree: o.worktree,
     base,
+    branchPrefix: o.manifest.repo.branchPrefix,
     redactor,
     model: o.reviewModel ?? o.manifest.seats.reviewer.model,
     ...(effort ? { effort } : {}),
@@ -165,6 +166,10 @@ export { snapshotCandidate, buildCandidateTree, fileManifest, manifestMismatch, 
 export type { Candidate, FileRecord, CandidateStatus, BuiltTree, SnapshotOptions, IgnoredBaseline, IgnoredMeta } from './candidate.js';
 export { GateMemo, latestVerify, latestReview, claim, writeEvidence, ignoredBaseline, ignoredBaselineKey, ignoredBaselineOf, commandDigest, safeText, IGNORED_BASELINE_VERSION } from './evidence.js';
 export type { VerifyMemo, ReviewMemo } from './evidence.js';
+export { candidateChanges, candidateEnvelope, envelopeView } from './envelope.js';
+export type { EnvelopeView } from './envelope.js';
+export { intentionBranchName, preparationKeys, preparationRecordOf, workBranchOf } from './intentionBranch.js';
+export type { IntentionPreparationRecord, WorkBranch } from './intentionBranch.js';
 export { hostGit, gitEnv, assertSafeRepo, UnsafeRepo, GitFailed, refSafe, DEFAULT_IDENTITY, HOST_GIT_ARGS } from './gitx.js';
 export type { GitIdentity, RepoSafety } from './gitx.js';
 export { EXIT, TOOLING_EXITS, isTerminalExit } from './types.js';

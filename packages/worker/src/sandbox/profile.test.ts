@@ -45,7 +45,7 @@ describe('ChildProfile', () => {
     ]);
     expect(p.command).toBe(process.execPath);
     expect(p.args.at(-1)).toBe(join(scratch, 'child', 'entry.mjs'));
-    expect(p.env).toEqual({ PATH: '', HOME: join(scratch, 'home'), TMPDIR: join(scratch, 'home'), LANG: 'C.UTF-8', ...(process.env.CI !== undefined ? { CI: process.env.CI } : {}) });
+    expect(p.env).toEqual({ PATH: '', HOME: join(scratch, 'home'), TMPDIR: join(scratch, 'home'), LANG: 'C.UTF-8', TECERA_SANDBOX: 'repl', ...(process.env.CI !== undefined ? { CI: process.env.CI } : {}) });
     expect(JSON.stringify(p.env)).not.toContain('canary-profile-value');
     expect(p.envDropped).toEqual(['TECERA_CANARY_PROFILE']);
     expect(p.spawnOptions).toMatchObject({ cwd: join(scratch, 'home'), detached: true, stdio: ['pipe', 'pipe', 'pipe'] });

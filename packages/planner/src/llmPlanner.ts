@@ -563,6 +563,10 @@ export class LLMPlanner implements Planner {
       connections,
       redactor: this.redactor,
       implied: impliedNeeds(statement, connections, inv),
+      // a drafted envelope stays inside the manifest's boundary and matches the repository as it is
+      allowedChanges: this.o.manifest.repo.allowedChanges,
+      protectedPaths: this.o.manifest.policy.protectedPaths,
+      ...(this.o.repoFiles ? { fileExists: this.o.repoFiles } : {}),
     });
     if (!built.ok) return { ok: false, issues: this.sanitizeIssues(built.issues) };
     // A well-formed draft that proves too little about the request goes back for repair like a malformed one.

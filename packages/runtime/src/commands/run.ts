@@ -108,7 +108,7 @@ import { decisionEvent } from './approve.js';
 export const CALLS_PER_RUN = 400;
 
 /** Tools the default validator accepts when wiring does not supply a catalog. */
-export const DEFAULT_TOOL_CATALOG = ['read', 'edit', 'listFiles', 'runVerify'] as const;
+export const DEFAULT_TOOL_CATALOG = ['read', 'edit', 'delete', 'listFiles', 'runVerify'] as const;
 
 export function reflexSettings(m: Manifest): Record<ReflexSeam, ReflexSetting> {
   return Object.fromEntries(REFLEX_SEAMS.map((s) => [s, m.reflexes[s]])) as Record<ReflexSeam, ReflexSetting>;
@@ -543,6 +543,10 @@ function buildLoop(rt: Runtime, ctx: WiringContext, ports: WiredPorts, signal?: 
     callsCap: CALLS_PER_RUN,
     // S2: the worktree is checkpointed after every worker step and at each suspension; a restart restores it.
     ...(ports.worktreeCheckpoint ? { worktreeCheckpoint: ports.worktreeCheckpoint } : {}),
+    // The change-path envelope at step close-out: the host's own list of what a worker step changed.
+    ...(ports.stepChanges ? { stepChanges: (a: { from: string; to: string }) => ports.stepChanges!({ from: a.from, to: a.to }) } : {}),
+    // A later intention of the goal works on its own branch cut from the pinned base; nothing is inherited.
+    ...(ports.prepareIntention ? { prepareIntention: ports.prepareIntention } : {}),
     // closeOut evidence: which files a worker step changed (paths and line counts, never contents).
     ...(ports.worktreeChanges ? { worktreeChanges: ports.worktreeChanges } : {}),
     // D9/D10: declared connections are probed for real; missing capabilities provisioned in Tecera's space.
@@ -910,7 +914,9 @@ export async function resumeRun(rt: Runtime, ctx: WiringContext, ports: WiredPor
   // A note that only re-held a step changed nothing; anything else restore did (re-dispatch, restart,
   // reconcile, complete, fail, expire) must be driven and recorded.
   const recoveredWork = (restored.recovered ?? []).filter((n) => n.action !== 'held').length;
-  const work = resumed > 0 || expired > 0 || recoveredWork > 0 || (restored.dispatchable ?? 0) > 0 || (after.dispatchable ?? 0) > 0 || after.state === 'stopped';
+  // An intention still waiting for its own branch is work too: the first tick prepares it.
+  const unprepared = Object.keys(after.awaitingPreparation ?? {}).length;
+  const work = resumed > 0 || expired > 0 || recoveredWork > 0 || (restored.dispatchable ?? 0) > 0 || (after.dispatchable ?? 0) > 0 || unprepared > 0 || after.state === 'stopped';
   if (!work && failedResumes === 0) {
     // Nothing to do. A crash between goal.achieved and staging is still repaired (idempotent).
     for (const p of await stageAchievedPlans(ctx.ledger, ctx.runId, { ids: ctx.ids, now: rt.now })) notes.push(`plan ${p} staged as a candidate (its goal was achieved)`);

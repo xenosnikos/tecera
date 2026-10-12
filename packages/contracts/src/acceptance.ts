@@ -23,18 +23,81 @@ export interface Criterion {
   requires?: string[];
 }
 
+/** What may happen to a path: it is created (absent on the base), modified, or deleted (present on the base). */
+export type ChangeOp = 'create' | 'modify' | 'delete';
+
+export const CHANGE_OPS: readonly ChangeOp[] = ['create', 'modify', 'delete'];
+
+/**
+ * One entry of a change-path envelope: a repository-relative path, or a narrow glob (`*` within a segment,
+ * `**` across segments; its first segment is always literal), and the operations allowed on what it matches.
+ */
+export interface ChangePath {
+  path: string;
+  ops: ChangeOp[];
+}
+
 export interface AcceptanceContract {
   goalId: string;
   statement: string;
   criteria: Criterion[];
   outOfScope: string[];
   assumptions: string[];
+  /**
+   * The change-path envelope the requestor signs off with the criteria: the only paths the delivered change
+   * may create, modify or delete. It is part of the contract hash, so only an amendment can widen it. Absent
+   * = no envelope was stated: the manifest's repo.allowedChanges is the envelope, with every operation, and
+   * the hash is the one the contract had before envelopes existed.
+   */
+  envelope?: ChangePath[];
 }
 
 const ID = /^[a-z0-9][a-z0-9_-]*$/;
 
 function isStringList(v: unknown): v is string[] {
   return Array.isArray(v) && v.every((x) => typeof x === 'string' && x.length > 0);
+}
+
+/**
+ * Why `v` is not a change-path envelope (null when it is): a non-empty list of {path, ops}; every path
+ * repository-relative with forward slashes, no `.` or `..` segment, no control character, at most 400
+ * characters, a literal first segment (so `**` or `*.js` alone, which would cover the whole repository, is
+ * refused); every ops list a non-empty set of create / modify / delete; no path listed twice.
+ */
+export function envelopeProblem(v: unknown): string | null {
+  if (!Array.isArray(v)) return 'the envelope must be a list of {path, ops}';
+  if (v.length === 0) return 'the envelope lists no path (omit it to use repo.allowedChanges)';
+  if (v.length > 200) return 'the envelope lists more than 200 paths';
+  const seen = new Set<string>();
+  for (const raw of v as unknown[]) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return 'an envelope entry is not an object';
+    const e = raw as Record<string, unknown>;
+    const extra = Object.keys(e).filter((k) => k !== 'path' && k !== 'ops');
+    if (extra.length) return `an envelope entry has an unknown field ${extra[0]}`;
+    const p = e.path;
+    if (typeof p !== 'string' || !p) return 'an envelope entry names no path';
+    if (p.length > 400) return 'an envelope path is too long';
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f\\]/.test(p)) return `envelope path ${JSON.stringify(p)} carries a control character or a backslash`;
+    if (p.startsWith('/') || /^[A-Za-z]:/.test(p)) return `envelope path ${p} is not repository-relative`;
+    const segs = p.split('/');
+    if (segs.some((x) => x === '' || x === '.' || x === '..')) return `envelope path ${p} is not normalized`;
+    if (/[*?[\]{}]/.test(segs[0]!)) return `envelope path ${p} starts with a wildcard: name at least its first directory or file`;
+    if (/[?[\]{}]/.test(p)) return `envelope path ${p} uses a wildcard other than * and **`;
+    if (segs.some((x) => x.includes('**') && x !== '**')) return `envelope path ${p} uses ** inside a segment`;
+    if (seen.has(p)) return `envelope path ${p} is listed twice`;
+    seen.add(p);
+    const ops = e.ops;
+    if (!Array.isArray(ops) || ops.length === 0) return `envelope path ${p} allows no operation`;
+    if (ops.some((o) => !CHANGE_OPS.includes(o as ChangeOp))) return `envelope path ${p} names an unknown operation`;
+    if (new Set(ops).size !== ops.length) return `envelope path ${p} names an operation twice`;
+  }
+  return null;
+}
+
+/** The envelope in the order the hash uses: entries by path, operations in create / modify / delete order. */
+export function canonicalEnvelope(list: readonly ChangePath[]): ChangePath[] {
+  return [...list].map((e) => ({ path: e.path, ops: CHANGE_OPS.filter((o) => e.ops.includes(o)) })).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
 /** Why `c` is not a well-formed acceptance contract (null when it is). Shape only. */
@@ -46,6 +109,10 @@ export function contractProblem(c: unknown): string | null {
   if (!Array.isArray(o.criteria) || o.criteria.length === 0) return 'contract has no criteria';
   if (!isStringList(o.outOfScope ?? [])) return 'outOfScope must be a list of strings';
   if (!isStringList(o.assumptions ?? [])) return 'assumptions must be a list of strings';
+  if (o.envelope !== undefined) {
+    const env = envelopeProblem(o.envelope);
+    if (env) return env;
+  }
   const seen = new Set<string>();
   let commands = 0;
   for (const raw of o.criteria as unknown[]) {
@@ -81,6 +148,8 @@ export function contractHash(c: AcceptanceContract): string {
     criteria: c.criteria.map((k) => ({ id: k.id, statement: k.statement, check: k.check, requires: [...(k.requires ?? [])].sort() })),
     outOfScope: c.outOfScope,
     assumptions: c.assumptions,
+    // Only a stated envelope is hashed: a contract without one keeps the hash it always had.
+    ...(c.envelope !== undefined ? { envelope: canonicalEnvelope(c.envelope) } : {}),
   };
   return sha256(canonicalJson(norm as unknown as Json));
 }

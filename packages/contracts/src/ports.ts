@@ -4,6 +4,7 @@ import type { Manifest } from './manifest.js';
 import type { TeceraEvent, EventKind, Trace } from './events.js';
 import type { DecisionRecord, ReflexAnswers, ReflexQuestions, ReflexResult, ReflexSeam } from './reflex.js';
 import type { CapabilitySet, Effect, ExecResult, HookDescriptor, Inputs, MockToolDeclaration, Outcome, SpanEvent, SpanKind, ToolRequest, ToolResult, WriteGuard } from './worker.js';
+import type { PathChange } from './envelope.js';
 import type { AcceptanceContract, CapabilityRecord, ContractDraft, CriterionProof, HumanCriterionAnswer, ProvisionedResource, ProvisioningAllowance } from './acceptance.js';
 
 /**
@@ -461,6 +462,12 @@ export interface GateContext {
   step: Step;
   /** Absolute worktree path. Empty string = not configured: every gate MUST refuse (terminal). */
   worktree: string;
+  /**
+   * The work branch of this intention when the worktree was prepared onto its own branch (every intention of
+   * a goal after the first; `<branchPrefix><goal>.<n>`). Absent = the goal's first branch `<branchPrefix><goal>`.
+   * The gates accept it only when the intention's preparation record names the same branch.
+   */
+  branch?: string;
   /** Present on a gate.pr step resumed after a human grant (bound to prActionHash of the committed sha). */
   approval?: GateApproval;
   /** Candidate fingerprints the loop saw: d1 = latest verify fingerprint, d2 = latest review fingerprint. */
@@ -518,6 +525,11 @@ export interface GateVerifyResult extends GateResultBase {
    */
   criteria?: CriterionProof[];
   failedCriteria?: string[];
+  /**
+   * Paths of the candidate that lie outside the stated change-path envelope (contracts envelope.ts). Any
+   * makes exitCode non-zero before a check runs: the candidate is refused whatever a reviewer would say.
+   */
+  unexpected?: PathChange[];
 }
 
 export interface GateReviewResult extends GateResultBase {
@@ -570,7 +582,7 @@ export type GateReconcileOutcome = GateReconcileResult | GateCommitResult | null
 export interface GateRunner {
   verify(ctx: GateContext): Promise<GateVerifyResult>;
   review(ctx: GateContext): Promise<GateReviewResult>;
-  /** Commit the verified, reviewed candidate to the work branch tecera/<goal>. No approval (D6). */
+  /** Commit the verified, reviewed candidate to the intention's work branch (ctx.branch, else tecera/<goal>). No approval (D6). */
   commit(ctx: GateContext): Promise<GateCommitResult>;
   /**
    * The PR gate (D6): ctx.approval (a consumed-by-the-gate human grant bound to prActionHash of ctx.commit.sha)

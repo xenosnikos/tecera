@@ -132,7 +132,7 @@ describe('Dispatcher', () => {
   it('a throwing, hanging or aborting hook at Exit is an Abort too (never ignored); evidence of the other hooks survives', async () => {
     const rec = hook('rec', () => [{ type: 'AppendEvidence', key: 'k', kind: 'span', body: 1 }]);
     const boom = await new Dispatcher([hook('boom', () => { throw new Error('kaboom'); }), rec], { hookTimeoutMs: 50 }).emit(ev('Exit'), view);
-    expect(boom.abort?.reasons).toEqual([{ code: 'hookError', hookId: 'boom', reason: 'hook failed: kaboom' }]);
+    expect(boom.abort?.reasons).toEqual([{ code: 'hookError', hookId: 'boom', reason: 'hook failed: hook boom threw at Invoke/Exit: kaboom' }]);
     expect(boom.evidence.map((e) => e.key)).toEqual(['k']);
     expect(boom.ignored).toHaveLength(0);
     const slow = await new Dispatcher([hook('slow', () => new Promise(() => {}))], { hookTimeoutMs: 20 }).emit(ev('Exit'), view);

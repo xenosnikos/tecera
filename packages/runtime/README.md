@@ -12,8 +12,12 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
   principal never approves its own request, and only a human principal can approve (exit 8). The name is
   asserted, not verified: any local process that can run `tecera` can approve under any name. Workers
   have no shell and no such tool. For a host assistant, the Claude Code pre-tool hook refuses every
-  `tecera` command except `gate`, `status`, `why` and `validate` with their listed flags; the decision
-  commands themselves carry no second check, and the Codex adapter installs no hook at all.
+  `tecera` command except `gate`, `status`, `why` and `validate` with their listed flags, and the Codex
+  adapter installs no hook at all. The decision commands carry an accident guard of their own
+  (src/decisionGuard.ts): they refuse with exit 8 under an agent-host marker (`CLAUDECODE`,
+  `CLAUDE_CODE_ENTRYPOINT`, `CODEX_*`, `TECERA_SANDBOX`) or without a terminal on stdin, unless
+  `TECERA_DECISION_NONINTERACTIVE=1` is set, and record what they saw as `guard` on the decision event. It
+  prevents accidents; it is not authentication.
 - **reflexes on.** Seams are `rule` / `model` / `frontier` (the manifest refuses `off`); the planner seat is
   the frontier, wired into the reflex router and as `LoopPorts.frontier` (metered by its own SeatMeter).
 - **budgets off by default.** `openRunPools` opens usd / tokens / calls / wallMs with `budgets.enforce`
@@ -136,10 +140,22 @@ reviewer call; the durable PR approval re-held; commit reconciled, never repeate
   `verify` is a command criterion, `ask` a human one; at least one must be a command. Such a file is its
   own accepted contract under `acceptance.signoff: statement` (no sign-off hold); `always` holds every run.
   A goal file without `criteria:` keeps the single-check path (its `verify` alone), exactly as before.
-- **One id, one branch.** The ledger goal id is the goal file's id, or the statement's slug
+- **One id, one branch per intention.** The ledger goal id is the goal file's id, or the statement's slug
   (`make-the-failing-test-pass`); it names the work branch (`tecera/<id>`) on the first segment and on every
   resume. The gates look the goal up by that id. Runs adopted before (with `g_<id>`) still commit to the
   named branch. `g_` is reserved: `g_<id>` refers to the goal file `<id>`, so no goal file id starts with it.
+  A goal planned again in the same run works on `tecera/<id>.2`, then `.3`: a fresh branch at the base the
+  run pinned, with the earlier branch left as it was (see "Amendments re-plan").
+- **A contract may state where the change may land.** `envelope:` in a goal file's front matter is a
+  one-line JSON flow list: `envelope: [{"path": "src/slugify.js", "ops": ["modify"]}, {"path": "src/reports/*.js", "ops": ["create"]}]`.
+  It needs `criteria:`, must lie inside `repo.allowedChanges` and off the protected paths, and is part of
+  the contract hash. For a statement the planner drafts it with the criteria and the requestor signs both
+  off; a scripted `contract.json` may carry `envelope` too. A plan's writing steps may declare a subset
+  (`changes`); a step that names more is rejected with the plan. A write or deletion outside it fails at
+  the tool; a file that got there another way fails the step when it returns (the retried worker is told
+  which paths and can remove them with `deleteFile(path, digest)`); a candidate that still has one is
+  refused at verify and at commit. Without `envelope:` nothing changes: `repo.allowedChanges` is the
+  boundary and the contract hash is the one it had.
 - **Every criterion is verified.** The verify gate runs each command criterion on the frozen candidate;
   the PR lists every criterion, how it was proven and at what fidelity. Human criteria are asked at the PR
   hold, one `answer_criterion` approval each (`tecera approve <request>`).
@@ -171,6 +187,14 @@ reviewer call; the durable PR approval re-held; commit reconciled, never repeate
   `criteria.amended` with the human as actor. `accept` and `amend` refuse (exit 9) on a ledger whose hash
   chain does not verify. The acceptance is stale: the next resume drops the running
   intention (no step of it runs again) and holds for a sign-off of the new contract, then re-plans for it.
+  The dropped intention's pending PR approval is denied by Tecera (`tecera approve` on it then fails), and
+  what it committed stays on its branch, undelivered. Before the new plan's first step, the worktree is
+  put on the new intention's branch at the base commit (src/worktree.ts `prepareBranch`): the old commit,
+  uncommitted files and ignored files that were not there at the run's baseline are gone from the worktree,
+  and the new work is verified, reviewed and approved from scratch. The transition is recorded as
+  `intention-prepare:<run>:<intention>` before anything moves and `intention-prepared:…` after; a resume
+  that finds only the first completes it before any worker runs. A lost lease during it ends the segment
+  (exit 9) with the new intention still waiting.
 - **Scripted.** A scripted directory may hold `contract.json`: the contract proposal(s) the planner drafts
   for a statement (`{criteria, outOfScope?, assumptions?, needs?}`, or a list with `when` substrings). The
   scripted `plan.json` is stamped with the accepted contract's hash and capabilities, and its `gate.verify`
@@ -180,10 +204,16 @@ reviewer call; the durable PR approval re-held; commit reconciled, never repeate
 
 `src/criteria.e2e.test.ts` proves it end to end with scripted models, the real sandbox and real gates: a goal
 file with criteria reaches achievement through the PR hold alone; a statement run holds for sign-off, then
-the PR, then is achieved on `tecera/make-the-failing-test-pass`; a mocked capability ends provisional (exit
+the PR, then is achieved on `tecera/make-the-failing-test-pass`; a goal file with an envelope refuses a
+write of an unrequested file at the tool call, fails a step that left one behind through the check, and
+lets the retried worker delete it and deliver the requested file alone; a mocked capability ends provisional (exit
 10, PR marked, Stop blocks); a provisioned bare remote receives the push, is listed for transfer and is torn
 down by `tecera resources release`; an amendment at the PR hold drops the intention, holds for sign-off and
-re-plans for the new hash.
+re-plans for the new hash. Two further cases follow an amendment after a commit to the end: the new
+intention's commit lands on `tecera/fix-failing-test.2` with the base as its parent, the first branch is
+unchanged, the new work has its own verify and review evidence, the first PR approval is denied and never
+consumed; and a lease lost before, or a crash after, the branch mutation leaves the new intention
+undispatched until a later resume completes the preparation.
 
 ## What wiring builds (src/wiring.ts)
 
@@ -207,6 +237,10 @@ re-plans for the new hash.
      recorded as `worktree.no-git`.
    - The lease is `ledger.lease('worktree:<runId>')`, renewed while the run lives. Its fencing token goes to every
      worker step. Resume reuses the worktree and refuses if it is missing or foreign.
+   - `prepareBranch` puts the worktree on a later intention's branch at the base commit (the branch is
+     created there, HEAD is pointed at it, the tree and index are reset and proven equal to the base tree),
+     re-checking the lease before each mutation. The wiring wraps it in the two preparation records and
+     hands it to the Loop as `prepareIntention`.
    - **Losing the lease revokes authority**: `lost` fires, the Loop stops (`leaseSignal`) and aborts its running
      steps, live sandbox children are disposed, every write-class tool (src/fencing.ts) and every gate call
      re-proves the lease on the ledger right before it runs (a stale token or a refused renewal refuses it).
@@ -219,7 +253,9 @@ re-plans for the new hash.
    These switches are read from the operator's environment, never from the manifest.
 5. **Worker.** `StepWorker` runs a `ChildProcessRepl` per exec, built from the manifest's sandbox profile, plus:
    - the fourteen mandatory hooks (`assertMandatory`);
-   - the tools read/edit/listFiles, and runVerify bound to the goal check;
+   - the tools read/edit/delete/listFiles, and runVerify bound to the goal check. Under a change-path
+     envelope the edit and delete tools get the step's declared subset (from the accepted contract and the
+     step's `changes`) and refuse any other path, naming it;
    - every known secret, for redaction and the canary;
    - Brain context (lessons, episodes) added to each step's inputs. No run writes episodes or stages
      lessons yet, so this context is empty in practice.
@@ -230,7 +266,8 @@ re-plans for the new hash.
    stand-in's first use is recorded as `capability.mocked` on the step's goal.
 6. **Gates.** `createGates` gets the METERED reviewer seat (src/metering.ts: reserve before, settle at actual
    after, an overrun is exhaustion → exit 7), every writer identity, the redactor, the worktree and the
-   session. verify/review/commit/pr/reconcile are exposed. The commit branch is `<branchPrefix><goal name>`;
+   session. verify/review/commit/pr/reconcile are exposed. The commit branch is `<branchPrefix><goal name>`
+   for a goal's first intention and the prepared `<branchPrefix><goal name>.<n>` for a later one;
    the PR gate gets `.tecera/runs` for its bundle, the run's PATH for gh (gh sees only its own variables) and
    the run's cost line for the PR body. A gates build without a PR gate fails `gate.pr` for a human.
 7. **Planner.** `ScriptedRunPlanner` (src/scripted.ts) is used when a scripted plan is given. Otherwise

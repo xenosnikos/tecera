@@ -203,9 +203,9 @@ export class ScriptedRunPlanner implements Planner {
   private readonly drafts: ScriptedPlanner;
   constructor(
     private readonly plan: Plan,
-    private readonly o: { contracts?: readonly ScriptedContract[]; connections?: Manifest['connections'] } = {},
+    private readonly o: { contracts?: readonly ScriptedContract[]; connections?: Manifest['connections']; allowedChanges?: readonly string[]; protectedPaths?: readonly string[] } = {},
   ) {
-    this.drafts = new ScriptedPlanner({ plans: [plan], ...(o.contracts ? { contracts: o.contracts } : {}), ...(o.connections ? { connections: o.connections } : {}) });
+    this.drafts = new ScriptedPlanner({ plans: [plan], ...(o.contracts ? { contracts: o.contracts } : {}), ...(o.connections ? { connections: o.connections } : {}), ...(o.allowedChanges ? { allowedChanges: o.allowedChanges } : {}), ...(o.protectedPaths ? { protectedPaths: o.protectedPaths } : {}) });
   }
 
   write(e: TeceraEvent, beliefs: BeliefProjection, goal: AchievementGoal, meter?: UsageMeter, ctx?: PlanningContext): Promise<Plan> {

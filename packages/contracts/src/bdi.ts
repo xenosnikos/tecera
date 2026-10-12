@@ -1,5 +1,5 @@
 import type { Json, JsonObject } from './json.js';
-import type { Criterion, CriterionProof, Fidelity } from './acceptance.js';
+import { envelopeProblem, type ChangePath, type Criterion, type CriterionProof, type Fidelity } from './acceptance.js';
 
 /**
  * BDI vocabulary. Beliefs are plain facts projected from the log. Goals carry an environmental check.
@@ -152,6 +152,12 @@ export interface Step {
    * must be in plan.permissions.tools (validatePlanShape). Replaces the old `inputs.tools` convention.
    */
   tools?: string[];
+  /**
+   * The paths this worker step may create, modify or delete: a subset of the accepted contract's envelope
+   * (of repo.allowedChanges when the contract states none). Declared before execution; a plan can narrow the
+   * envelope, never widen it (policy changeEnvelope). Absent = the whole envelope.
+   */
+  changes?: ChangePath[];
 }
 
 /** What a plan reacts to: an event kind plus optional payload constraints. */
@@ -342,6 +348,12 @@ export function validatePlanShape(plan: Plan): string[] {
     }
     for (const t of s.tools) if (!allowedTools.has(t)) errors.push(`step ${s.id} tool ${t} is not in plan.permissions.tools`);
   }
+  for (const s of plan.steps) {
+    if (s.changes === undefined) continue;
+    if (s.kind !== 'worker') errors.push(`step ${s.id} declares changes but is not a worker step`);
+    const why = envelopeProblem(s.changes);
+    if (why) errors.push(`step ${s.id} changes: ${why}`);
+  }
   // cycle check (Kahn)
   const indeg = new Map<string, number>();
   for (const s of plan.steps) indeg.set(s.id, s.dependsOn.length);
@@ -400,9 +412,14 @@ export function isWritingStep(plan: Plan, step: Step): boolean {
  * never file contents. `kind` names the gate that refused the candidate.
  */
 export interface FailureContext {
-  kind: 'verify' | 'review';
+  kind: 'verify' | 'review' | 'envelope';
   /** The attempt whose candidate was refused. */
   attempt: number;
+  /**
+   * envelope (and a verify refused for it): paths the host found changed outside what the step or the
+   * accepted contract allows, each with the operation it amounts to against the base.
+   */
+  unexpected?: UnexpectedPathContext[];
   /** verify: the criteria (or the goal check, id 'check') that did not pass. */
   criteria?: FailedCriterionContext[];
   /** review: the reviewer's findings. */
@@ -411,6 +428,11 @@ export interface FailureContext {
   reason?: string;
   instruction: string;
   untrusted: true;
+}
+
+export interface UnexpectedPathContext {
+  path: string;
+  op: string;
 }
 
 export interface FailedCriterionContext {

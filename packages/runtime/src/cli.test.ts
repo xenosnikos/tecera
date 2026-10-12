@@ -55,6 +55,15 @@ function gitRepo(dir: string): void {
   g('commit', '-q', '-m', 'base');
 }
 
+/**
+ * The human decision commands refuse without a terminal (decisionGuard.ts). This suite makes them as the local
+ * human from a test process: the explicit opt-out, on those commands only, never on `tecera run`.
+ */
+const humanEnv = (argv: readonly string[]): Record<string, string> =>
+  argv[0] === 'approve' || argv[0] === 'deny' || (argv[0] === 'criteria' && (argv[1] === 'accept' || argv[1] === 'amend')) || (argv[0] === 'resources' && (argv[1] === 'release' || argv[1] === 'transfer')) || ((argv[0] === 'plans' || argv[0] === 'memory') && ['graduate', 'reject', 'retract'].includes(argv[1] ?? ''))
+    ? { TECERA_DECISION_NONINTERACTIVE: '1' }
+    : {};
+
 let idn = 0;
 async function cli(cwd: string, argv: string[], opts: MainOptions = {}): Promise<{ code: number; out: string; err: string }> {
   let out = '';
@@ -62,7 +71,7 @@ async function cli(cwd: string, argv: string[], opts: MainOptions = {}): Promise
   const { env: extraEnv, ...rest } = opts;
   const code = await main(argv, {
     cwd,
-    env: { ...ENV, ...(extraEnv ?? {}) },
+    env: { ...ENV, ...humanEnv(argv), ...(extraEnv ?? {}) },
     stdout: (s) => (out += s),
     stderr: (s) => (err += s),
     isTTY: false,

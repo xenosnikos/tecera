@@ -2,6 +2,7 @@ import { Brain, GraduationError } from '@tecera/brain';
 import type { Json } from '@tecera/contracts';
 import type { Command, CommandContext } from '../cli/context.js';
 import { pad } from '../cli/io.js';
+import { guardDecision } from '../decisionGuard.js';
 import { CliError, EXIT } from '../errors.js';
 import { PlanDecisionError, PlanRegistry, type PlanVerdict } from '../plans.js';
 import { localPrincipal, PrincipalError, type HumanIdentity } from '../principal.js';
@@ -12,6 +13,9 @@ import { safeWriteFile } from '../util/safefs.js';
  * Learning goes through humans only: a decision needs a non-empty rationale (exit 2 without) and the local
  * human principal (principal.ts, D1: `--as` or $USER), recorded with the decision. Plans are a projection of plan.* events (PlanRegistry); memory is @tecera/brain over
  * the same ledger. Graduated plans are also rendered to `.tecera/plans/<id>.json` as a view.
+ * graduate, reject and retract go through the accident guard first (decisionGuard.ts: exit 8 under an
+ * agent-host marker or without a terminal, unless TECERA_DECISION_NONINTERACTIVE=1; not authentication).
+ * `candidates` only reads and is not guarded.
  */
 
 const VERBS = ['candidates', 'graduate', 'reject', 'retract'] as const;
@@ -24,8 +28,12 @@ function parseVerb(c: CommandContext, noun: string): { verb: Verb; id?: string; 
   return { verb: verb as Verb, id, rationale: c.args.values.rationale?.trim() ?? '' };
 }
 
-async function needDecider(c: CommandContext, verb: Verb, rationale: string): Promise<HumanIdentity> {
+function needRationale(verb: Verb, rationale: string): void {
   if (!rationale) throw new CliError(`${verb}: --rationale is required (learning is a human decision with a reason)`, EXIT.usage);
+}
+
+async function needDecider(c: CommandContext, verb: Verb, rationale: string): Promise<HumanIdentity> {
+  needRationale(verb, rationale);
   try {
     return localPrincipal(c.runtime(), { as: c.args.values.as });
   } catch (e) {
@@ -36,6 +44,11 @@ async function needDecider(c: CommandContext, verb: Verb, rationale: string): Pr
 
 export const plansCommand: Command = async (c) => {
   const { verb, id, rationale } = parseVerb(c, 'plans');
+  if (verb !== 'candidates') {
+    needRationale(verb, rationale); // usage errors first (exit 2), wherever the command is run
+    const guard = guardDecision(c, `plans ${verb}`);
+    if (typeof guard === 'number') return guard;
+  }
   const rt = c.runtime();
   const ledger = rt.ledger();
   const reg = await PlanRegistry.load(ledger);
@@ -69,6 +82,11 @@ export const plansCommand: Command = async (c) => {
 
 export const memoryCommand: Command = async (c) => {
   const { verb, id, rationale } = parseVerb(c, 'memory');
+  if (verb !== 'candidates') {
+    needRationale(verb, rationale);
+    const guard = guardDecision(c, `memory ${verb}`);
+    if (typeof guard === 'number') return guard;
+  }
   const rt = c.runtime();
   const ledger = rt.ledger();
   const ident = verb === 'candidates' ? null : await needDecider(c, verb, rationale);

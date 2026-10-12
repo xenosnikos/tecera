@@ -85,6 +85,13 @@ export async function authorizeWriteVia(guard: WriteGuard, _ctx: ToolContext, w:
   }
 }
 
+/**
+ * An extra, host-supplied check on one repository mutation (a write or a deletion of the resolved
+ * worktree-relative path), on top of the capability allowlist and the protected paths: the runtime uses it
+ * to hold the step to its declared change paths. Throw to refuse; nothing has been changed yet.
+ */
+export type ChangeAuthorizer = (rel: string, kind: 'write' | 'delete', ctx: ToolContext) => void;
+
 export const redactorOf = (ctx: ToolContext): Redactor | undefined => (ctx as WorkerToolContext).redactor;
 export const signalOf = (ctx: ToolContext): AbortSignal | undefined => (ctx as WorkerToolContext).signal;
 

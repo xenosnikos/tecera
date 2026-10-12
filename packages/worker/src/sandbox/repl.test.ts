@@ -132,7 +132,9 @@ describe('escape', () => {
       expect(found).toBe(true);
       expect(environ).not.toContain(value);
       expect(environ).not.toContain('NODE_OPTIONS');
-      expect(environ.split('\0').filter(Boolean).map((kv) => kv.split('=')[0]).sort()).toEqual(['HOME', 'LANG', 'PATH', 'TMPDIR']);
+      // TECERA_SANDBOX is the supervisor's own marker (env.ts), set for every process the sandbox starts.
+      expect(environ.split('\0').filter(Boolean).map((kv) => kv.split('=')[0]).sort()).toEqual(['HOME', 'LANG', 'PATH', 'TECERA_SANDBOX', 'TMPDIR']);
+      expect(environ.split('\0')).toContain('TECERA_SANDBOX=repl');
       // The dropped name is reported, but it is itself canary-shaped, so the trace carries it redacted.
       expect(r.trace.envDropped).toHaveLength(1);
       expect(JSON.stringify(r)).not.toContain(value);

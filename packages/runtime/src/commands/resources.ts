@@ -4,6 +4,7 @@ import { LocalProvisioner, ProvisioningRefused, resourcesRoot } from '../capabil
 import { resourceTransferredEvent } from '../capabilities/events.js';
 import { releaseRecorded } from '../capabilities/sweep.js';
 import type { Command, CommandContext } from '../cli/context.js';
+import { guardDecision } from '../decisionGuard.js';
 import { CliError, EXIT } from '../errors.js';
 import { identityJson, localPrincipal, PrincipalError, type HumanIdentity } from '../principal.js';
 import type { Runtime } from '../runtime.js';
@@ -23,6 +24,9 @@ import type { Runtime } from '../runtime.js';
  *   (resource.transferred, actor and `to` human; `to` defaults to the principal). Tecera never tears it down
  *   afterwards. Release and transfer hold the resource's lock and read the ledger again under it, so the
  *   one that gets there first decides.
+ * - release and transfer are human decisions: both go through the accident guard first (decisionGuard.ts:
+ *   exit 8 under an agent-host marker or without a terminal, unless TECERA_DECISION_NONINTERACTIVE=1). It is
+ *   not authentication. `list` only reads and is not guarded.
  */
 
 export interface ResourcesCommandOptions {
@@ -89,9 +93,15 @@ export function resourcesListCommand(): Command {
   };
 }
 
-async function target(c: CommandContext, rt: Runtime, verb: string): Promise<{ r: ProvisionedResource } | { code: number }> {
+/** The resource id of `release|transfer <resourceId>`; a usage error (exit 2) comes before everything else. */
+function resourceArg(c: CommandContext, verb: string): string {
   const id = c.args.positionals[1];
   if (!id || c.args.positionals.length > 2) throw new CliError(`usage: tecera resources ${verb} <resourceId>${verb === 'transfer' ? ' [--to id]' : ''} [--as id] [--reason text]`, EXIT.usage);
+  return id;
+}
+
+async function target(c: CommandContext, rt: Runtime, verb: string): Promise<{ r: ProvisionedResource } | { code: number }> {
+  const id = resourceArg(c, verb);
   if (!rt.ledgerExists()) {
     c.out.error(`resources ${verb}: no ledger yet`);
     return { code: EXIT.error };
@@ -107,6 +117,9 @@ async function target(c: CommandContext, rt: Runtime, verb: string): Promise<{ r
 
 export function resourcesReleaseCommand(o: ResourcesCommandOptions = {}): Command {
   return async (c) => {
+    resourceArg(c, 'release');
+    const guard = guardDecision(c, 'resources release');
+    if (typeof guard === 'number') return guard;
     const rt = c.runtime();
     const t = await target(c, rt, 'release');
     if ('code' in t) return t.code;
@@ -155,6 +168,9 @@ export function resourcesReleaseCommand(o: ResourcesCommandOptions = {}): Comman
 
 export function resourcesTransferCommand(o: ResourcesCommandOptions = {}): Command {
   return async (c) => {
+    resourceArg(c, 'transfer');
+    const guard = guardDecision(c, 'resources transfer');
+    if (typeof guard === 'number') return guard;
     const rt = c.runtime();
     const t = await target(c, rt, 'transfer');
     if ('code' in t) return t.code;

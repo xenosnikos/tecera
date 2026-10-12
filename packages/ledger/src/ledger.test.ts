@@ -3,13 +3,13 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { LedgerError, approvalGrantedEvent, event } from '@tecera/contracts';
+import { LedgerError, approvalGrantedEvent, event, eventsChainProblem } from '@tecera/contracts';
 import { grantAudited, ledgerConformance } from './conformance.js';
 import { MemoryLedger } from './memory.js';
 import { SqliteLedger } from './sqlite.js';
 
-ledgerConformance('MemoryLedger', () => new MemoryLedger());
-ledgerConformance('SqliteLedger', () => new SqliteLedger(join(mkdtempSync(join(tmpdir(), 'tecera-ledger-')), 'l.sqlite')));
+ledgerConformance('MemoryLedger', (now) => new MemoryLedger(now ? { now } : {}));
+ledgerConformance('SqliteLedger', (now) => new SqliteLedger(join(mkdtempSync(join(tmpdir(), 'tecera-ledger-')), 'l.sqlite'), now ? { now } : {}));
 
 describe('SqliteLedger specifics', () => {
   it('triggers forbid UPDATE and DELETE on events and evidence', async () => {
@@ -217,6 +217,132 @@ describe('SqliteLedger multi-connection chain and migration', () => {
     await b.consume('q', 'h', 's', 'cq', 20);
     expect((await a.getApproval('q'))!.state).toBe('consumed');
     expect(await b.verifyChain()).toEqual({ ok: true, length: 1 });
+    a.close();
+    b.close();
+  });
+});
+
+describe('chain numbering: sequence numbers must run 1..N without a gap', () => {
+  const three = async (l: SqliteLedger | MemoryLedger): Promise<void> => {
+    await l.append(event('run.started', { id: 'e1', at: 1, actor: sys, payload: {} }));
+    await l.append(event('belief.added', { id: 'e2', at: 2, actor: sys, payload: { key: 'k', value: 1 } }));
+    await l.append(event('run.ended', { id: 'e3', at: 3, actor: sys, payload: {} }));
+  };
+
+  it('SqliteLedger: renumbered events (hashes untouched) are reported; the hash chain alone would not see it', async () => {
+    const l = new SqliteLedger(tmpDb());
+    await three(l);
+    expect(await l.verifyChain()).toEqual({ ok: true, length: 3 });
+    l.rawExec('DROP TRIGGER events_no_update');
+    // Shift every row up, last first, so no intermediate state collides: prev_hash and hash still link.
+    for (const seq of [3, 2, 1]) l.rawExec(`UPDATE events SET seq = ${seq + 10} WHERE seq = ${seq}`);
+    const v = await l.verifyChain();
+    expect(v).toMatchObject({ ok: false, brokenAtSeq: 11, reason: /events sequence has a gap at seq 1 \(found 11\)/ });
+    const all = [];
+    for await (const e of l.events()) all.push(e);
+    expect(eventsChainProblem(all)).toMatch(/gap at seq 1 \(found 11\)/); // the pure verifier agrees
+    l.close();
+  });
+
+  it('SqliteLedger: renumbering only the tail (a hole before the last row) is reported at that row', async () => {
+    const l = new SqliteLedger(tmpDb());
+    await three(l);
+    l.rawExec('DROP TRIGGER events_no_update');
+    l.rawExec('UPDATE events SET seq = 7 WHERE seq = 3');
+    expect(await l.verifyChain()).toMatchObject({ ok: false, brokenAtSeq: 7, reason: /gap at seq 3 \(found 7\)/ });
+    l.close();
+  });
+
+  it('SqliteLedger: a deleted middle event is reported at the first row after the hole', async () => {
+    const l = new SqliteLedger(tmpDb());
+    await three(l);
+    l.rawExec('DROP TRIGGER events_no_delete');
+    l.rawExec('DELETE FROM events WHERE seq = 2');
+    expect(await l.verifyChain()).toMatchObject({ ok: false, brokenAtSeq: 3, reason: /gap at seq 2 \(found 3\)/ });
+    l.close();
+  });
+
+  it('SqliteLedger: renumbered evidence and a deleted middle evidence row are reported with the key', async () => {
+    const l = new SqliteLedger(tmpDb());
+    await three(l);
+    for (const k of ['a', 'b', 'c']) await l.evidence({ key: k, kind: 'x', runId: 'r', body: { k } });
+    expect(await l.verifyChain()).toEqual({ ok: true, length: 3 });
+    l.rawExec('DROP TRIGGER evidence_no_update');
+    l.rawExec(`UPDATE evidence SET n = 9 WHERE key = 'c'`);
+    expect(await l.verifyChain()).toMatchObject({ ok: false, brokenEvidenceKey: 'c', reason: /gap/ });
+    l.rawExec(`UPDATE evidence SET n = 3 WHERE key = 'c'`);
+    expect(await l.verifyChain()).toEqual({ ok: true, length: 3 });
+    l.rawExec('DROP TRIGGER evidence_no_delete');
+    l.rawExec(`DELETE FROM evidence WHERE key = 'b'`);
+    expect(await l.verifyChain()).toMatchObject({ ok: false, brokenEvidenceKey: 'c', reason: /gap/ });
+    l.close();
+  });
+
+  it('SqliteLedger: refused and rolled-back inserts leave no gap (the numbering the check relies on)', async () => {
+    const path = tmpDb();
+    const l = new SqliteLedger(path);
+    await l.append(event('run.started', { id: 'e1', at: 1, actor: sys, payload: {}, idemKey: 'ik1' }));
+    // refused by the append-only trigger, by a constraint, and ignored
+    expect(() => l.rawExec(`INSERT INTO events (id, kind, at, actor_kind, actor_id, payload, prev_hash, hash) VALUES ('e1', 'run.ended', 9, 'system', 's', '{}', 'p', 'x')`)).toThrow(/append-only/);
+    expect(() => l.rawExec(`INSERT INTO events (id, kind, at, actor_kind, actor_id, payload, prev_hash, hash) VALUES ('n1', 'run.ended', 9, 'system', 's', NULL, 'p', 'x')`)).toThrow(/NOT NULL/);
+    expect(() => l.rawExec(`INSERT OR IGNORE INTO events (id, kind, at, actor_kind, actor_id, payload, prev_hash, hash) VALUES ('e1', 'run.ended', 9, 'system', 's', '{}', 'p', 'y')`)).toThrow(/append-only/);
+    // an explicit transaction that inserted an event and rolled back
+    expect(() => l.rawExec(`BEGIN IMMEDIATE; INSERT INTO events (id, kind, at, actor_kind, actor_id, payload, prev_hash, hash) VALUES ('tmp', 'run.ended', 9, 'system', 's', '{}', 'p', 'z'); ROLLBACK;`)).not.toThrow();
+    // a grant whose row update fails after its audit event was inserted: the event is rolled back with it
+    await l.requestApproval({ requestId: 'q', runId: 'r', sessionId: 's', actionHash: 'h', requester: { kind: 'agent', id: 'w' }, reason: 'x', expiresAt: 1000 });
+    l.rawExec(`CREATE TRIGGER test_no_grant BEFORE UPDATE ON approvals WHEN NEW.state = 'granted' BEGIN SELECT RAISE(ABORT, 'forced grant failure'); END;`);
+    await expect(grantAudited(l, 'q', { kind: 'human', id: 'h1' }, 's', 10, { actionHash: 'h' })).rejects.toThrow(/forced grant failure/);
+    l.rawExec('DROP TRIGGER test_no_grant');
+    // duplicates write nothing
+    expect((await l.append(event('run.ended', { id: 'dup', at: 2, actor: sys, payload: {}, idemKey: 'ik1' }))).duplicate).toBe(true);
+    const next = await l.append(event('run.ended', { id: 'e2', at: 2, actor: sys, payload: {} }));
+    expect(next.seq).toBe(2);
+    l.close();
+    // and a second connection continues from the same number
+    const b = new SqliteLedger(path);
+    expect((await b.append(event('belief.added', { id: 'e3', at: 3, actor: sys, payload: { key: 'k', value: 1 } }))).seq).toBe(3);
+    expect(await b.verifyChain()).toEqual({ ok: true, length: 3 });
+    b.close();
+  });
+
+  it('MemoryLedger: renumbered events and a deleted middle event are reported', async () => {
+    const a = new MemoryLedger();
+    await three(a);
+    expect(await a.verifyChain()).toEqual({ ok: true, length: 3 });
+    a.tamperEventsForTest({ renumber: (seq) => seq + 10 });
+    expect(await a.verifyChain()).toMatchObject({ ok: false, brokenAtSeq: 11, reason: /gap at seq 1 \(found 11\)/ });
+    const b = new MemoryLedger();
+    await three(b);
+    b.tamperEventsForTest({ dropSeq: 2 });
+    expect(await b.verifyChain()).toMatchObject({ ok: false, brokenAtSeq: 3, reason: /gap at seq 2 \(found 3\)/ });
+  });
+
+  it('SqliteLedger: both chains are verified in one read snapshot (a commit between the two reads is not seen)', async () => {
+    const path = tmpDb();
+    const a = new SqliteLedger(path);
+    const b = new SqliteLedger(path);
+    await a.append(event('run.started', { id: 'e1', at: 1, actor: sys, payload: {} }));
+    await a.evidence({ key: 'k1', kind: 'x', runId: 'r', body: { v: 1 } });
+    // Connection b commits an event and an evidence row bound to it right after a has read the events table.
+    const raw = (a as unknown as { db: Database.Database }).db;
+    const prepare = raw.prepare.bind(raw);
+    let injected = false;
+    (raw as unknown as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
+      const st = prepare(sql);
+      if (!injected && /FROM evidence ORDER BY/.test(sql)) {
+        injected = true;
+        const w = new Database(path);
+        const ins = new SqliteLedger(path);
+        void ins.append(event('run.ended', { id: 'e2', at: 2, actor: sys, payload: {} }));
+        void ins.evidence({ key: 'k2', kind: 'x', runId: 'r', body: { v: 2 } });
+        ins.close();
+        w.close();
+      }
+      return st;
+    };
+    expect(await a.verifyChain()).toEqual({ ok: true, length: 1 });
+    expect(injected).toBe(true);
+    expect(await b.verifyChain()).toEqual({ ok: true, length: 2 });
     a.close();
     b.close();
   });

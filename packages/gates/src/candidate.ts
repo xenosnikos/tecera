@@ -87,6 +87,12 @@ export interface IgnoredBaseline {
 export interface SnapshotOptions {
   /** Ignored files recorded on the untouched tree. Unchanged ones are not changes; missing ones are. */
   ignoredBaseline?: IgnoredBaseline;
+  /**
+   * The work branch of an intention that was prepared onto its own branch (intentionBranch.ts). It is part
+   * of the fingerprint, so evidence keyed by a fingerprint (verify, criteria, review) is never shared between
+   * two intentions of one run. Absent for a goal's first intention: its fingerprints are unchanged.
+   */
+  branch?: string;
   signal?: AbortSignal;
 }
 
@@ -272,6 +278,7 @@ export async function snapshotCandidate(dir: string, base: string, o: SnapshotOp
     v: 4,
     head,
     baseCommit,
+    ...(o.branch !== undefined ? { branch: o.branch } : {}),
     // A deleted baseline entry is fingerprinted by its key, never by its (display) name.
     files: files.map((f) => [f.deleted ? `<deleted ${f.pathKey}>` : f.path, f.status, f.mode ?? null, f.oid ?? null, f.sha256 ?? null, f.unreadable ?? null, f.stamp ?? null]),
     ignored: Object.keys(ignored)

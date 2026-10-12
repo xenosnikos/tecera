@@ -2,7 +2,7 @@ import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rm
 import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Lease, Ledger } from '@tecera/contracts';
-import { assertSafeRepo, hostGit, UnsafeRepo } from '@tecera/gates';
+import { assertSafeRepo, hostGit, ignoredPathKey, UnsafeRepo } from '@tecera/gates';
 import type { Env } from './util/proc.js';
 
 /**
@@ -21,13 +21,17 @@ import type { Env } from './util/proc.js';
  * - Not a git repository: a plain copy (ledger files and runs excluded) turned into a fresh one-commit
  *   repository on `<base>`, recorded as `worktree.no-git` evidence: the commit lands in the copy, not in the
  *   developer's directory.
- * - Lease: `ledger.lease('worktree:<runId>', holder)` with a TTL that is renewed while the run lives; the
+ * - Lease: `ledger.lease('worktree:<runId>', holder)` with a TTL that is renewed (every sixth of it) while the run lives; the
  *   fencing token goes to every worker step. A lease held by a live holder refuses the run (two processes
  *   never drive one worktree). Losing the lease REVOKES authority in this process: the token is dropped,
  *   `lost` (an AbortSignal) fires so the loop stops and every running step/gate is aborted, and
  *   `assertHeld()` (called by the fenced tools and gate wrappers right before each mutation) re-proves the
  *   lease against the ledger itself (renew with the same holder and token), not against a copied number.
  * - Resume reuses the run's worktree and must find it intact (same path, a worktree of this repository).
+ * - A later intention of the goal gets its own branch (`prepareBranch`): the branch is created at the pinned
+ *   base commit, HEAD is pointed at it and the working tree and index are made equal to the base tree. What
+ *   the previous intention left (its commit on its own branch, uncommitted and ignored files) is not carried
+ *   over; its branch is not touched. Every step re-checks the lease.
  *
  * Every failure is a WiringError: the run does not start.
  */
@@ -116,7 +120,30 @@ export interface LeasedWorktree {
    * HEAD, and the result re-snapshotted and compared (a mismatch throws: nothing is confirmed).
    */
   restore(checkpointId: string, signal?: AbortSignal): Promise<string>;
+  /**
+   * Put the worktree on `branch` at the base commit (see prepareWorktreeBranch). The lease is re-checked right
+   * before every mutation; LeaseLost leaves whatever was not yet moved exactly as it was. Idempotent.
+   */
+  prepareBranch(a: PrepareBranchOptions): Promise<PreparedBranch>;
   release(): Promise<void>;
+}
+
+export interface PrepareBranchOptions {
+  branch: string;
+  /** Ignored files to keep, by ignoredPathKey (the run's ignored baseline). Every other ignored file is removed. */
+  keepIgnored?: (pathKey: string) => boolean;
+  signal?: AbortSignal;
+  /** Fault injection for crash and fence tests only: runs after the entry checks, before the first mutation. */
+  beforeMutation?: () => void | Promise<void>;
+}
+
+export interface PreparedBranch {
+  branch: string;
+  baseSha: string;
+  /** False when the branch already existed at the base (an earlier, interrupted preparation created it). */
+  created: boolean;
+  /** Ignored files removed because the run's baseline does not hold them. */
+  removedIgnored: number;
 }
 
 export class LeaseLost extends Error {
@@ -133,7 +160,7 @@ export interface LeaseOptions {
   ledger: Ledger;
   worktreesRoot: string;
   resume: boolean;
-  /** Lease TTL; renewed every ttl/3 while the run lives. */
+  /** Lease TTL; renewed every ttl/6 while the run lives. */
   ttlMs: number;
   holder: string;
   signal?: AbortSignal;
@@ -189,7 +216,10 @@ export async function leaseWorktree(o: LeaseOptions): Promise<LeasedWorktree> {
   const lostCtl = new AbortController();
   // Local validity: a renewal REQUESTED at t keeps the lease ours on the ledger until at least t + ttl; we stop
   // writing a margin earlier (clock steps, scheduling), so no write of ours can land after a takeover.
-  const margin = Math.min(Math.max(Math.floor(o.ttlMs / 4), 1), 30_000);
+  // The margin is an eighth of the ttl (at most 30 s) and renewals go out every sixth of it, so a renewal that
+  // is late (a stalled event loop, a slow disk) but still lands inside the validity keeps the lease: only
+  // several missed renewals in a row lose it.
+  const margin = Math.min(Math.max(Math.floor(o.ttlMs / 8), 1), 30_000);
   let validUntil = leaseRequestedAt + o.ttlMs - margin;
   const stop = (): void => {
     if (timer) clearInterval(timer);
@@ -313,7 +343,7 @@ export async function leaseWorktree(o: LeaseOptions): Promise<LeasedWorktree> {
       if (!current) return;
       // A failed renewal revokes (inside renewOnce): no further writes, gates or steps in this process.
       renewShared().catch(() => undefined);
-    }, Math.max(50, Math.floor(o.ttlMs / 3)));
+    }, Math.max(25, Math.floor(o.ttlMs / 6)));
     timer.unref();
 
     return {
@@ -332,6 +362,11 @@ export async function leaseWorktree(o: LeaseOptions): Promise<LeasedWorktree> {
       heldReason,
       checkpoint: (signal?: AbortSignal) => snapshotTree(path, signal),
       restore: (checkpointId: string, signal?: AbortSignal) => restoreTree(path, baseSha, checkpointId, signal),
+      prepareBranch: (a: PrepareBranchOptions) =>
+        prepareWorktreeBranch(path, baseSha, a, () => {
+          const why = heldReason();
+          if (why !== null) throw new LeaseLost(why);
+        }),
       release,
     };
   } catch (e) {
@@ -400,6 +435,32 @@ export async function diffTrees(dir: string, from: string, to: string, signal?: 
 }
 
 /**
+ * Every path that differs between two checkpoints (`tree:<oid>` each; `from` may be 'base' when `baseSha` is
+ * given) and whether it is gone in the second.
+ * Renames are not paired: the old name is listed as deleted and the new one as present. Names only.
+ */
+export async function changedPaths(dir: string, from: string, to: string, signal?: AbortSignal, baseSha?: string): Promise<{ path: string; deleted: boolean }[]> {
+  const oid = (id: string): string => {
+    const m = TREE_ID.exec(id);
+    if (!m) throw new Error(`not a worktree checkpoint: ${JSON.stringify(id)}`);
+    return m[1]!;
+  };
+  // 'base': the tree of the run's base commit
+  const first = from === 'base' && baseSha ? (await hostGit(dir, ['rev-parse', '--verify', `${baseSha}^{tree}`], { signal })).trim() : oid(from);
+  const out = await hostGit(dir, ['diff-tree', '-r', '--no-renames', '--name-status', '-z', first, oid(to)], { signal, maxBuffer: 16 * 1024 * 1024 });
+  // -z name-status without renames: "<status>\0<path>\0" per file
+  const parts = out.split('\0');
+  const files: { path: string; deleted: boolean }[] = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const status = parts[i]!;
+    const path = parts[i + 1]!;
+    if (!status || !path) continue;
+    files.push({ path, deleted: status.startsWith('D') });
+  }
+  return files;
+}
+
+/**
  * Make the worktree equal to `checkpointId` ('base' or tree:<oid>), reset the index to HEAD, and prove it by
  * re-snapshotting. Returns the restored checkpoint id. Throws when the id is malformed or the proof fails.
  */
@@ -421,4 +482,62 @@ export async function restoreTree(dir: string, baseSha: string, checkpointId: st
   const now = await snapshotTree(dir, signal);
   if (now !== `tree:${tree}`) throw new Error(`worktree restore to ${checkpointId} did not converge (now ${now})`);
   return checkpointId;
+}
+
+// ---------- a fresh work branch per intention ----------
+
+/**
+ * Put the worktree `dir` on `branch` at `baseSha`, carrying nothing over:
+ *  1. the branch must not exist, or exist at the base (an interrupted preparation); anything else is refused;
+ *  2. `fence()` (throws when the lease is gone), then the branch is created at the base;
+ *  3. `fence()`, then HEAD is pointed at the branch (the previous intention's branch keeps its commit);
+ *  4. `fence()`, then the working tree and index are made equal to the base tree (restoreTree, proven by a
+ *     re-snapshot), and ignored files the run's baseline does not hold are removed;
+ *  5. the result is read back: HEAD is the branch, the branch is the base.
+ * No step runs after a failed fence, so a lost lease before step 2 leaves the repository untouched.
+ */
+export async function prepareWorktreeBranch(dir: string, baseSha: string, a: PrepareBranchOptions, fence: () => void): Promise<PreparedBranch> {
+  const signal = a.signal;
+  const ref = `refs/heads/${a.branch}`;
+  await hostGit(dir, ['check-ref-format', '--branch', a.branch], { signal });
+  const oidOf = async (r: string): Promise<string | null> => (await hostGit(dir, ['rev-parse', '--verify', '--quiet', `${r}^{commit}`], { signal }).catch(() => '')).trim() || null;
+  const at = await oidOf(ref);
+  if (at !== null && at !== baseSha) throw new Error(`branch ${a.branch} already exists at ${at}, not at the base ${baseSha}; refusing to reuse it`);
+  await a.beforeMutation?.();
+  fence();
+  if (at === null) await hostGit(dir, ['update-ref', '-m', 'tecera: prepare intention branch', ref, baseSha, '0'.repeat(baseSha.length)], { signal });
+  fence();
+  await hostGit(dir, ['symbolic-ref', '-m', 'tecera: prepare intention branch', 'HEAD', ref], { signal });
+  fence();
+  await restoreTree(dir, baseSha, 'base', signal);
+  fence();
+  const removedIgnored = removeIgnored(dir, (await hostGit(dir, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard'], { signal, maxBuffer: 64 * 1024 * 1024 })).split('\0'), a.keepIgnored);
+  const headRef = (await hostGit(dir, ['symbolic-ref', '-q', 'HEAD'], { signal }).catch(() => '')).trim();
+  const head = await oidOf('HEAD');
+  if (headRef !== ref || head !== baseSha) throw new Error(`the worktree is not on ${a.branch} at the base after its preparation (HEAD ${headRef || 'detached'} at ${head ?? 'nothing'})`);
+  return { branch: a.branch, baseSha, created: at === null, removedIgnored };
+}
+
+/** Remove the listed ignored paths unless kept. A path that leaves the worktree (a link on the way) is refused. */
+function removeIgnored(dir: string, listed: readonly string[], keep?: (pathKey: string) => boolean): number {
+  const root = realpathSync(dir);
+  let n = 0;
+  for (const raw of listed) {
+    if (!raw) continue;
+    const rel = raw.endsWith('/') ? raw.slice(0, -1) : raw;
+    if (keep?.(ignoredPathKey(rel))) continue;
+    if (isAbsolute(rel) || rel.split('/').includes('..')) throw new Error(`ignored path ${JSON.stringify(rel)} is not inside the worktree`);
+    const abs = join(root, rel);
+    let parent: string;
+    try {
+      parent = realpathSync(dirname(abs));
+    } catch {
+      continue; // already gone with a directory removed above
+    }
+    if (!inside(root, parent)) throw new Error(`ignored path ${JSON.stringify(rel)} resolves outside the worktree; refusing to remove it`);
+    // rmSync removes a link itself, never what it points at
+    rmSync(join(parent, abs.slice(dirname(abs).length + 1)), { recursive: true, force: true });
+    n++;
+  }
+  return n;
 }

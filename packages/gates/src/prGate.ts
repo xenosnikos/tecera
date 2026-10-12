@@ -34,6 +34,7 @@ import {
 import { contractOf, criterionFidelity, inventoryById } from './criteria.js';
 import { claim, commandDigest, commitEvidenceKey, defaultIds, errMsg, GateMemo, keyPart, obj, redactorFrom, safeText, usableGuard, verifyMemoFrom, writeEvidence } from './evidence.js';
 import { assertSafeRepo, gitEnv, hostGit, refSafe, UnsafeRepo } from './gitx.js';
+import { workBranchOf } from './intentionBranch.js';
 import { EXIT, type PrResult, type StepContext } from './types.js';
 import { gateWorktree, resolveCheck } from './verifyGate.js';
 
@@ -280,7 +281,9 @@ export class PrGate {
     // ---- the commit: recorded by this run's preceding commit gate, on this goal's work branch, untouched since ----
     const commit = await this.commitEvidence(ctx, sha);
     if ('reason' in commit) return fail(EXIT.human, commit.reason, commit.detail);
-    const branch = `${this.o.manifest.repo.branchPrefix}${refSafe(ctx.goal.id)}`;
+    const wb = await workBranchOf(this.o.ledger, this.redactor, this.o.manifest.repo.branchPrefix, ctx);
+    if (!wb.ok) return fail(EXIT.human, wb.reason, wb.detail);
+    const branch = wb.branch;
     record.branch = branch;
     if (commit.branch !== branch) return fail(EXIT.human, 'not-the-work-branch', { recorded: commit.branch, expected: branch });
     if (branch === this.base || `refs/heads/${branch}` === this.base) return fail(EXIT.policy, 'branch-is-base', branch);

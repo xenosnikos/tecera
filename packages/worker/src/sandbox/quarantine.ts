@@ -29,6 +29,13 @@ export interface WorktreeQuarantine {
   since: number;
   /** The path as given, when it differs from its real path. */
   lexical?: string;
+  /** Who left the work unresolved, when the recorder knows (e.g. `run r1 exec 3`). First recorder wins. */
+  origin?: string;
+  /**
+   * On a lookup: the recorded path that matched and how it relates to the path asked about ('ancestor' = the
+   * recorded path contains it, 'descendant' = it contains the recorded path).
+   */
+  matched?: { path: string; relation: 'same' | 'ancestor' | 'descendant' };
 }
 
 const registry = new Map<string, WorktreeQuarantine>();
@@ -51,7 +58,7 @@ function related(a: string, b: string): boolean {
 }
 
 /** Record that `path` may still be written by something unresolved. Merges with an existing entry (a reason already recorded is not repeated). */
-export function quarantineWorktree(path: string, t: Omit<WorktreeQuarantine, 'path' | 'since'>): void {
+export function quarantineWorktree(path: string, t: Omit<WorktreeQuarantine, 'path' | 'since' | 'matched'>): void {
   if (typeof path !== 'string' || !path) return;
   const key = norm(path);
   const prev = registry.get(key);
@@ -64,6 +71,7 @@ export function quarantineWorktree(path: string, t: Omit<WorktreeQuarantine, 'pa
     outstanding: [...new Set([...(prev?.outstanding ?? []), ...t.outstanding])],
     processes: [...new Set([...(prev?.processes ?? []), ...t.processes])],
     since: prev?.since ?? Date.now(),
+    ...((prev?.origin ?? t.origin) ? { origin: prev?.origin ?? t.origin } : {}),
   });
 }
 
@@ -71,7 +79,14 @@ export function quarantineWorktree(path: string, t: Omit<WorktreeQuarantine, 'pa
 export function worktreeQuarantine(path: string | undefined): WorktreeQuarantine | undefined {
   if (typeof path !== 'string' || !path) return undefined;
   const keys = forms(path);
-  for (const t of registry.values()) if (keys.some((k) => related(k, t.path) || (t.lexical !== undefined && related(k, t.lexical)))) return { ...t, outstanding: [...t.outstanding], processes: [...t.processes] };
+  for (const t of registry.values()) {
+    for (const recorded of t.lexical !== undefined ? [t.path, t.lexical] : [t.path]) {
+      const k = keys.find((x) => related(x, recorded));
+      if (k === undefined) continue;
+      const relation = k === recorded ? 'same' : k.length > recorded.length ? 'ancestor' : 'descendant';
+      return { ...t, outstanding: [...t.outstanding], processes: [...t.processes], matched: { path: recorded, relation } };
+    }
+  }
   return undefined;
 }
 

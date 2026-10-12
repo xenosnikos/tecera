@@ -98,3 +98,5 @@ export { renderBrainSummary, renderPermissionsSettings } from './adapters/render
 export { applyManagedBlock, jsonMerge, BLOCK_START, BLOCK_END } from './adapters/merge.js';
 export { PlannedFs } from './vfs.js';
 export type { Env } from './util/proc.js';
+export { DECISION_NONINTERACTIVE_ENV, AGENT_HOST_MARKERS, guardDecision, decisionGuard } from './decisionGuard.js';
+export type { DecisionGuardRecord, DecisionGuardVerdict } from './decisionGuard.js';

@@ -10,6 +10,8 @@ import {
   payloadOf,
   resourceRegistryOf,
   acceptedContractOf,
+  statedAllows,
+  statedEnvelope,
   type AcceptanceContract,
   type AchievementGoal,
   type CapabilityMockedPayload,
@@ -40,6 +42,7 @@ import {
   type LLMUsage,
   type Manifest,
   type Outcome,
+  type PathChange,
   type Plan,
   type PlanLibrary,
   type PoolUsage,
@@ -49,6 +52,7 @@ import {
   type Reflex,
   type Repl,
   type SecretInput,
+  type StatedEnvelope,
   type TeceraEvent,
   type Trace,
   type UsageMeter,
@@ -58,13 +62,13 @@ import {
   type WriteGuard,
 } from '@tecera/contracts';
 import { Brain } from '@tecera/brain';
-import { createGates, hostGit, PrGate, scrubbedAllowlist, type Gates } from '@tecera/gates';
-import { DEFAULT_LLM_RESERVATION, type SeatCost, type WorktreeChange } from '@tecera/loop';
+import { claim, createGates, GateMemo, hostGit, ignoredBaseline, intentionBranchName, preparationKeys, preparationRecordOf, PrGate, scrubbedAllowlist, snapshotCandidate, writeEvidence, type Gates } from '@tecera/gates';
+import { DEFAULT_LLM_RESERVATION, type IntentionPreparation, type IntentionPreparationRequest, type SeatCost, type WorktreeChange } from '@tecera/loop';
 import { createPlanValidator, LLMPlanner, type RepoFacts } from '@tecera/planner';
 import { allowanceOf, assertMandatory, criterionScriptDirs, mandatoryHooks, packageScriptsOf, type PackageScripts, type PermissionsDoc } from '@tecera/policy';
 import { createProvider, doctorProbe, priceFor, type FetchLike, type SecretStore } from '@tecera/providers';
 import type { Frontier } from '@tecera/reflex';
-import { ChildProcessRepl, createEditTool, createListFilesTool, createReadTool, MESSAGE_KINDS, MESSAGE_METHODS, resourceTools, StepWorker, STORE_KINDS, STORE_METHODS, type ReplFactory } from '@tecera/worker';
+import { ChildProcessRepl, createDeleteTool, createEditTool, createListFilesTool, createReadTool, MESSAGE_KINDS, MESSAGE_METHODS, resourceTools, StepWorker, STORE_KINDS, STORE_METHODS, type ChangeAuthorizer, type ReplFactory } from '@tecera/worker';
 import { capabilityAccess, hostBinding, repositoryFacts, runtimeEnvironment, withStandIns } from './capabilities/access.js';
 import { ConnectionProbe, storeAuthResolver } from './capabilities/probe.js';
 import { LocalProvisioner, locatorWithin, resourcesRoot } from './capabilities/provisioner.js';
@@ -79,7 +83,7 @@ import { OwnershipRecorder, ownerFilePath, reapPriorProcesses, type ReapResult }
 import { providerOptions, providerSetup, withIdentity } from './providerSetup.js';
 import { loadScripts, scriptedFetch, ScriptedRunPlanner, type ScriptSet, type ScriptTap } from './scripted.js';
 import { gitSync, type Env } from './util/proc.js';
-import { diffTrees, leaseWorktree, repoFileView, WiringError, worktreesRoot, type LeasedWorktree } from './worktree.js';
+import { changedPaths, diffTrees, leaseWorktree, repoFileView, WiringError, worktreesRoot, type LeasedWorktree } from './worktree.js';
 
 export { WiringError } from './worktree.js';
 
@@ -99,7 +103,7 @@ export { WiringError } from './worktree.js';
  *    refuses the run) shared by the worker's runVerify tool and the verify gate;
  * 5. the worker: StepWorker over a ChildProcessRepl per exec (sandbox profile from the manifest), the
  *    fourteen mandatory hooks (assertMandatory; progressCheck fed from the ledger's verify fingerprints per
- *    attempt of the step's intention), tools read/edit/listFiles (+ runVerify bound to the goal check), every
+ *    attempt of the step's intention), tools read/edit/delete/listFiles (+ runVerify bound to the goal check), every
  *    known secret for redaction and the canary, brain context added to each step's inputs;
  * 6. gates: createGates with the METERED reviewer seat, every writer identity (planner + workers), the
  *    redactor, the worktree and the session; verify/review/commit/pr/reconcile are exposed (D6: commit lands
@@ -142,7 +146,7 @@ export { WiringError } from './worktree.js';
  */
 
 /** Tools the wired worker exposes (the validator's catalog). */
-export const WIRED_TOOLS = ['read', 'edit', 'listFiles', 'runVerify'] as const;
+export const WIRED_TOOLS = ['read', 'edit', 'delete', 'listFiles', 'runVerify'] as const;
 
 export interface WiringContext {
   root: string;
@@ -227,8 +231,15 @@ export interface WiredPorts {
   worktreeCheckpoint?: (a: { runId: string; intentionId: string; stepId: string; attempt: number; reason: 'baseline' | 'completed' | 'suspended' }) => Promise<string>;
   /** LoopPorts.worktreeChanges: files changed between two checkpoints of the leased worktree (paths and counts). */
   worktreeChanges?: (a: { runId: string; intentionId: string; stepId: string; from: string; to: string }) => Promise<WorktreeChange[]>;
+  /** LoopPorts.stepChanges: every path changed between two checkpoints with its operation against the base, and the ignored files that differ from the run's baseline. */
+  stepChanges?(a: { from: string; to: string }): Promise<PathChange[]>;
   /** Restore the leased worktree to a checkpoint ('base' or `tree:<oid>`), proven by a re-snapshot. */
   restoreWorktree?(checkpointId: string, signal?: AbortSignal): Promise<string>;
+  /**
+   * LoopPorts.prepareIntention: put the leased worktree on a later intention's own branch at the pinned base,
+   * behind a durable preparation record (intent before anything moves, completion after). Idempotent.
+   */
+  prepareIntention?(a: IntentionPreparationRequest): Promise<IntentionPreparation>;
   /** Kill every process of a previous supervisor of this run (owner records + anything working in the worktree). */
   reapPrior?(): Promise<ReapResult>;
   /** Arm the durable run deadline (epoch ms): it aborts the run-wide signal every model call and gate runs under. */
@@ -278,6 +289,13 @@ export interface WiringOptions {
   editToolSeams?: { beforeOpen?: (r: { rel: string; abs: string }) => Promise<void>; afterRead?: (r: { rel: string; abs: string }) => Promise<void> };
   /** Commit-gate fault injection (crash/race tests only): passed to createGates unchanged. */
   commitTestHooks?: NonNullable<Parameters<typeof createGates>[0]['commitTestHooks']>;
+  /** Fault injection for the intention-branch preparation (crash and fence tests only). */
+  prepareTestHooks?: {
+    /** After the intent record, before the first repository mutation. `loseLease` releases the worktree lease. */
+    beforeMutation?: (c: { intentionId: string; branch: string; loseLease: () => Promise<void> }) => void | Promise<void>;
+    /** After the worktree is on the new branch, before the completion record. */
+    afterMutation?: (c: { intentionId: string; branch: string; loseLease: () => Promise<void> }) => void | Promise<void>;
+  };
   /** gh binary for gate.pr (tests): undefined = look it up on the run environment's PATH, null = never use gh. */
   gh?: string | null;
   /** Verify identity override (tests); default from the operator env (verifyIdentity). */
@@ -285,7 +303,7 @@ export interface WiringOptions {
 }
 
 /** Evidence kinds a worker writes that become `evidence.appended` events (so `why`/`evidence` find them). */
-const SURFACED_EVIDENCE = new Set(['tool.denied', 'sandbox.violation', 'sandbox.kill', 'sandbox.outstanding']);
+const SURFACED_EVIDENCE = new Set(['tool.denied', 'sandbox.violation', 'sandbox.kill', 'sandbox.ended', 'sandbox.outstanding']);
 
 interface StepTrace {
   trace: Trace;
@@ -297,6 +315,8 @@ interface StepTrace {
   history?: AttemptFingerprint[];
   /** The accepted acceptance contract of the step's goal (tamperCheck protects it and what its criteria run). */
   contract?: AcceptanceContract | null;
+  /** The change-path envelope stated for the step (the contract's and the step's declared subset); null = none. */
+  envelope?: StatedEnvelope | null;
 }
 
 /** Per-call reservation for the reviewer and frontier seats (settled at actual usage). */
@@ -869,7 +889,32 @@ export function createWiring(o: WiringOptions = {}): WireFn {
         };
         return repl;
       };
-      workerTools.unshift(createReadTool(), fencedTool(createEditTool({ ...(o.editToolSeams ?? {}), beforeCommit: mutationCheck(wt) }), wt), createListFilesTool());
+      // The change-path envelope at the tool call: a write or a deletion of a path outside the step's declared
+      // subset of the accepted envelope is refused before anything is touched. Operations are relative to
+      // the base commit (a path the base lacks is created; removing such a path is no change at all).
+      let baseFiles: Set<string> | null = null;
+      const inBase = (rel: string): boolean => {
+        if (!baseFiles) {
+          const r = gitSync(wt.path, ['ls-tree', '-r', '-z', '--name-only', '--full-tree', wt.baseSha], { env: ctx.env });
+          if (r.code !== 0) throw new Error('the base tree could not be listed; the change-path envelope cannot be checked');
+          baseFiles = new Set(r.stdout.split('\0').filter((p) => p.length > 0));
+        }
+        return baseFiles.has(rel);
+      };
+      const authorizeChange: ChangeAuthorizer = (rel, kind) => {
+        const env = als.getStore()?.envelope;
+        if (!env) return;
+        const present = inBase(rel);
+        if (kind === 'delete' && !present) return;
+        const op = kind === 'delete' ? 'delete' : present ? 'modify' : 'create';
+        if (!statedAllows(env, rel, op)) throw new Error(`${rel} (${op}) is outside ${env.source === 'step' ? 'the change paths this step declared' : 'the accepted change-path envelope'}; only an amended contract can add a path`);
+      };
+      workerTools.unshift(
+        createReadTool(),
+        fencedTool(createEditTool({ ...(o.editToolSeams ?? {}), beforeCommit: mutationCheck(wt), authorizeChange }), wt),
+        fencedTool(createDeleteTool({ beforeCommit: mutationCheck(wt), authorizeChange }), wt),
+        createListFilesTool(),
+      );
       const stepWorker = new StepWorker({
         seats: workerLLMs,
         repl: replFactory,
@@ -943,14 +988,15 @@ export function createWiring(o: WiringOptions = {}): WireFn {
           const host = { runtimeEnvironment: hostBinding('runtime:environment', runtimeEnvironment(facts())), ...(access.length ? { capabilityAccess: hostBinding('runtime:capabilities', access) } : {}) };
           const inputs = { ...extra, ...host, ...(req.inputs ?? {}) };
           const served = withStandIns(req, mocks.map((d) => d.tool));
-          return budgetTerminal(await als.run({ trace, fps, history, attempt: req.intention.attempt, contract }, () => stepGuards.run({ guard }, () => stepWorker.run({ ...served, inputs, guard, ...(mocks.length ? { mocks } : {}) }, merged))));
+          const envelope = statedEnvelope(contract, req.step);
+          return budgetTerminal(await als.run({ trace, fps, history, attempt: req.intention.attempt, contract, envelope }, () => stepGuards.run({ guard }, () => stepWorker.run({ ...served, inputs, guard, ...(mocks.length ? { mocks } : {}) }, merged))));
         },
         resume: async (token: string, grant: ApprovalGrant, signal?: AbortSignal, given?: WriteGuard): Promise<Outcome> => {
           if (wt.lost.aborted) return leaseAborted(runId, leaseReason());
           const guard: WriteGuard = leaseGuard(wt, given);
           const merged = AbortSignal.any([...(signal ? [signal] : []), guard.signal]);
           const contract = await acceptedContractFor(null);
-          return budgetTerminal(await als.run({ trace: {}, contract }, () => stepGuards.run({ guard }, () => resumeStep(token, grant, merged, guard))));
+          return budgetTerminal(await als.run({ trace: {}, contract, envelope: statedEnvelope(contract, null) }, () => stepGuards.run({ guard }, () => resumeStep(token, grant, merged, guard))));
         },
       };
 
@@ -996,7 +1042,7 @@ export function createWiring(o: WiringOptions = {}): WireFn {
       const workerSeats = m.seats.workers.map((w) => ({ id: w.id, provider: w.provider, model: w.model, costPerMTok: priceFor(w.model).inputPerM }));
       let bridge: MeteredPlanner | null = null;
       const innerPlanner: Planner = scripts?.plan
-        ? new ScriptedRunPlanner(scripts.plan, { ...(scripts.contracts ? { contracts: scripts.contracts } : {}), connections: m.connections })
+        ? new ScriptedRunPlanner(scripts.plan, { ...(scripts.contracts ? { contracts: scripts.contracts } : {}), connections: m.connections, allowedChanges: m.repo.allowedChanges, protectedPaths: m.policy.protectedPaths })
         : new LLMPlanner({
             // every planner call is cancelled by the loop meter's signal (deadline, loop stop) and the run's
             llm: cancellableLLM(plannerLLM, runSignal, () => bridge?.meterSignal()),
@@ -1193,6 +1239,76 @@ export function createWiring(o: WiringOptions = {}): WireFn {
           const l = wt.heldReason();
           if (l) throw new Error(`no change summary without the lease: ${l}`);
           return diffTrees(wt.path, a.from, a.to, runCtl.signal);
+        },
+        stepChanges: async (a: { from: string; to: string }): Promise<PathChange[]> => {
+          const l = wt.heldReason();
+          if (l) throw new Error(`no changed paths without the lease: ${l}`);
+          const out: PathChange[] = [];
+          for (const c of await changedPaths(wt.path, a.from, a.to, runCtl.signal, wt.baseSha)) {
+            const present = inBase(c.path);
+            // gone again and never in the base: nothing changed against the base
+            if (c.deleted && !present) continue;
+            out.push({ path: c.path, op: c.deleted ? 'delete' : present ? 'modify' : 'create' });
+          }
+          // Ignored files are in no checkpoint tree: they are compared with the run's ignored baseline, as the gates do.
+          const snap = await snapshotCandidate(wt.path, m.repo.base, { ignoredBaseline: await ignoredBaseline(ledger, new GateMemo(), runId), signal: runCtl.signal });
+          for (const f of snap.files) if (f.status === '!') out.push({ path: f.path, op: 'ignored' });
+          return out;
+        },
+        prepareIntention: async (a: IntentionPreparationRequest): Promise<IntentionPreparation> => {
+          // Proven on the ledger first; every mutation below re-checks the lease itself (wt.prepareBranch).
+          const token = await wt.assertHeld();
+          const signal = a.signal ? AbortSignal.any([a.signal, wt.lost, runCtl.signal]) : AbortSignal.any([wt.lost, runCtl.signal]);
+          const nameOf = (goalId: string): string => (goalId === ctx.goal.goalId ? goalName : goalId);
+          const branch = intentionBranchName(m.repo.branchPrefix, nameOf(a.goalId), a.ordinal);
+          const keys = preparationKeys(redactor, runId, a.intentionId);
+          const oidOf = async (b: string): Promise<string | null> => (await hostGit(wt.path, ['rev-parse', '--verify', '--quiet', `refs/heads/${b}^{commit}`]).catch(() => '')).trim() || null;
+          // The previous intention's branch: the one its own preparation named, else the goal's first branch.
+          const prevDone = preparationRecordOf((await ledger.getEvidence(preparationKeys(redactor, runId, a.previousIntentionId).done))?.body);
+          const previousBranch = prevDone?.branch ?? intentionBranchName(m.repo.branchPrefix, nameOf(a.goalId), 1);
+          const transition = { intentionId: a.intentionId, previousIntentionId: a.previousIntentionId, goalId: a.goalId, ordinal: a.ordinal, base: m.repo.base, baseSha: wt.baseSha, branch, previousBranch };
+          // The intent is written once, before anything moves: a restart finds it and completes exactly this
+          // transition, with the previous branch still where the intent saw it.
+          const obj = (b: Json | undefined): Record<string, Json> | null => (b && typeof b === 'object' && !Array.isArray(b) ? (b as Record<string, Json>) : null);
+          let intent = obj((await ledger.getEvidence(keys.intent))?.body);
+          if (!intent) {
+            await claim(ledger, redactor, keys.intent, 'intention.prepare', runId, { ...transition, previousBranchSha: await oidOf(previousBranch), fencingToken: token, at: ctx.now() });
+            intent = obj((await ledger.getEvidence(keys.intent))?.body);
+          }
+          const recorded = preparationRecordOf(intent as Json);
+          if (!intent || !recorded || recorded.intentionId !== a.intentionId || recorded.previousIntentionId !== a.previousIntentionId || recorded.baseSha !== wt.baseSha || recorded.branch !== branch || intent.previousBranch !== previousBranch) {
+            throw new Error(`the preparation intent on record for intention ${a.intentionId} names another transition; a human must look`);
+          }
+          const previousBranchSha = typeof intent.previousBranchSha === 'string' ? intent.previousBranchSha : null;
+          const moved = async (): Promise<string | null> => {
+            const now = await oidOf(previousBranch);
+            return now === previousBranchSha ? null : `the previous intention's branch ${previousBranch} moved (${previousBranchSha ?? 'absent'} → ${now ?? 'absent'})`;
+          };
+          const before = await moved();
+          if (before) throw new Error(before);
+          const baseline = await ignoredBaseline(ledger, new GateMemo(), runId);
+          const prepared = await wt.prepareBranch({
+            branch,
+            keepIgnored: (k) => baseline?.entries[k] !== undefined,
+            signal,
+            ...(o.prepareTestHooks?.beforeMutation ? { beforeMutation: () => o.prepareTestHooks!.beforeMutation!({ intentionId: a.intentionId, branch, loseLease: () => wt.release() }) } : {}),
+          });
+          const after = await moved();
+          if (after) throw new Error(after);
+          await o.prepareTestHooks?.afterMutation?.({ intentionId: a.intentionId, branch, loseLease: () => wt.release() });
+          // What the planner and the workers are told about the repository is read again from the base.
+          repoFactsCache = null;
+          const done = await ledger.getEvidence(keys.done);
+          if (done) {
+            const d = preparationRecordOf(done.body);
+            if (!d || d.intentionId !== a.intentionId || d.branch !== branch || d.baseSha !== wt.baseSha) throw new Error(`the preparation record of intention ${a.intentionId} names another branch or base; a human must look`);
+          } else {
+            const l = wt.heldReason();
+            if (l) throw new Error(`no preparation record without the lease: ${l}`);
+            await writeEvidence(ledger, redactor, { key: keys.done, kind: 'intention.prepared', runId, body: { ...transition, previousBranchSha, fencingToken: token, intentFencingToken: recorded.fencingToken, created: prepared.created, removedIgnored: prepared.removedIgnored, at: ctx.now() } });
+            await ledger.append(event('evidence.appended', { id: ctx.ids(), at: ctx.now(), actor: { kind: 'system', id: 'wiring' }, runId, trace: { goalId: a.goalId, intentionId: a.intentionId }, payload: { kind: 'intention.prepared', evidenceKey: keys.done, branch, baseSha: wt.baseSha, previousIntentionId: a.previousIntentionId, previousBranch, fencingToken: token } }));
+          }
+          return { branch, baseSha: wt.baseSha, fencingToken: token, evidenceKey: keys.done };
         },
         restoreWorktree: async (checkpointId: string, signal?: AbortSignal): Promise<string> => {
           await wt.assertHeld();

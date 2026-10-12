@@ -331,11 +331,11 @@ export function criterionScriptProblem(path: string, added: readonly string[], t
  * names a protected script. A targeted edit of a script's value alone is left to the tamper gate, which
  * diffs the scripts the commit would land.
  */
-export function packageScriptWriteProblem(input: { method?: string; path?: string; args?: unknown }, targets: CriterionTargets): string | null {
+export function packageScriptWriteProblem(input: { tool?: string; method?: string; path?: string; args?: unknown }, targets: CriterionTargets): string | null {
   if (!input.path || !isPackageJson(input.path) || targets.scripts.length === 0) return null;
   const p = normalizePath(input.path).replace(/^\.\//, '');
   const names = targets.scripts.join(', ');
-  if (input.method === 'delete') return `deleting ${p} removes the package scripts a criterion's check command runs (${names})`;
+  if (input.method === 'delete' || input.tool === 'delete') return `deleting ${p} removes the package scripts a criterion's check command runs (${names})`;
   const args = Array.isArray(input.args) ? input.args : [];
   const a = args[0];
   if (a && typeof a === 'object' && !Array.isArray(a)) {

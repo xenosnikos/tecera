@@ -120,7 +120,8 @@ export interface CrashResult {
   stderr: string;
 }
 
-export const LEASE_TTL_MS = 1_500;
+// long enough that a stalled event loop under load does not lose the lease by itself; the tests wait it out
+export const LEASE_TTL_MS = 4_000;
 
 export async function crashRun(o: { cwd: string; argv: string[]; env: Record<string, string>; at: CrashPoint; marker?: string; liveNeedle?: string; timeoutMs?: number }): Promise<CrashResult> {
   const d = tmp('tecera-adv-crash-');

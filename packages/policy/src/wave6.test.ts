@@ -594,3 +594,54 @@ describe('Stop decision through the single-source proof (sprint 5 item 1)', () =
     await expect(evaluateStopLedger(throwing as never, { now: T })).resolves.toMatchObject({ decision: { decision: 'block', reason: expect.stringMatching(/approvals table cannot be read: locked/) } });
   });
 });
+
+describe('change-path envelope: a plan declares per-step subsets and can never widen what was accepted', () => {
+  const v = (p: Plan, ctx?: Parameters<typeof validatePlan>[2]['context'], m = manifest()) => validatePlan(p, m, { ...opts, ...(ctx ? { context: ctx } : {}) }).join('\n');
+  const withChanges = (changes: NonNullable<Plan['steps'][number]['changes']>, o: Partial<Plan> = {}): Plan => ({ ...deliveryPlan(o), steps: deliveryPlan().steps.map((s) => (s.id === 'edit' ? { ...s, changes } : s)) });
+  const enveloped = contract({ criteria: [contract().criteria[0]!], envelope: [{ path: 'src/session.ts', ops: ['modify'] }, { path: 'src/store/*.ts', ops: ['create', 'modify'] }] });
+  const ctx = { contract: enveloped, contractHash: contractHash(enveloped) };
+  const bound = { contractHash: ctx.contractHash };
+
+  it('a subset of the accepted envelope passes; a step that declares nothing is held to the whole envelope', () => {
+    expect(v(withChanges([{ path: 'src/session.ts', ops: ['modify'] }], bound), ctx)).toBe('');
+    expect(v(withChanges([{ path: 'src/store/sqlite.ts', ops: ['create'] }, { path: 'src/store/*.ts', ops: ['modify'] }], bound), ctx)).toBe('');
+    expect(v(deliveryPlan(bound), ctx)).toBe('');
+  });
+
+  it('a path, an operation or a glob the requestor did not sign off is refused: the plan cannot authorize its own expansion', () => {
+    expect(v(withChanges([{ path: 'src/session.ts', ops: ['modify'] }, { path: 'src/config.ts', ops: ['create'] }], bound), ctx)).toMatch(/step edit changes: src\/config\.ts \(create\) is not inside the accepted envelope; a plan can narrow the envelope, only an amended contract can widen it/);
+    expect(v(withChanges([{ path: 'src/session.ts', ops: ['modify', 'delete'] }], bound), ctx)).toMatch(/src\/session\.ts \(delete\) is not inside the accepted envelope/);
+    expect(v(withChanges([{ path: 'src/**', ops: ['modify'] }], bound), ctx)).toMatch(/src\/\*\* \(modify\) is not inside the accepted envelope/);
+    expect(v(withChanges([{ path: 'src/store/a.ts', ops: ['delete'] }], bound), ctx)).toMatch(/\(delete\) is not inside/);
+  });
+
+  it('without a contract envelope the declared changes must still lie inside repo.allowedChanges, and never on a protected path', () => {
+    expect(v(withChanges([{ path: 'src/session.ts', ops: ['modify'] }]))).toBe('');
+    expect(v(withChanges([{ path: 'src/deep/*.ts', ops: ['create'] }]))).toBe('');
+    expect(v(withChanges([{ path: 'lib/x.ts', ops: ['create'] }]))).toMatch(/step edit changes: lib\/x\.ts is outside allowedChanges/);
+    expect(v(withChanges([{ path: 'lib/*.ts', ops: ['create'] }]))).toMatch(/lib\/\*\.ts is outside allowedChanges/);
+    expect(v(withChanges([{ path: 'src/a.test.ts', ops: ['delete'] }]))).toMatch(/src\/a\.test\.ts is a protected path/);
+  });
+
+  it('only a step that can write declares changes; a malformed declaration is refused', () => {
+    const reading: Plan = { ...deliveryPlan(), steps: [{ id: 'look', kind: 'worker', dependsOn: [], inputs: {}, tools: ['read'], changes: [{ path: 'src/session.ts', ops: ['modify'] }] }, ...deliveryPlan().steps.map((s) => (s.id === 'edit' ? { ...s, dependsOn: ['look'] } : s))] };
+    expect(v(reading)).toMatch(/step look declares changes but has no tool that writes/);
+    expect(v(withChanges([{ path: '**', ops: ['modify'] }]))).toMatch(/step edit changes: .*starts with a wildcard/);
+  });
+
+  it('the hooks treat the delete tool as a write: a protected or out-of-allowlist path aborts, a contract check file is tampering, and it is never held for approval', () => {
+    const view = { capabilities: { tools: ['edit', 'delete'], paths: { read: ['**'], write: ['src/**', 'scripts/**'], protected: ['test/**', '**/*.test.*'] }, network: 'none' as const, limits: { usd: 1, tokens: 1, calls: 1, wallMs: 1, depth: 1, iterations: 1 } }, blackboard: {}, hooks: [] };
+    const ev = (stage: SpanEvent['stage'], input: Record<string, unknown>): SpanEvent => ({ span: 'ToolCall', stage, spanId: 's', run: { runId: 'r', invokeId: 'i', depth: 0 }, attempt: 1, input: input as SpanEvent['input'] });
+    const hooks = mandatoryHooks(manifest(), { permissions: { ...DEFAULT_PERMISSIONS, requiresApproval: [...DEFAULT_PERMISSIONS.requiresApproval, 'delete'] }, contract: () => contract() });
+    const hook = (id: string) => hooks.find((h) => h.id === id)!;
+    expect(hook('protectedPaths').handle(ev('Enter', { tool: 'delete', method: 'call', path: 'test/session.test.ts' }), view)).toMatchObject([{ type: 'Abort', code: 'protected', reason: expect.stringMatching(/test\/session\.test\.ts is protected by/) }]);
+    expect(hook('protectedPaths').handle(ev('Enter', { tool: 'delete', method: 'call', path: 'lib/x.ts' }), view)).toMatchObject([{ type: 'Abort', reason: expect.stringMatching(/outside the write allowlist/) }]);
+    expect(hook('protectedPaths').handle(ev('Enter', { tool: 'delete', method: 'call', path: 'src/config.ts' }), view)).toEqual([]);
+    expect(hook('tamperCheck').handle(ev('Enter', { tool: 'delete', method: 'call', path: 'scripts/check-db.sh' }), view)).toMatchObject([{ type: 'Abort', code: 'policy', reason: expect.stringMatching(/^tampering: /) }]);
+    expect(hook('tamperCheck').handle(ev('Enter', { tool: 'delete', method: 'call', path: 'package.json', args: ['package.json', 'x'] }), view)).toMatchObject([{ type: 'Abort', reason: expect.stringMatching(/deleting package\.json removes the package scripts/) }]);
+    // even when a permissions file lists it under requiresApproval, a deletion is a work-branch write: no Suspend
+    expect(hook('approvalGate').handle(ev('Send', { tool: 'delete', method: 'call', path: 'src/config.ts' }), view)).toEqual([]);
+    const never = mandatoryHooks(manifest(), { permissions: { ...DEFAULT_PERMISSIONS, never: [...DEFAULT_PERMISSIONS.never, 'delete'] } }).find((h) => h.id === 'approvalGate')!;
+    expect(never.handle(ev('Send', { tool: 'delete', method: 'call', path: 'src/config.ts' }), view)).toMatchObject([{ type: 'Abort', code: 'policy' }]);
+  });
+});

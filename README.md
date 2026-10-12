@@ -117,7 +117,10 @@ sample, not for code you do not trust.
 ## What a run gives you
 
 - A commit on `tecera/<goal>` and either an opened pull request (when the repository has a remote and `gh`
-  is authenticated) or a patch bundle under `.tecera/runs/<run>/pr/`. Tecera never merges.
+  is authenticated) or a patch bundle under `.tecera/runs/<run>/pr/`. Tecera never merges. When a goal is
+  planned again in the same run (its acceptance contract was amended, or its plan was interrupted), the new
+  plan works on a fresh branch cut from the base the run started on: `tecera/<goal>.2`, then `.3`. The
+  earlier branch is kept as it was and is not delivered.
 - `goal.achieved` with a proof: the check command, exit code 0, the candidate fingerprint and the evidence
   key of the passing verification, plus one proof per acceptance criterion with its fidelity. The PR
   body lists every criterion, how it was proven, and any provisioned resource awaiting transfer.
@@ -144,7 +147,10 @@ Exit codes: 0 ok · 1 error · 2 invalid or usage · 3 not ready · 4 held for a
 Approvals are local and unauthenticated. `tecera approve`, `criteria accept` and the other decision
 commands record whoever `--as` names (default `$USER`) as a human principal; there are no tokens and no
 login. The ledger refuses a grant from the requester (the loop) or from a non-human principal, binds each
-grant to one action and consumes it once, but it cannot tell which local process typed the command.
+grant to one action and consumes it once, but it cannot tell which local process typed the command. The
+decision commands refuse (exit 8) when they run under an agent host (Claude Code, Codex, Tecera's own
+sandbox) or without a terminal; set `TECERA_DECISION_NONINTERACTIVE=1` to decide from a script you control.
+This guard prevents accidents and is not authentication.
 
 ## Configuration
 
@@ -154,8 +160,9 @@ A project is a *business case*: a `tecera.json` manifest plus a `.tecera/` folde
   sandbox, protected paths, the verify command, declared `connections` (each with a probe command and
   whether a stand-in may serve it), the local `provisioning` allowance, and the mandatory hooks. Secrets
   are references (`env:NAME`), never values; unknown fields are rejected.
-- **`.tecera/`**: goals (what, the check, and optionally the acceptance criteria), graduated plans,
-  skills, permissions, and memory. The ledger and run folders live here too and are git-ignored.
+- **`.tecera/`**: goals (what, the check, and optionally the acceptance criteria and the change-path
+  envelope: the only paths the change may create, modify or delete), graduated plans, skills, permissions,
+  and memory. The ledger and run folders live here too and are git-ignored.
 
 `tecera adapters install <host>` (also run by `tecera init`) mounts a business case into a host
 assistant. What is installed differs by host:
@@ -169,8 +176,9 @@ assistant. What is installed differs by host:
   `tecera` binary, which must be on `PATH`.
 - **Codex** (`codex`): a managed block in `AGENTS.md` and nothing else. No deny list and no hooks are
   installed; the block tells the agent to run `tecera gate <goal>` itself before it stops. Under Codex
-  nothing installed by Tecera keeps an agent from editing protected paths or from running
-  `tecera approve`.
+  nothing installed by Tecera keeps an agent from editing protected paths. `tecera approve` and the other
+  decision commands refuse when they see a `CODEX_*` variable, as they do under Claude Code; an agent that
+  clears its environment gets past that.
 
 The host adapters are a second layer. Enforcement proper is `tecera run`: sandboxed workers and gates run
 by the harness.
@@ -212,8 +220,9 @@ Tecera is research-grade. What follows is the state of the code, not a roadmap.
   not detected. Treat the host adapters as protection against accidents, not against a determined agent,
   and read every acceptance contract and pull request yourself.
 - **Approvals are not authenticated.** A decision is a local command and the approver is the name given
-  with `--as`. Any local process that can run `tecera` and is not behind the Claude Code hooks can approve
-  under any name.
+  with `--as`. The decision commands refuse under an agent-host marker or without a terminal, which stops
+  accidents only: any local process that can run `tecera`, allocate a terminal and choose its own
+  environment can approve under any name.
 - **Codex gets no hooks** (see Configuration).
 - **The benchmark is not yet a measurement.** Its pass rules are being tightened: at present a scenario
   can pass its rule without the delivered work being complete. Do not read its scorecard, including its
@@ -224,6 +233,10 @@ Tecera is research-grade. What follows is the state of the code, not a roadmap.
 - **HTTP stub provisioning.** A provisioned loopback HTTP stub is served to workers as a brokered tool, but
   a criterion's check runs in a network namespace of its own and cannot reach it. A criterion that needs
   the stub fails verification.
+- **The change-path envelope controls paths, not content.** When a contract states one, a file outside it
+  cannot be written, deleted or committed, whatever a reviewer says. It does not detect unrequested
+  behaviour inside a file the envelope allows, and a contract without an envelope (the default) leaves
+  `repo.allowedChanges` as the only path boundary: an extra file inside it is then stopped by review alone.
 - **Degraded hosts.** With `sandbox.isolation: "node"` (the shipped sample) the worker child runs with
   Node's permission model and whatever OS controls the host offers; the missing ones are recorded as
   `isolation.degraded`. A non-root supervisor runs checks under its own uid.

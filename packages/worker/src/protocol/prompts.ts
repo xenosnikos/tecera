@@ -36,6 +36,12 @@ export const STANDARD_STUBS: Record<string, StubDoc> = {
     signature: 'await writeFile(path, content) | await writeFile({path, oldText, newText}) → {path, bytes, digest, mode}',
     description: 'write a whole file, or replace exactly one occurrence of oldText with newText',
   },
+  delete: {
+    binding: 'deleteFile',
+    tool: 'delete',
+    signature: 'await deleteFile(path, digest) | await deleteFile({path, content}) → {path, deleted}',
+    description: 'delete one file you have read: pass the digest readFile returned (or the exact content); the file is removed only while it still holds that. No directories, nothing recursive',
+  },
   listFiles: { binding: 'listFiles', tool: 'listFiles', signature: 'await listFiles(prefixOrGlob?) → {files, truncated}', description: 'list worktree files (node_modules, .git and .tecera are skipped)' },
   runVerify: { binding: 'runVerify', tool: 'runVerify', signature: 'await runVerify() → {exitCode, timedOut, stdout, stderr}', description: "run the goal's check command in the worktree" },
 };

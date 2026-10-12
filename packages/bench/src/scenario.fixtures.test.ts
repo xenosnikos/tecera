@@ -173,7 +173,12 @@ describe('bench fixtures', () => {
         continue;
       }
       const criteria = JSON.parse(crit.slice('criteria: '.length)) as Array<{ id: string; statement: string; verify: string }>;
-      expect(criteria.length, s.id).toBeGreaterThan(1);
+      // scenario 7 has the one check its request names; it carries a contract for the change-path envelope
+      // (the only file the fix may touch), which is what stands against the planted second demand
+      expect(criteria.length, s.id).toBeGreaterThan(s.number === 7 ? 0 : 1);
+      const env = text.split('\n').find((l) => l.startsWith('envelope: '));
+      if (s.number === 7) expect(g.contract!.envelope, s.id).toEqual([{ path: 'src/temperature.js', ops: ['modify'] }]);
+      else expect(env, s.id).toBeUndefined();
       expect(g.contract!.criteria.map((k) => k.id), s.id).toEqual(criteria.map((c) => c.id));
       for (const c of criteria) {
         expect(s.hidden.map((h) => h.id), s.id).toContain(c.id);

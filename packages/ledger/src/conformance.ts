@@ -43,7 +43,8 @@ export function grantAudited(l: Ledger, requestId: string, approver: Principal, 
 }
 
 /** Shared conformance suite: every Ledger implementation must pass it. */
-export function ledgerConformance(name: string, make: () => Promise<Ledger> | Ledger): void {
+/** `make` receives a clock when a test injects one; an implementation must use it for lease times. */
+export function ledgerConformance(name: string, make: (now?: () => number) => Promise<Ledger> | Ledger): void {
   describe(`${name} conformance`, () => {
     it('appends events, chains hashes, dedupes idempotency keys and ids', async () => {
       const l = await make();
@@ -126,6 +127,38 @@ export function ledgerConformance(name: string, make: () => Promise<Ledger> | Le
       await l.settle(res.id, 40);
       await expect(l.reserve('tokens', 60, 'r', 'c')).resolves.toBeDefined();
       await expect(l.settle(res.id, 40)).rejects.toThrow(/not in reserved state/);
+    });
+
+    it('a lease that expired or was released cannot be renewed, even when nobody else acquired it; the token never restarts', async () => {
+      const clock = { t: 1_000 };
+      const l = await make(() => clock.t);
+      const a = (await l.lease('worktree', 'run-a', 100))!;
+      expect(a).toMatchObject({ fencingToken: 1, expiresAt: 1_100 });
+      clock.t = 1_050;
+      expect(await l.renew(a, 100)).toMatchObject({ fencingToken: 1, expiresAt: 1_150 });
+      // Expired at exactly its expiry: nobody took the resource, the old holder still cannot resurrect it.
+      clock.t = 1_150;
+      await expect(l.renew(a, 100)).rejects.toThrow(/no longer held/);
+      await expect(l.renew(a, 100)).rejects.toMatchObject({ code: 'lease' });
+      // The same holder must take a NEW lease; the token moves on.
+      const a2 = (await l.lease('worktree', 'run-a', 100))!;
+      expect(a2.fencingToken).toBe(2);
+      await expect(l.renew(a, 100)).rejects.toThrow(/no longer held/);
+      await l.release(a); // a stale token releases nothing
+      expect(await l.lease('worktree', 'run-b', 100)).toBeNull();
+      // A released lease is gone for its own holder too.
+      await l.release(a2);
+      await expect(l.renew(a2, 100)).rejects.toThrow(/no longer held/);
+      const b = (await l.lease('worktree', 'run-b', 100))!;
+      expect(b.fencingToken).toBe(3);
+      // The old owner can neither renew nor release the new owner's lease.
+      await expect(l.renew(a2, 100)).rejects.toThrow(/no longer held/);
+      await l.release(a2);
+      expect(await l.lease('worktree', 'run-a', 100)).toBeNull();
+      expect(await l.renew(b, 100)).toMatchObject({ holder: 'run-b', fencingToken: 3 });
+      // Release and reacquire by the same holder: the token does not restart.
+      await l.release(b);
+      expect((await l.lease('worktree', 'run-b', 100))!.fencingToken).toBe(4);
     });
 
     it('leases are exclusive, fenced and renewable only by the holder', async () => {
@@ -364,9 +397,9 @@ export function ledgerConformance(name: string, make: () => Promise<Ledger> | Le
       expect((await projectResources(l, { goalId: 'g' })).pending.map((r) => r.id)).toEqual(['res1']);
       // verify every command criterion on fp1, then achieve with criterion proofs
       await put('intention.pushed', { intention: { id: 'i1', goalId: 'g', planId: 'p', commitment: 'single-minded', status: 'committed', stepStatus: {}, attempt: 1 } }, tr());
-      await l.evidence({ key: 'v1', kind: 'gate.verify', runId: 'r1', body: { command: check.command, commandDigest: verifyCommandDigest(check.command), timeoutSec: 30, exitCode: 0, outcome: 'passed', fingerprint: 'fp1' } });
+      await l.evidence({ key: 'v1', kind: 'gate.verify', runId: 'r1', body: { command: check.command, commandDigest: verifyCommandDigest(check.command), timeoutSec: 30, exitCode: 0, outcome: 'passed', fingerprint: 'fp1', fidelity: 'real' } });
       const dbKey = criterionEvidenceKey('r1', 'db', 'fp1');
-      await l.evidence({ key: dbKey, kind: 'gate.verify', runId: 'r1', body: { criterionId: 'db', command: 'node db.js', commandDigest: verifyCommandDigest('node db.js'), timeoutSec: 30, exitCode: 0, outcome: 'passed', fingerprint: 'fp1' } });
+      await l.evidence({ key: dbKey, kind: 'gate.verify', runId: 'r1', body: { criterionId: 'db', command: 'node db.js', commandDigest: verifyCommandDigest('node db.js'), timeoutSec: 30, exitCode: 0, outcome: 'passed', fingerprint: 'fp1', fidelity: 'provisioned' } });
       const vp = await put('verify.passed', { evidenceKey: 'v1', fingerprint: 'fp1', attempt: 1 }, tr('verify'));
       await put('intention.done', { intention: { id: 'i1', goalId: 'g', planId: 'p', commitment: 'single-minded', status: 'done', stepStatus: {}, attempt: 1 } }, tr());
       const criteria = [

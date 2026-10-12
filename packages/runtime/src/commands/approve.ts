@@ -1,5 +1,6 @@
 import { approvalGrantedEvent, LedgerError, requireApproval, type ApprovalView, type Json, type TeceraEvent, type Trace } from '@tecera/contracts';
 import type { Command, CommandContext } from '../cli/context.js';
+import { guardDecision, guardJson, type DecisionGuardRecord } from '../decisionGuard.js';
 import { CliError, EXIT } from '../errors.js';
 import { identityJson, localPrincipal, PrincipalError, type HumanIdentity } from '../principal.js';
 import type { Runtime } from '../runtime.js';
@@ -18,6 +19,9 @@ import type { Runtime } from '../runtime.js';
  *   missing event (repair) instead of failing. A denial is recorded, then its event appended.
  * - Separation of duty stays: requester = approver, or a non-human approver, is a policy failure (exit 8);
  *   an unknown, expired or already-decided request is exit 1. `--yes` never approves anything.
+ * - Accident guard (decisionGuard.ts): the command refuses (exit 8) under an agent-host marker or without a
+ *   terminal on stdin, unless TECERA_DECISION_NONINTERACTIVE=1; the conditions it saw are recorded on the
+ *   decision's event (`guard`). That is protection against accidents, not authentication.
  * - Under D6 the only approval point is the PR gate: the request names the committed sha it opens a PR for.
  */
 
@@ -41,7 +45,7 @@ function traceOf(req: TeceraEvent | null): Trace {
 }
 
 /** The approval.granted audit event for this decision (identity and evidence key carried in the payload). */
-function grantedEvent(rt: Runtime, view: ApprovalView, who: HumanIdentity, reason: string, trace: Trace, evidenceKey: string): TeceraEvent {
+function grantedEvent(rt: Runtime, view: ApprovalView, who: HumanIdentity, reason: string, trace: Trace, evidenceKey: string, guard: DecisionGuardRecord): TeceraEvent {
   return approvalGrantedEvent({
     id: rt.ids('ev'),
     at: rt.now(),
@@ -52,7 +56,7 @@ function grantedEvent(rt: Runtime, view: ApprovalView, who: HumanIdentity, reaso
     approver: { kind: 'human', id: who.id },
     trace,
     reason,
-    extra: { identity: identityJson(who) as unknown as Json, evidenceKey },
+    extra: { identity: identityJson(who) as unknown as Json, evidenceKey, guard: guardJson(guard) },
   }) as TeceraEvent;
 }
 
@@ -70,6 +74,7 @@ function reportDecision(c: CommandContext, kind: 'approve' | 'deny', view: Appro
   c.out.set('requestId', view.requestId);
   c.out.set('eventId', ev.id);
   c.out.set('identity', identityJson(who));
+  c.out.set('guard', (ev.payload as { guard?: Json }).guard ?? null);
   return EXIT.ok;
 }
 
@@ -82,6 +87,7 @@ async function recordDecision(
   who: HumanIdentity,
   reason: string,
   req: TeceraEvent | null,
+  guard: DecisionGuardRecord,
 ): Promise<number> {
   const evKind = kind === 'approve' ? 'approval.granted' : 'approval.denied';
   const trace = traceOf(req);
@@ -89,7 +95,7 @@ async function recordDecision(
   try {
     const evidenceKey = await identityEvidence(rt, view, evKind, who);
     if (kind === 'approve') {
-      ev = grantedEvent(rt, view, who, reason, trace, evidenceKey);
+      ev = grantedEvent(rt, view, who, reason, trace, evidenceKey, guard);
       await rt.ledger().append(ev);
     } else {
       ev = await rt.append(evKind, {
@@ -97,7 +103,7 @@ async function recordDecision(
         trace,
         actor: { kind: 'human', id: who.id },
         idemKey: `${evKind}:${view.requestId}`,
-        payload: { requestId: view.requestId, approver: { kind: 'human', id: who.id }, identity: identityJson(who), reason, sessionId: view.sessionId, actionHash: view.actionHash, evidenceKey },
+        payload: { requestId: view.requestId, approver: { kind: 'human', id: who.id }, identity: identityJson(who), reason, sessionId: view.sessionId, actionHash: view.actionHash, evidenceKey, guard: guardJson(guard) },
       });
     }
   } catch (e) {
@@ -116,6 +122,9 @@ function decision(kind: 'approve' | 'deny'): Command {
     const reason = c.args.values.reason?.trim() ?? '';
     if (kind === 'deny' && !reason) throw new CliError('deny: --reason is required', EXIT.usage);
     if (c.args.bools.yes) c.out.info('note: --yes never approves; this decision is the explicit command you ran');
+    // Before anything is read: an accident guard, not authentication (decisionGuard.ts).
+    const guard = guardDecision(c, kind);
+    if (typeof guard === 'number') return guard;
     const rt = c.runtime();
     if (!rt.ledgerExists()) {
       c.out.error(`${kind}: no ledger yet`);
@@ -142,7 +151,7 @@ function decision(kind: 'approve' | 'deny'): Command {
     const want = kind === 'approve' ? 'granted' : 'denied';
     if (view.state === want && view.approver?.kind === 'human' && view.approver.id === who.id && !(await decisionEvent(rt, requestId, kind === 'approve' ? 'approval.granted' : 'approval.denied'))) {
       c.out.info(`${kind}: ${requestId} is already ${want} by ${who.id} but its event is missing; recording it now`);
-      return recordDecision(c, rt, kind, view, who, reason, req);
+      return recordDecision(c, rt, kind, view, who, reason, req, guard);
     }
     const refused = (e: unknown): number | null => {
       if (e instanceof LedgerError && e.code === 'approval') {
@@ -163,13 +172,13 @@ function decision(kind: 'approve' | 'deny'): Command {
       }
       const after = await requireApproval(ledger, requestId);
       c.out.set('state', (after?.state ?? 'unknown') as Json);
-      return recordDecision(c, rt, kind, after ?? view, who, reason, req);
+      return recordDecision(c, rt, kind, after ?? view, who, reason, req, guard);
     }
     // approve: the identity evidence first, then the grant and its audit event in one ledger transaction.
     const trace = traceOf(req);
     let audit: TeceraEvent;
     try {
-      audit = grantedEvent(rt, view, who, reason, trace, await identityEvidence(rt, view, 'approval.granted', who));
+      audit = grantedEvent(rt, view, who, reason, trace, await identityEvidence(rt, view, 'approval.granted', who), guard);
     } catch (e) {
       c.out.error(`approve: could not record the approver's identity evidence (${(e as Error).message}); nothing was granted`);
       return EXIT.ledger;

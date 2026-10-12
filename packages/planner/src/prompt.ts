@@ -120,6 +120,7 @@ function systemMessage(i: PlannerPromptInput, nonce: string): string {
     `- Never allowed (a plan naming any of these is rejected): ${list(perms.never)}`,
     `- Tool catalog (\`permissions.tools\` must be a subset): ${list(tools)}`,
     '- A worker step narrows its tools with its `tools` field (a subset of `permissions.tools`), never widens them. A `tools` key inside `inputsJson` is not honoured and is rejected.',
+    '- A worker step that writes declares in `changes` the paths it may create, modify or delete (`[{"path","ops"}]`): a subset of the accepted change-path envelope when the contract has one, else of repo.allowedChanges. The host refuses a write or deletion outside it and fails a step that changed anything else. A plan may narrow the envelope, never widen it: a path outside it is rejected. Use `delete` (the tool) only to remove a file the step may delete or one a worker created by mistake.',
     '',
     '## Hard ceilings',
     `- \`permissions.write\` globs must each lie within repo.allowedChanges: ${list(m.repo.allowedChanges)}. Use them as they are; the host sets allowedChanges for any plan that changes files (a file that must change may be one nothing names, e.g. the command that imports the module the request names).`,
@@ -302,6 +303,12 @@ function contractSection(i: PlannerPromptInput, nonce: string, r: Redactor): str
     `## Accepted acceptance contract${hash ? ` (${safeText(hash, r, 80).slice(0, 16)}…)` : ''}`,
     ...criteria.map((k) => renderCriterion(k, r, nonce)),
     ...(i.planning?.contract?.outOfScope.length ? ['out of scope:', ...i.planning.contract.outOfScope.map((x) => `- ${defang(safeText(x, r, 500), nonce)}`)] : []),
+    ...(i.planning?.contract?.envelope?.length
+      ? [
+          'change-path envelope (the only paths the work may touch; a writing step may declare a subset in `changes`, never a path outside it):',
+          ...i.planning.contract.envelope.map((e) => `- ${defang(safeText(e.path, r, 400), nonce)}: ${e.ops.join(', ')}`),
+        ]
+      : []),
     '',
     '## Capability inventory',
     ...renderInventory(i.planning?.inventory, r),
@@ -482,6 +489,7 @@ export function buildContractPrompt(i: ContractPromptInput): LLMMessage[] {
     '- `human`: a yes/no question for a human reviewer, only for what no command can judge. A contract needs at least one command criterion; human judgments alone prove nothing.',
     '- `tags`: short lowercase kebab-case names of what the criterion checks: `http-<status>` for a status code, the header name in lowercase, `<thing>-<behaviour>` (e.g. `orders-persist`), `<thing>-unchanged` for a regression guard, `per-<scope>`, `configurable-<thing>`.',
     '- `outOfScope` lists what the request does not ask for; `assumptions` lists what the contract takes for granted (e.g. the module and function names the criteria import).',
+    '- `envelope` is the change-path envelope the requestor signs off: every repository path the work may touch, each with its operations (`create` for a file that does not exist yet, `modify` and `delete` for one that does). List the existing files the work must change and the new files the criteria imply (the module a criterion imports, when it is new). Prefer exact paths; a glob must start with a literal directory (`src/reports/*.js`). Stay inside the allowed-changes globs and off protected paths; never list a file a criterion\'s command runs. A path that is not listed cannot be changed without amending the contract. Leave it empty only when the paths cannot be told.',
     '- Requestor criteria (when listed) are already agreed: copy each one exactly (same id, statement, check and requires). You may add criteria; you may never drop, reword or loosen one.',
     '',
     '## Capabilities',

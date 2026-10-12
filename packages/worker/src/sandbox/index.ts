@@ -2,8 +2,9 @@
  * @tecera/worker sandbox: the restricted child-process REPL, the verify runner, and the pieces they are
  * built from (profile, containment, frames, handles, killTree, env). Re-exported by the worker barrel.
  */
-export { ChildProcessRepl, ReplTainted } from './host.js';
-export type { ChildProcessReplOptions, SubInvokeRequest as ChildSubInvokeRequest, CheckpointRecord, SandboxEvidence, ExecTrace, CallTrace, ExecOutput, TaintReport, DisposeReport } from './host.js';
+export { ChildProcessRepl, ReplTainted, SETTLE_LOG_ENV } from './host.js';
+export type { ChildProcessReplOptions, SubInvokeRequest as ChildSubInvokeRequest, CheckpointRecord, SandboxEvidence, ExecTrace, ExecSettlement, SettleCause, CallTrace, ExecOutput, TaintReport, DisposeReport } from './host.js';
+export { limitProblem, limitsProblem, LIMIT_KEYS, COUNT_LIMITS } from './limits.js';
 export { ProcessVerifyRunner, resolveVerifyPolicy, admitVerifyProfile, VERIFY_CONTROLS, VERIFY_TIMEOUT_EXIT, VERIFY_CANCEL_EXIT, VERIFY_SPAWN_EXIT, VERIFY_OUTPUT_CAP } from './verifyRunner.js';
 export type { ProcessVerifyRunnerOptions, VerifyOutcomeExt, VerifyControl, VerifyIdentity, VerifyEvidence, VerifyProfile, VerifyHostEnv, VerifyAdmission, ResolvedVerifyPolicy } from './verifyRunner.js';
 export { redactCapped, CappedStream, REDACT_LOOKAHEAD_CHARS, OUTPUT_WITHHELD, INTERRUPTED_MARKER, trailingTokenStart } from './capture.js';
@@ -20,7 +21,7 @@ export type { KillTreeResult } from './killTree.js';
 export { HandleMint, ExecHandleTable, HandleLimitError, VIEW_METHODS, isHandleRef, promoteStrings } from './handles.js';
 export type { HandleEntry } from './handles.js';
 export { FrameReader, FrameError, decodeFrame, checkChildFrame, scanDepth } from './frames.js';
-export { scrubEnv, isDeniedEnvName, assertEnvAllowlist, EnvRefused, SANDBOX_SAFE_ENV } from './env.js';
+export { scrubEnv, isDeniedEnvName, assertEnvAllowlist, EnvRefused, SANDBOX_SAFE_ENV, SANDBOX_MARKER_ENV } from './env.js';
 export type { ScrubbedEnv } from './env.js';
 export { IsolationUnavailable, SuspendExec, sandboxError } from './errors.js';
 export type { SandboxCode } from './errors.js';

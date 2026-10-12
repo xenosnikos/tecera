@@ -2,6 +2,7 @@ export * from './json.js';
 export * from './manifest.js';
 export * from './bdi.js';
 export * from './acceptance.js';
+export * from './envelope.js';
 export * from './events.js';
 export * from './reflex.js';
 export * from './worker.js';

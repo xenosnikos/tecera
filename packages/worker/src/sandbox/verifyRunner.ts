@@ -4,7 +4,7 @@ import { dirname, isAbsolute } from 'node:path';
 import { makeRedactor, type Json, type Redactor, type VerifyOutcome, type VerifyRequest, type VerifyRunner } from '@tecera/contracts';
 import { CappedStream } from './capture.js';
 import { cgroupOwner, detectContainment, Jail, probeCgroupMigration, type ContainmentLayer, type ContainmentProbe, type ReapResult } from './contain.js';
-import { EnvRefused, scrubEnv } from './env.js';
+import { EnvRefused, SANDBOX_MARKER_ENV, scrubEnv } from './env.js';
 import { IsolationUnavailable } from './errors.js';
 import { detectIsolation, type IsolationProbe } from './profile.js';
 import { quarantineWorktree, worktreeQuarantine } from './quarantine.js';
@@ -495,6 +495,7 @@ export class ProcessVerifyRunner implements VerifyRunner {
     try {
       const s = scrubEnv(req.envAllowlist ?? [], process.env);
       env = s.env;
+      env[SANDBOX_MARKER_ENV] = 'verify';
       base.envDropped = s.dropped;
     } catch (e) {
       if (e instanceof EnvRefused) return early(`env refused: ${e.names.join(', ')}`, VERIFY_SPAWN_EXIT);

@@ -44,6 +44,15 @@ export function git(dir: string, ...args: string[]): string {
   }).toString('utf8');
 }
 
+/**
+ * The human decision commands. This suite makes them as the local human, from a test process that has no
+ * terminal: it says so with the product's explicit opt-out of the accident guard, on these commands only
+ * (never on `tecera run`, so nothing a run starts inherits it). A test may set the variable itself.
+ */
+const isDecision = (argv: readonly string[]): boolean =>
+  argv[0] === 'approve' || argv[0] === 'deny' || (argv[0] === 'criteria' && (argv[1] === 'accept' || argv[1] === 'amend')) || (argv[0] === 'resources' && (argv[1] === 'release' || argv[1] === 'transfer')) || ((argv[0] === 'plans' || argv[0] === 'memory') && ['graduate', 'reject', 'retract'].includes(argv[1] ?? ''));
+const HUMAN_ENV: Record<string, string> = { TECERA_DECISION_NONINTERACTIVE: '1' };
+
 let idn = 0;
 export async function cli(cwd: string, argv: string[], opts: MainOptions = {}): Promise<{ code: number; out: string; err: string }> {
   let out = '';
@@ -51,7 +60,7 @@ export async function cli(cwd: string, argv: string[], opts: MainOptions = {}): 
   const { env: extraEnv, ...rest } = opts;
   const code = await main(argv, {
     cwd,
-    env: { ...ENV, ...(extraEnv ?? {}) },
+    env: { ...ENV, ...(isDecision(argv) ? HUMAN_ENV : {}), ...(extraEnv ?? {}) },
     stdout: (s) => (out += s),
     stderr: (s) => (err += s),
     isTTY: false,
