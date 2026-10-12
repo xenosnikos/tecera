@@ -52,11 +52,29 @@ describe('CASE_INDEX', () => {
     for (const c of [...CASE_INDEX, ...ACCEPTANCE_INDEX, ...DECISION_INDEX]) check(c);
   });
 
-  it('DECISION_INDEX covers every owner decision D1–D7 of 2026-10-05, once per id, in src/decisions.test.ts', () => {
+  it('DECISION_INDEX covers every owner decision D1–D7 of 2026-10-05 (src/decisions.test.ts) and D8–D12 of 2026-10-06 (src/contract.test.ts), once per id', () => {
     const ids = DECISION_INDEX.map((c) => c.id);
     expect(new Set(ids).size).toBe(ids.length);
-    for (const n of [1, 2, 3, 4, 5, 6, 7]) expect(ids.some((id) => id.startsWith(`decision.d${n}_`)), `D${n}`).toBe(true);
-    for (const c of DECISION_INDEX) expect(c.file, c.id).toBe('src/decisions.test.ts');
+    for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) expect(ids.some((id) => id.startsWith(`decision.d${n}_`)), `D${n}`).toBe(true);
+    for (const c of DECISION_INDEX) expect(c.file, c.id).toBe(Number(/^decision\.d(\d+)_/.exec(c.id)?.[1]) >= 8 ? 'src/contract.test.ts' : 'src/decisions.test.ts');
+    // the wave 6 attacks named in the plan, each a case of its own
+    for (const id of [
+      'decision.d8_forged_acceptance',
+      'decision.d8_self_acceptance',
+      'decision.d8_contract_edited',
+      'decision.d8_weaker_draft',
+      'decision.d8_worker_edits_criterion',
+      'decision.d11_mock_reported_real',
+      'decision.d11_achieved_over_mock',
+      'decision.d11_forged_achieved_stop',
+      'decision.d9_undeclared_connection',
+      'decision.d10_mock_for_available',
+      'decision.d12_provision_outside_allowance',
+      'decision.d12_resource_without_teardown',
+      'decision.d12_resource_locator',
+      'decision.d12_sandbox_reaches_locator',
+    ])
+      expect(ids).toContain(id);
     // the cases the 2026-10-05 brief names explicitly
     for (const id of ['decision.d4_stop_hook', 'decision.d4_achieved_proof', 'decision.d6_plan_requires_pr', 'decision.d3_budget_soft', 'decision.d5_review_foreign', 'decision.d2_reflex_on', 'decision.d7_openrouter_canary']) expect(ids).toContain(id);
   });

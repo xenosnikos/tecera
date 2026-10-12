@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   approvalGrantedEvent,
+  commitActionHash,
+  event,
   FencedWriteGuard,
   MANDATORY_HOOKS,
   parseManifest,
@@ -23,7 +25,7 @@ import {
   type WriteGuard,
 } from '@tecera/contracts';
 import { MemoryLedger, SqliteLedger } from '@tecera/ledger';
-import { commitActionHash, prActionHash } from '../actionHash.js';
+import { prActionHash } from '../actionHash.js';
 import type { StepContext } from '../types.js';
 
 /** Test-only helpers (excluded from the build). Every repo lives under os.tmpdir(), never /mnt/c. */
@@ -283,4 +285,28 @@ export async function grantAudited(
   } catch {
     // self-approval, agent approvers and similar are refused at grant time; consume must refuse too
   }
+}
+
+let verifyEvents = 0;
+
+/**
+ * Record a gate.verify result the way the loop does: verify.passed (exit 0) or verify.failed with the
+ * evidence key and fingerprint. The PR gate proves achievement only from this audited event (its time is
+ * the proof's verifiedAt), never from the gate's in-process memo.
+ */
+export async function recordVerify(
+  ledger: Ledger,
+  v: { exitCode: number; evidenceKey: string; fingerprint?: string },
+  o: { stepId?: string; at?: number; runId?: string; intentionId?: string; goalId?: string } = {},
+): Promise<void> {
+  await ledger.append(
+    event(v.exitCode === 0 ? 'verify.passed' : 'verify.failed', {
+      id: `ev-verify-${++verifyEvents}-${Math.random().toString(36).slice(2, 8)}`,
+      at: o.at ?? NOW,
+      actor: { kind: 'system', id: 'loop' },
+      runId: o.runId ?? 'run1',
+      trace: { goalId: o.goalId ?? 'g1', intentionId: o.intentionId ?? 'i1', stepId: o.stepId ?? 'v' },
+      payload: { exitCode: v.exitCode, evidenceKey: v.evidenceKey, ...(v.fingerprint !== undefined ? { fingerprint: v.fingerprint } : {}) },
+    }),
+  );
 }

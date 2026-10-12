@@ -1,5 +1,9 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { event, type Json, type LLM, type LLMRequest, type LLMResponse, type TeceraEvent } from '@tecera/contracts';
+import { event, verifyCommandDigest, type Json, type JsonObject, type LLM, type LLMRequest, type LLMResponse, type RunVerdict, type TeceraEvent } from '@tecera/contracts';
 import { MemoryLedger } from '@tecera/ledger';
 import { applyManagedBlock, BLOCK_END, BLOCK_START, jsonContains, jsonMerge, MergeError, securityConflicts } from './adapters/merge.js';
 import { parseArgs, UsageError } from './cli/args.js';
@@ -14,6 +18,7 @@ import { providerOptions, providerSetup, withIdentity, wireOf } from './provider
 import { scriptedFetch } from './scripted.js';
 import { exhaustionRecorder } from './wiring.js';
 import { localPrincipal, PrincipalError } from './principal.js';
+import { diffTrees, repoFileView, snapshotTree } from './worktree.js';
 
 describe('argv parsing', () => {
   it('parses value flags, inline values, booleans, short flags and --', () => {
@@ -133,8 +138,34 @@ describe('run outcome from the ledger', () => {
   let n = 0;
   const ev = (kind: TeceraEvent['kind'], payload: Record<string, unknown> = {}, trace: TeceraEvent['trace'] = { goalId: 'g' }): TeceraEvent =>
     ({ id: `e${++n}`, kind, at: n, actor: { kind: 'system', id: 't' }, trace, payload } as TeceraEvent);
+  const proof = { command: 'node --test', exitCode: 0, fingerprint: 'f', evidenceKey: 'k', verifiedAt: 1 };
+  const verdict = (o: { achieved?: boolean; provisional?: boolean; why?: string | null } = {}): RunVerdict => {
+    const achieved = o.achieved ?? true;
+    const provisional = o.provisional ?? false;
+    const why = o.why ?? (achieved ? null : 'not proven');
+    return { runId: 'r', achieved, provisional, why, goals: { g: { goalId: 'g', runId: 'r', achieved, provisional, why, ...(achieved || provisional ? { proof } : {}) } } };
+  };
+  it('exit 0 only on a proven verdict; a goal.achieved event alone proves nothing; provisional is 10, never 0', () => {
+    expect(exitCodeForRun([ev('goal.achieved')], 'g', undefined, verdict()).exitCode).toBe(EXIT.ok);
+    // the same event without a verdict, or with one that does not prove it: not achieved (and said so)
+    const bare = exitCodeForRun([ev('goal.achieved')], 'g');
+    expect(bare.exitCode).toBe(EXIT.ledger);
+    expect(bare.reason).toMatch(/recorded but not proven/);
+    expect(exitCodeForRun([ev('goal.achieved')], 'g', undefined, verdict({ achieved: false, why: 'the verify evidence carries no digest' })).reason).toMatch(/no digest/);
+    // every criterion proven, one on a mock: provisional (10)
+    const prov = exitCodeForRun([ev('goal.provisional')], 'g', undefined, verdict({ achieved: false, provisional: true, why: 'mail is mocked' }));
+    expect(prov.exitCode).toBe(EXIT.provisional);
+    expect(EXIT.provisional).not.toBe(EXIT.ok);
+    // holds name what they wait for
+    const signoff = ev('approval.requested', { requestId: 's', action: 'accept_criteria' }, { goalId: 'g', intentionId: 'signoff:g', stepId: 'accept_criteria' });
+    expect(exitCodeForRun([signoff], 'g')).toMatchObject({ exitCode: EXIT.held, reason: expect.stringMatching(/criteria sign-off approval s/) });
+    const ask = ev('approval.requested', { requestId: 'c', action: 'provide_capability' }, { goalId: 'g', intentionId: 'capability:g', stepId: 'provide_capability' });
+    expect(exitCodeForRun([ask], 'g').reason).toMatch(/a capability the run lacks/);
+    const answer = ev('approval.requested', { requestId: 'a', action: 'answer_criterion' }, { goalId: 'g', intentionId: 'i', stepId: 'answer:k' });
+    expect(exitCodeForRun([answer], 'g').reason).toMatch(/human criterion answer/);
+  });
   it('maps events to the exit-code table', () => {
-    expect(exitCodeForRun([ev('goal.achieved')], 'g').exitCode).toBe(EXIT.ok);
+    expect(exitCodeForRun([ev('goal.achieved')], 'g', undefined, verdict()).exitCode).toBe(EXIT.ok);
     expect(exitCodeForRun([ev('approval.requested', { requestId: 'a' }), ev('step.held', { requestId: 'a' })], 'g').exitCode).toBe(EXIT.held);
     expect(exitCodeForRun([ev('step.failed', { reason: 'verify exit 1' }), ev('goal.dropped')], 'g').exitCode).toBe(EXIT.verifyFailed);
     expect(exitCodeForRun([ev('step.failed', { reason: 'review reject' }), ev('goal.dropped')], 'g').exitCode).toBe(EXIT.reviewRejected);
@@ -148,7 +179,7 @@ describe('run outcome from the ledger', () => {
     expect(exitCodeForRun([ev('step.failed', { reason: 'approval ap_1 could not be consumed: x', terminal: true })], 'g').exitCode).toBe(EXIT.policy);
     const held = ev('approval.requested', { requestId: 'a' }, { goalId: 'g', intentionId: 'i', stepId: 'commit' });
     expect(exitCodeForRun([held, ev('approval.granted', { requestId: 'a' })], 'g').exitCode).toBe(EXIT.held);
-    expect(exitCodeForRun([held, ev('approval.consumed', { requestId: 'a' }), ev('goal.achieved')], 'g').exitCode).toBe(EXIT.ok);
+    expect(exitCodeForRun([held, ev('approval.consumed', { requestId: 'a' }), ev('goal.achieved')], 'g', undefined, verdict()).exitCode).toBe(EXIT.ok);
   });
 });
 
@@ -171,36 +202,103 @@ describe('D4: the active run of a business case (Stop hook)', () => {
     expect(activeRunForStop([evt('run.started', 1, 'r1'), evt('run.ended', 2, 'r1', { exitCode: 7 }), evt('run.started', 3, 'r2'), evt('run.ended', 4, 'r2', { exitCode: 4 })])).toMatchObject({ runId: 'r2', state: 'held' });
   });
 
-  it('a well-formed proof whose verify evidence is missing, of another run, or not exit 0 does not let the assistant stop; a backed proof does', async () => {
-    const proofFor = (key: string) => ({ command: 'node --test', exitCode: 0, fingerprint: 'f', evidenceKey: key, verifiedAt: 3 });
-    const build = async (key: string, body: Json, rid = 'r1'): Promise<MemoryLedger> => {
+  it('only a run ledgerProvenRun proves lets the assistant stop: a well-formed proof whose verify evidence is missing, of another run, not exit 0, without its digest or without its verify.passed blocks', async () => {
+    const CHECK = { command: 'node --test', timeoutSec: 60 };
+    const body = (o: Record<string, Json> = {}): JsonObject => ({ command: CHECK.command, commandDigest: verifyCommandDigest(CHECK.command), timeoutSec: 30, exitCode: 0, outcome: 'passed', fingerprint: 'f', runId: 'r1', ...o });
+    const build = async (o: { key?: string; body?: JsonObject; rid?: string; passed?: boolean; held?: boolean; delivered?: 'granted' | 'pending' | 'none' } = {}): Promise<MemoryLedger> => {
       const l = new MemoryLedger();
-      await l.evidence({ key: 'vk', kind: 'gate.verify', runId: rid, body });
+      await l.evidence({ key: 'vk', kind: 'gate.verify', runId: o.rid ?? 'r1', body: o.body ?? body() });
+      // the PR the achievement follows: an approval the approvals table holds (granted by a human, or still pending)
+      const delivered = o.delivered ?? 'granted';
+      if (delivered !== 'none') {
+        await l.requestApproval({ requestId: 'ap_pr', runId: 'r1', sessionId: 's', actionHash: 'h', requester: { kind: 'system', id: 'loop' }, reason: 'open_pr', expiresAt: Date.now() + 60_000 });
+        if (delivered === 'granted') await l.approve('ap_pr', { kind: 'human', id: 'ana' }, 's', Date.now());
+      }
       const g = { goalId: 'g' };
+      const it1 = { goalId: 'g', intentionId: 'i1', planId: 'p', stepId: 'verify' };
+      const goal = { id: 'g', statement: 's', check: CHECK, commitment: 'single-minded', status: 'open', evidence: [] };
       let n = 0;
-      for (const e of [
-        evt('run.started', ++n, 'r1'),
-        evt('goal.adopted', ++n, 'r1', { goal: { id: 'g', statement: 's', check: { command: 'node --test', timeoutSec: 60 } } }, g),
-        evt('goal.achieved', ++n, 'r1', { goal: { id: 'g', check: { command: 'node --test', timeoutSec: 60 } }, proof: proofFor(key) }, g),
-      ])
-        await l.append(e);
+      const list: TeceraEvent[] = [evt('run.started', ++n, 'r1'), evt('goal.adopted', ++n, 'r1', { goal }, g), evt('intention.pushed', ++n, 'r1', { intention: { id: 'i1' } }, it1)];
+      if (o.passed !== false) list.push(evt('verify.passed', ++n, 'r1', { evidenceKey: o.key ?? 'vk', fingerprint: 'f', exitCode: 0 }, it1));
+      if (delivered !== 'none') list.push(evt('pr.requested', ++n, 'r1', { step: 'pr', sha: 'c1', evidenceKey: 'pk', approvalRequestId: 'ap_pr' }, { ...it1, stepId: 'pr' }));
+      list.push(evt('intention.done', ++n, 'r1', { intention: { id: 'i1' } }, it1), evt('goal.achieved', ++n, 'r1', { goal, proof: { command: CHECK.command, exitCode: 0, fingerprint: 'f', evidenceKey: o.key ?? 'vk', verifiedAt: 5 } }, g));
+      if (o.held !== false) list.push(evt('run.ended', ++n, 'r1', { exitCode: 4 }));
+      for (const e of list) await l.append(e);
       return l;
     };
-    const ok = await evaluateStop(await build('vk', { exitCode: 0, fingerprint: 'f' }));
+    const ok = await evaluateStop(await build());
     expect(ok.decision).toMatchObject({ decision: 'allow', exitCode: 0 });
-    const missing = await evaluateStop(await build('vk-missing', { exitCode: 0, fingerprint: 'f' }));
-    expect(missing.decision.exitCode).toBe(2);
-    expect(missing.missing).toMatch(/verify evidence vk-missing is not in the ledger/);
-    const failed = await evaluateStop(await build('vk', { exitCode: 1, fingerprint: 'f' }));
-    expect(failed.missing).toMatch(/records exit 1/);
-    const other = await evaluateStop(await build('vk', { exitCode: 0, fingerprint: 'f' }, 'r-other'));
-    expect(other.missing).toMatch(/belongs to run r-other/);
-    const otherTree = await evaluateStop(await build('vk', { exitCode: 0, fingerprint: 'g' }));
-    expect(otherTree.missing).toMatch(/another candidate/);
-    // budget never matters: a budget.exhausted run with a backed proof may stop
-    const l = await build('vk', { exitCode: 0, fingerprint: 'f' });
-    await l.append(evt('budget.exhausted', 9, 'r1', { pool: 'usd', enforced: false }));
+    expect(ok.proof).toMatchObject({ evidenceKey: 'vk', fingerprint: 'f' });
+    for (const [name, l] of [
+      ['missing evidence', await build({ key: 'vk-missing' })],
+      ['not exit 0', await build({ body: body({ exitCode: 1, outcome: 'failed' }) })],
+      ['another run', await build({ rid: 'r-other', body: body({ runId: 'r-other' }) })],
+      ['another candidate', await build({ body: body({ fingerprint: 'g' }) })],
+      ['no verify.passed', await build({ passed: false })],
+    ] as const) {
+      const s = await evaluateStop(l);
+      expect(s.decision.exitCode, name).toBe(2);
+      expect(s.missing, name).toMatch(/run r1 \(goal g\) is held for a human decision; its goal.achieved is not proven/);
+    }
+    // a proven goal.achieved of a run that never delivered its PR, or whose PR approval the approvals table
+    // does not hold as granted by a human, does not let the assistant stop
+    for (const [name, delivered, why] of [
+      ['no PR', 'none', /claims its goal achieved before delivering it: no PR was delivered/],
+      ['PR approval not granted', 'pending', /claims its goal achieved before delivering it: its PR names no approval a human granted/],
+    ] as const) {
+      const s = await evaluateStop(await build({ delivered }));
+      expect(s.decision.exitCode, name).toBe(2);
+      expect(s.missing, name).toMatch(why);
+    }
+    // a ledger that reads once and then fails (or fails part-way) is never decided on a partial view
+    const flaky = await build();
+    const read = flaky.events.bind(flaky);
+    let reads = 0;
+    flaky.events = ((...a: Parameters<typeof read>) => {
+      if (++reads > 1) throw new Error('disk went away');
+      return read(...a);
+    }) as typeof flaky.events;
+    const fl = await evaluateStop(flaky);
+    expect(reads).toBeGreaterThan(1);
+    expect(fl.decision).toMatchObject({ decision: 'block', exitCode: 2 });
+    expect(fl.missing).toMatch(/could not be read \(disk went away\)/);
+    // budget never matters: a budget.exhausted run with a proven goal may stop
+    const l = await build();
+    await l.append(evt('budget.exhausted', 99, 'r1', { pool: 'usd', enforced: false }));
     expect((await evaluateStop(l)).decision.decision).toBe('allow');
+    // a run that ended (exit 0) is not active: the hook allows and names the proof of the latest run
+    const ended = await build({ held: false });
+    await ended.append(evt('run.ended', 98, 'r1', { exitCode: 0 }));
+    expect(await evaluateStop(ended)).toMatchObject({ decision: { decision: 'allow' }, activeRun: null, provedRunId: 'r1' });
+  });
+
+  it('a provisional run (exit 10) blocks until it or a LATER run proves the same goal; a later run of another goal, or one that proves nothing, does not settle it', async () => {
+    const prov = (goalId: string): TeceraEvent[] => [evt('run.started', 101, 'r0'), evt('goal.adopted', 102, 'r0', { goal: { id: goalId } }, { goalId }), evt('goal.provisional', 103, 'r0', {}, { goalId }), evt('run.ended', 104, 'r0', { exitCode: 10 })];
+    const CHECK = { command: 'node --test', timeoutSec: 60 };
+    const goal = { id: 'g', statement: 's', check: CHECK, commitment: 'single-minded', status: 'open', evidence: [] };
+    const it1 = { goalId: 'g', intentionId: 'i1', planId: 'p', stepId: 'verify' };
+    const later = async (o: { goalId?: string; proven?: boolean } = {}): Promise<MemoryLedger> => {
+      const l = new MemoryLedger();
+      for (const e of prov('g')) await l.append(e);
+      const gid = o.goalId ?? 'g';
+      const g = { ...goal, id: gid };
+      const tr = { ...it1, goalId: gid };
+      await l.evidence({ key: 'vk', kind: 'gate.verify', runId: 'r1', body: { command: CHECK.command, commandDigest: verifyCommandDigest(CHECK.command), timeoutSec: 30, exitCode: 0, outcome: 'passed', fingerprint: 'f', runId: 'r1' } });
+      let n = 200;
+      const list: TeceraEvent[] = [evt('run.started', ++n, 'r1'), evt('goal.adopted', ++n, 'r1', { goal: g }, { goalId: gid }), evt('intention.pushed', ++n, 'r1', { intention: { id: 'i1' } }, tr)];
+      if (o.proven !== false) list.push(evt('verify.passed', ++n, 'r1', { evidenceKey: 'vk', fingerprint: 'f', exitCode: 0 }, tr));
+      list.push(evt('intention.done', ++n, 'r1', { intention: { id: 'i1' } }, tr), evt('goal.achieved', ++n, 'r1', { goal: g, proof: { command: CHECK.command, exitCode: 0, fingerprint: 'f', evidenceKey: 'vk', verifiedAt: 5 } }, { goalId: gid }), evt('run.ended', ++n, 'r1', { exitCode: 0 }));
+      for (const e of list) await l.append(e);
+      return l;
+    };
+    const alone = new MemoryLedger();
+    for (const e of prov('g')) await alone.append(e);
+    expect(await evaluateStop(alone)).toMatchObject({ decision: { decision: 'block' }, provisional: true });
+    // a later run proves goal g: the provisional run is superseded
+    expect(await evaluateStop(await later())).toMatchObject({ decision: { decision: 'allow' }, provedRunId: 'r1' });
+    // a later run of another goal, or one whose achievement is not proven, settles nothing
+    expect((await evaluateStop(await later({ goalId: 'other' }))).decision.decision).toBe('block');
+    expect((await evaluateStop(await later({ proven: false }))).decision.decision).toBe('block');
   });
 });
 
@@ -296,5 +394,64 @@ describe('D1: the local principal', () => {
       expect((e as PrincipalError).exitCode).toBe(EXIT.usage);
     }
     expect(() => localPrincipal({ env: {} }, { as: '$(id)' })).toThrow(/plain identifier/);
+  });
+});
+
+describe('closeOut change summary and the planner repository view (worktree)', () => {
+  const gitRepo = (): string => {
+    const d = mkdtempSync(join(tmpdir(), 'tecera-diff-'));
+    const g = (...a: string[]) => execFileSync('git', ['-C', d, '-c', 'user.email=t@example.com', '-c', 'user.name=t', '-c', 'core.hooksPath=/dev/null', ...a], { env: { PATH: process.env.PATH ?? '', HOME: d, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    g('init', '-q', '-b', 'main');
+    mkdirSync(join(d, 'src'));
+    writeFileSync(join(d, 'src/a.js'), 'one\ntwo\nthree\n');
+    writeFileSync(join(d, 'gone.txt'), 'x\ny\n');
+    g('add', '-A');
+    g('commit', '-q', '-m', 'base');
+    return d;
+  };
+
+  it('diffTrees: paths and line counts between two checkpoints (added, modified, deleted, binary as 0); a malformed id throws', async () => {
+    const d = gitRepo();
+    try {
+      const from = await snapshotTree(d);
+      expect(await diffTrees(d, from, from)).toEqual([]);
+      writeFileSync(join(d, 'src/a.js'), 'one\nTWO\nthree\nfour\n');
+      rmSync(join(d, 'gone.txt'));
+      writeFileSync(join(d, 'src/new file.js'), 'n\n');
+      writeFileSync(join(d, 'blob.bin'), Buffer.from([0, 1, 2, 0, 255]));
+      const to = await snapshotTree(d);
+      const files = await diffTrees(d, from, to);
+      expect([...files].sort((a, b) => a.path.localeCompare(b.path))).toEqual([
+        { path: 'blob.bin', added: 0, removed: 0 },
+        { path: 'gone.txt', added: 0, removed: 2 },
+        { path: 'src/a.js', added: 2, removed: 1 },
+        { path: 'src/new file.js', added: 1, removed: 0 },
+      ]);
+      await expect(diffTrees(d, 'base', to)).rejects.toThrow(/not a worktree checkpoint/);
+      await expect(diffTrees(d, from, 'tree:--output=/tmp/x')).rejects.toThrow(/not a worktree checkpoint/);
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('repoFileView: a repository-relative file that exists; absolute, climbing or link-escaping paths are absent', () => {
+    const d = gitRepo();
+    const outside = mkdtempSync(join(tmpdir(), 'tecera-outside-'));
+    try {
+      writeFileSync(join(outside, 'secret.txt'), 's');
+      symlinkSync(outside, join(d, 'out'));
+      const has = repoFileView(d);
+      expect(has('src/a.js')).toBe(true);
+      expect(has('./src/a.js')).toBe(true);
+      expect(has('src/missing.js')).toBe(false);
+      expect(has('')).toBe(false);
+      expect(has(join(d, 'src/a.js'))).toBe(false);
+      expect(has('src/../src/a.js')).toBe(false);
+      expect(has('../' + d.split('/').pop() + '/src/a.js')).toBe(false);
+      expect(has('out/secret.txt')).toBe(false);
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

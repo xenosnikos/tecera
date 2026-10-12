@@ -1,6 +1,7 @@
-import { isWritingStep, READ_ONLY_TOOLS, validatePlanShape, type AchievementGoal, type Manifest, type Plan, type PlanValidator, type Redactor, type Step } from '@tecera/contracts';
+import { isWritingStep, READ_ONLY_TOOLS, validatePlanShape, type AchievementGoal, type Manifest, type Plan, type PlanningContext, type PlanValidator, type Redactor, type Step } from '@tecera/contracts';
 import { DEFAULT_PERMISSIONS, classify, validatePlan, type PermissionsDoc } from '@tecera/policy';
 import { budgetIssues } from './budget.js';
+import { contractPlanIssues } from './contract.js';
 import { deepSecretKind, inertDepth, MAX_PLAN_DEPTH, patternRedactor, UNSCANNABLE } from './hygiene.js';
 import { safeLine } from './render.js';
 
@@ -13,8 +14,9 @@ import { safeLine } from './render.js';
  *   every worker → V1 gate.verify → R gate.review → V2 gate.verify → C gate.commit → P gate.pr
  * linked through dependsOn ancestry: V1 has every worker step as an ancestor, R has V1, V2 has R, C has V2,
  * P depends directly on C; C depends on every worker and only P follows it; P is the single last step. The
- * commit lands on the work branch without approval; P is the one human approval point (it needs 'open_pr'
- * in permissions.approvals, which policy.validatePlan checks together with its own deliveryChainProblems).
+ * commit lands on the work branch without approval; P is the one human approval point. It opens the PR and
+ * pushes the work branch, so it needs both 'open_pr' and 'git_push' in permissions.approvals (one approval,
+ * bound to the commit, covers both; policy.validatePlan checks 'open_pr' and its deliveryChainProblems).
  * A verify that runs beside the review, a review that only follows an earlier verify, or a commit whose
  * chain does not cover a writing step is rejected.
  *
@@ -142,6 +144,7 @@ export function plannerChecks(plan: Plan, permissions: PermissionsDoc = DEFAULT_
     if (!commits.some((c) => p.dependsOn.includes(c.id))) errors.push(`pr step ${p.id} must depend directly on the commit step (the PR delivers the committed work branch)`);
     const outside = plan.steps.filter((s) => s.id !== p.id && !has(p.id, s.id)).map((s) => s.id);
     if (outside.length) errors.push(`pr step ${p.id} must be the plan's single last step (not downstream of: ${outside.join(', ')})`);
+    for (const a of ['open_pr', 'git_push']) if (!plan.permissions.approvals.includes(a)) errors.push(`pr step ${p.id} opens a pull request and pushes the work branch: permissions.approvals must list '${a}'`);
   }
   for (const w of writers) {
     if (!commits.some((c) => has(c.id, w.id))) errors.push(`worker step ${w.id} may write but no commit chain depends on it`);
@@ -171,6 +174,11 @@ export interface CandidateValidationOptions {
   redactor?: Redactor;
   /** Require every budget field (default: true for origin 'generated', false otherwise). */
   requireCompleteBudget?: boolean;
+  /**
+   * The accepted contract, inventory and allowance the plan was written against (contractPlanIssues). Without
+   * it a goal that carries its own criteria and contractHash is checked against those.
+   */
+  ctx?: PlanningContext;
 }
 
 function hasCheck(goal: AchievementGoal | undefined, override: boolean | undefined): boolean {
@@ -242,9 +250,16 @@ export function validateCandidate(plan: Plan, o: CandidateValidationOptions): st
     const all = [
       ...planSecretIssues(plan, r),
       ...validatePlanShape(plan),
-      ...validatePlan(plan, o.manifest, { toolCatalog: o.toolCatalog ?? DEFAULT_TOOL_CATALOG, permissions, goalHasCheck: hasCheck(o.goal, o.goalHasCheck) }),
+      ...validatePlan(plan, o.manifest, {
+        toolCatalog: o.toolCatalog ?? DEFAULT_TOOL_CATALOG,
+        permissions,
+        goalHasCheck: hasCheck(o.goal, o.goalHasCheck),
+        ...(o.ctx ? { context: o.ctx } : {}),
+        ...(o.goal ? { goal: o.goal } : {}),
+      }),
       ...plannerChecks(plan, permissions, { workerSeats: seatsFor(o.manifest, o.workerSeats) }),
       ...budgetIssues(plan, o.manifest, o.goal ?? null, { requireComplete: o.requireCompleteBudget ?? plan.origin === 'generated' }),
+      ...contractPlanIssues(plan, o.ctx, { goal: o.goal, connections: o.manifest.connections }),
     ];
     return sanitizeDiagnostics(all, r);
   } catch (err) {
@@ -264,15 +279,16 @@ export interface PlanValidatorOptions {
 }
 
 /**
- * The loop's PlanValidator port (contracts): validatePlan(plan, manifest, goal). The loop runs it on
- * generated AND library-matched plans; it applies policy, the planner rules and the goal's budget ceiling
- * (policy.validatePlan has no goal parameter yet, so the goal ceilings are enforced here). Shape
+ * The loop's PlanValidator port (contracts): validatePlan(plan, manifest, goal, ctx?). The loop runs it on
+ * generated AND library-matched plans; it applies policy, the planner rules, the goal's budget ceiling
+ * (policy.validatePlan has no goal parameter yet, so the goal ceilings are enforced here) and, with an
+ * accepted contract (ctx, or the goal's own criteria), contractPlanIssues. Shape
  * validation is included as well; the loop also runs it, duplicates are harmless. Every diagnostic it
  * returns is sanitized (redacted with the supplied redactor, or SECRET_PATTERNS without one).
  */
 export function createPlanValidator(o: PlanValidatorOptions = {}): PlanValidator {
   return {
-    validatePlan(plan: Plan, manifest: Manifest, goal: AchievementGoal): string[] {
+    validatePlan(plan: Plan, manifest: Manifest, goal: AchievementGoal, ctx?: PlanningContext): string[] {
       if (!goal || typeof goal !== 'object') return ['plan validation needs the goal (budget ceilings and check); refusing'];
       const mode = o.requireCompleteBudget ?? 'generated';
       let origin: unknown;
@@ -290,6 +306,7 @@ export function createPlanValidator(o: PlanValidatorOptions = {}): PlanValidator
         workerSeats: o.workerSeats,
         redactor: o.redactor,
         requireCompleteBudget: mode === 'always' ? true : mode === 'never' ? false : origin === 'generated',
+        ctx,
       });
     },
   };

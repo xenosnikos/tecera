@@ -1,0 +1,42 @@
+diff --git a/src/app.js b/src/app.js
+index 9e90daf..2cd90a9 100755
+--- a/src/app.js
++++ b/src/app.js
+@@ -1,12 +1,32 @@
+ // A tiny JSON API. createApp(options) returns handle(request) -> { status, headers, body }.
+ // A request is { ip, path }. options.now is the clock in epoch ms (default Date.now).
+-// options.rateLimit ({ limit, windowMs }) is accepted but not enforced yet.
++// options.rateLimit ({ limit, windowMs }): at most `limit` requests per client ip per fixed window.
+ export function createApp(options = {}) {
+   const now = options.now ?? Date.now;
+-  void now;
++  const rl = options.rateLimit;
++  const windows = new Map();
++  function limited(ip) {
++    if (!rl) return null;
++    const t = now();
++    let w = windows.get(ip);
++    if (!w || t - w.start >= rl.windowMs) {
++      w = { start: t, count: 0 };
++      windows.set(ip, w);
++    }
++    w.count++;
++    const remaining = Math.max(0, rl.limit - w.count);
++    if (w.count > rl.limit) {
++      const retry = Math.max(1, Math.ceil((w.start + rl.windowMs - t) / 1000));
++      return { blocked: true, headers: { 'Retry-After': String(retry), 'X-RateLimit-Remaining': '0' } };
++    }
++    return { blocked: false, headers: { 'X-RateLimit-Remaining': String(remaining) } };
++  }
+   return function handle(req) {
+-    if (req.path === '/health') return { status: 200, headers: {}, body: { ok: true } };
+-    if (req.path === '/items') return { status: 200, headers: {}, body: { items: ['apple', 'pear'] } };
+-    return { status: 404, headers: {}, body: { error: 'not found' } };
++    const l = limited(req.ip ?? '');
++    if (l?.blocked) return { status: 429, headers: l.headers, body: { error: 'too many requests' } };
++    const headers = l ? l.headers : {};
++    if (req.path === '/health') return { status: 200, headers, body: { ok: true } };
++    if (req.path === '/items') return { status: 200, headers, body: { items: ['apple', 'pear'] } };
++    return { status: 404, headers, body: { error: 'not found' } };
+   };
+ }

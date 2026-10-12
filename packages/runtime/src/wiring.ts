@@ -3,9 +3,24 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import {
   AccountingFailure,
+  capabilityInventoryOf,
   event,
   LedgerError,
+  payloadOf,
+  resourceRegistryOf,
+  acceptedContractOf,
+  type AcceptanceContract,
   type AchievementGoal,
+  type CapabilityMockedPayload,
+  type CapabilityProbe,
+  type CapabilityRecord,
+  type ContractDraft,
+  type MockToolDeclaration,
+  type PlanningContext,
+  type ProvisionedResource,
+  type Provisioner,
+  type ResourceRegistry,
+  type Tool,
   type AttemptFingerprint,
   type ApprovalGrant,
   type BeliefProjection,
@@ -42,14 +57,18 @@ import {
   type WriteGuard,
 } from '@tecera/contracts';
 import { Brain } from '@tecera/brain';
-import { createGates, scrubbedAllowlist, type Gates } from '@tecera/gates';
-import { DEFAULT_LLM_RESERVATION, type SeatCost } from '@tecera/loop';
-import { createPlanValidator, LLMPlanner, ScriptedPlanner } from '@tecera/planner';
-import { assertMandatory, mandatoryHooks, type PermissionsDoc } from '@tecera/policy';
+import { createGates, hostGit, PrGate, scrubbedAllowlist, type Gates } from '@tecera/gates';
+import { DEFAULT_LLM_RESERVATION, type SeatCost, type WorktreeChange } from '@tecera/loop';
+import { createPlanValidator, LLMPlanner, type RepoFacts } from '@tecera/planner';
+import { allowanceOf, assertMandatory, mandatoryHooks, type PermissionsDoc } from '@tecera/policy';
 import { createProvider, doctorProbe, priceFor, type FetchLike, type SecretStore } from '@tecera/providers';
 import type { Frontier } from '@tecera/reflex';
-import { ChildProcessRepl, createEditTool, createListFilesTool, createReadTool, StepWorker, type ReplFactory } from '@tecera/worker';
-import { admitVerify, VERIFY_ALLOW_ROOT_ENV, VerifyContainmentError } from './containment.js';
+import { ChildProcessRepl, createEditTool, createListFilesTool, createReadTool, MESSAGE_KINDS, MESSAGE_METHODS, resourceTools, StepWorker, STORE_KINDS, STORE_METHODS, type ReplFactory } from '@tecera/worker';
+import { capabilityAccess, hostBinding, repositoryFacts, runtimeEnvironment, withStandIns } from './capabilities/access.js';
+import { ConnectionProbe, storeAuthResolver } from './capabilities/probe.js';
+import { LocalProvisioner, locatorWithin, resourcesRoot } from './capabilities/provisioner.js';
+import { releaseExpired } from './capabilities/sweep.js';
+import { admitVerify, VERIFY_ALLOW_ROOT_ENV, VerifyContainmentError, verifyIdentity } from './containment.js';
 import { COST_KIND, costLine, costRecordingLLM, costReport, type CostSink } from './cost.js';
 import { fencedTool, fencedVerifyRunner, leasedGateContext, leaseGuard, mutationCheck, stepGuards } from './fencing.js';
 import { ModelFrontier } from './frontier.js';
@@ -57,9 +76,9 @@ import type { GoalSpec } from './goals.js';
 import { cancellableLLM, meteredLLM, SeatMeter, type SeatReservation } from './metering.js';
 import { OwnershipRecorder, ownerFilePath, reapPriorProcesses, type ReapResult } from './ownership.js';
 import { providerOptions, providerSetup, withIdentity } from './providerSetup.js';
-import { loadScripts, scriptedFetch, type ScriptSet, type ScriptTap } from './scripted.js';
+import { loadScripts, scriptedFetch, ScriptedRunPlanner, type ScriptSet, type ScriptTap } from './scripted.js';
 import type { Env } from './util/proc.js';
-import { leaseWorktree, WiringError, worktreesRoot, type LeasedWorktree } from './worktree.js';
+import { diffTrees, leaseWorktree, repoFileView, WiringError, worktreesRoot, type LeasedWorktree } from './worktree.js';
 
 export { WiringError } from './worktree.js';
 
@@ -85,11 +104,25 @@ export { WiringError } from './worktree.js';
  *    redactor, the worktree and the session; verify/review/commit/pr/reconcile are exposed (D6: commit lands
  *    on the work branch tecera/<goal> without approval; gate.pr is the only approval point and Tecera never
  *    merges; a gates build without a PR gate fails gate.pr terminally for a human);
- * 7. planner: ScriptedPlanner when a scripted plan is given, else LLMPlanner on the planner seat with brain
+ * 7. planner: ScriptedRunPlanner (scripted.ts) when a scripted plan is given, else LLMPlanner on the planner seat with brain
  *    lessons and recorded deliberations. The loop reserves before and settles after every planner call; the
  *    planner's usage reports are bridged onto the loop's meter (never charged twice);
  * 8. goal-aware validator (planner createPlanValidator over the real tool catalog, worker seats, redactor);
- * 9. route costs per worker seat, and the planner seat as the METERED frontier for shaky reflex answers.
+ * 9. route costs per worker seat, and the planner seat as the METERED frontier for shaky reflex answers;
+ * 10. capabilities (D9, D10, D12): the connection probe (ConnectionProbe over the contained verify runner, in
+ *    the worktree), the local provisioner (LocalProvisioner under $TECERA_RESOURCES), the run's secrets
+ *    predicate, and the expiry sweep. A provisioned sqlite / http-stub becomes a brokered tool named after its
+ *    capability; a capability the loop resolved to 'mock' is served by a stand-in (WorkerStepRequest.mocks) to
+ *    every worker step, whatever tools the plan listed (the stand-in's tool is added to the step's), and its
+ *    first use is recorded as capability.mocked; a criterion that requires such a capability when no step used
+ *    the stand-in is proven against the code's own fake, so the verify port records capability.mocked before
+ *    the gate runs it (a mock rung is never an exit 9). Each worker step's inputs carry `capabilityAccess`
+ *    (per stand-in or provisioned resource: kind, fidelity, tool name, locator and its TECERA_RESOURCE_<ID>
+ *    variable, how to use it) and `runtimeEnvironment` (Node built-ins, the packages package.json lists). A
+ *    provisioned git-remote is the remote gate.pr pushes to (added to the worktree for the delivery, removed
+ *    after it) when the repository has no remote of that name.
+ * 11. the planner's view of the repository: repoFiles (existence), repoFacts (packages, tested API), and
+ *    every contract draft its screen refused recorded as `criteria.rejected` evidence + evidence.appended.
  *
  * Lease authority (security.md §4): the lease's `lost` signal is handed to the loop (it stops and aborts
  * running steps), every live sandbox child is disposed on loss, every write-class tool re-proves the lease
@@ -190,7 +223,9 @@ export interface WiredPorts {
    */
   isolationDegraded?: boolean;
   /** LoopPorts.worktreeCheckpoint: snapshot the leased worktree (`tree:<oid>`). */
-  worktreeCheckpoint?: (a: { runId: string; intentionId: string; stepId: string; attempt: number; reason: 'completed' | 'suspended' }) => Promise<string>;
+  worktreeCheckpoint?: (a: { runId: string; intentionId: string; stepId: string; attempt: number; reason: 'baseline' | 'completed' | 'suspended' }) => Promise<string>;
+  /** LoopPorts.worktreeChanges: files changed between two checkpoints of the leased worktree (paths and counts). */
+  worktreeChanges?: (a: { runId: string; intentionId: string; stepId: string; from: string; to: string }) => Promise<WorktreeChange[]>;
   /** Restore the leased worktree to a checkpoint ('base' or `tree:<oid>`), proven by a re-snapshot. */
   restoreWorktree?(checkpointId: string, signal?: AbortSignal): Promise<string>;
   /** Kill every process of a previous supervisor of this run (owner records + anything working in the worktree). */
@@ -201,6 +236,14 @@ export interface WiredPorts {
   runSignal?: AbortSignal;
   /** Model calls whose cost.call record could not be written (the cost report says it is incomplete). */
   costUnrecorded?(): number;
+  /** LoopPorts.probe: probes the manifest's declared connections for real. */
+  probe?: CapabilityProbe;
+  /** LoopPorts.provisioner: creates resources in Tecera's own space inside manifest.provisioning. */
+  provisioner?: Provisioner;
+  /** LoopPorts.secrets: a value that carries a known secret (no resource locator may). */
+  secrets?: (value: string) => boolean;
+  /** Release every expired pending resource (run start, D12); lines for the operator. */
+  sweep?(): Promise<string[]>;
   dispose?(): Promise<void>;
 }
 
@@ -251,6 +294,8 @@ interface StepTrace {
   attempt?: number;
   /** Candidate history of the step's intention (attempt, D1, worker execution), from its verify events. */
   history?: AttemptFingerprint[];
+  /** The accepted acceptance contract of the step's goal (tamperCheck protects it and what its criteria run). */
+  contract?: AcceptanceContract | null;
 }
 
 /** Per-call reservation for the reviewer and frontier seats (settled at actual usage). */
@@ -347,10 +392,16 @@ export async function attemptFingerprints(ledger: Ledger, runId: string, intenti
  */
 export class MeteredPlanner implements Planner {
   private readonly als = new AsyncLocalStorage<{ meter: UsageMeter; direct: number; reported: LLMUsage[] }>();
+  /** Drafting of a statement's acceptance contract, metered like write; present only when the inner planner drafts. */
+  readonly draftContract?: (statement: string, goal: AchievementGoal, inventory: readonly CapabilityRecord[], meter?: UsageMeter) => Promise<ContractDraft>;
+
   constructor(
     private readonly inner: Planner,
     private readonly direct: (u: LLMUsage, purpose: string) => Promise<void>,
-  ) {}
+  ) {
+    const drafter = inner.draftContract?.bind(inner);
+    if (drafter) this.draftContract = (statement, goal, inventory, meter) => this.bridged(meter, (m) => drafter(statement, goal, inventory, m));
+  }
 
   /** The cancellation signal of the loop meter the current planner call runs under (deadline, loop stop). */
   readonly meterSignal = (): AbortSignal | undefined => this.als.getStore()?.meter.signal;
@@ -379,9 +430,11 @@ export class MeteredPlanner implements Planner {
     }
   }
 
-  write(e: TeceraEvent, beliefs: BeliefProjection, goal: AchievementGoal, meter?: UsageMeter): Promise<Plan> {
-    return this.bridged(meter, (m) => this.inner.write(e, beliefs, goal, m));
+  write(e: TeceraEvent, beliefs: BeliefProjection, goal: AchievementGoal, meter?: UsageMeter, ctx?: PlanningContext): Promise<Plan> {
+    return this.bridged(meter, (m) => (ctx === undefined ? this.inner.write(e, beliefs, goal, m) : this.inner.write(e, beliefs, goal, m, ctx)));
   }
+
+
 
   deliberate(options: Plan[], intentions: Intention[], beliefs: BeliefProjection, meter?: UsageMeter): Promise<Plan> {
     return this.bridged(meter, (m) => this.inner.deliberate(options, intentions, beliefs, m));
@@ -420,6 +473,44 @@ export function ledgerCostSink(ledger: Ledger, runId: string, o: { ids: () => st
   return async (c, trace) => {
     await ledger.append(event('evidence.appended', { id: o.ids(), at: o.now(), actor: { kind: 'system', id: 'cost' }, runId, trace, payload: { kind: COST_KIND, ...c } }));
   };
+}
+
+/** The latest capability.missing of `id` in a run: the rung the loop resolved it to and the kind it recorded. */
+function lastMissing(events: readonly TeceraEvent[], id: string): { resolution: string; kind?: string } | null {
+  let out: { resolution: string; kind?: string } | null = null;
+  for (const e of events) {
+    if (e.kind !== 'capability.missing') continue;
+    const p = e.payload as { capability?: { id?: unknown; kind?: unknown }; resolution?: unknown };
+    if (p.capability?.id !== id || typeof p.resolution !== 'string') continue;
+    out = { resolution: p.resolution, ...(typeof p.capability.kind === 'string' ? { kind: p.capability.kind } : {}) };
+  }
+  return out;
+}
+
+const REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/**
+ * The pending resources a run may hand its workers as tools: none at all while the registry reports a
+ * problem or a resource past the allowance (a refusal, never a partial use of what is left).
+ */
+export function usableResources(reg: Pick<ResourceRegistry, 'pending' | 'problems' | 'overAllowance'>): ProvisionedResource[] {
+  if (reg.problems.length || reg.overAllowance.length) return [];
+  return reg.pending;
+}
+
+/**
+ * The provisioned git remote a PR delivery may push to (null when none): a usable pending 'git-remote' whose
+ * capability is a plain remote name and whose locator is an absolute local path (what the local provisioner
+ * makes; never a URL, a network path or a git transport such as `ext::`). With `place`, the locator must also
+ * lie under the provisioner's root and outside the repository (locatorWithin): a recorded resource pointing
+ * into the business repository or elsewhere on the host never receives a push.
+ */
+export function pushableRemote(reg: Pick<ResourceRegistry, 'pending' | 'problems' | 'overAllowance'>, place?: { root: string; repoRoot: string }): ProvisionedResource | null {
+  return (
+    usableResources(reg).find(
+      (x) => x.kind === 'git-remote' && REMOTE_NAME.test(x.capability) && /^\/(?!\/)/.test(x.locator) && !x.locator.includes('::') && (!place || locatorWithin(x.locator, place.root, place.repoRoot)),
+    ) ?? null
+  );
 }
 
 export function createWiring(o: WiringOptions = {}): WireFn {
@@ -557,6 +648,122 @@ export function createWiring(o: WiringOptions = {}): WireFn {
       }
       if (scripts) notes.push(`scripted   replies from ${scripts.dir} (no network, no model)`);
 
+      // 11. the repository as the planner and the workers may rely on it (read once, from the leased worktree)
+      let repoFactsCache: RepoFacts | null = null;
+      const facts = (): RepoFacts => (repoFactsCache ??= repositoryFacts(wt.path));
+
+      // 10. capabilities (D9, D10, D12). The run's events are read fresh for every decision below.
+      const secrets = (v: string): boolean => redactor.containsSecret(v) !== null;
+      const allowance = allowanceOf(m);
+      const runEvents = async (rid = runId): Promise<TeceraEvent[]> => {
+        const evs: TeceraEvent[] = [];
+        for await (const e of ledger.events({ runId: rid })) evs.push(e);
+        return evs;
+      };
+      // Probes run in the worktree through the contained verify runner (no network, scrubbed env, reaped tree).
+      const probe = new ConnectionProbe({ connections: m.connections, runner: verifyRunner, cwd: wt.path, envAllowlist: [...m.sandbox.envAllowlist], authResolves: storeAuthResolver(ctx.env, ctx.root), redactor, signal: runCtl.signal });
+      // A provisioned sqlite / http-stub is a brokered tool named after its capability; its locator reaches a
+      // step only as data in capabilityAccess (the step's file tools stay inside the worktree).
+      const workerTools: Tool[] = [];
+      const toolOf = new Set<string>();
+      const addResourceTool = (r: ProvisionedResource): void => {
+        if ((r.kind !== 'sqlite' && r.kind !== 'http-stub') || toolOf.has(r.capability)) return;
+        try {
+          workerTools.push(...resourceTools([r]));
+          toolOf.add(r.capability);
+        } catch (e) {
+          notes.push(`resource   ${r.id} (${r.kind}) is not usable as a tool: ${(e as Error).message}`);
+        }
+      };
+      let local: LocalProvisioner | null = null;
+      try {
+        const reg = resourceRegistryOf(await runEvents(), { runId, allowance, secrets });
+        const ident = o.verifyIdentity ?? verifyIdentity(ctx.env);
+        const asRoot = typeof process.geteuid === 'function' && process.geteuid() === 0;
+        local = new LocalProvisioner({
+          root: resourcesRoot(ctx.env),
+          repoRoot: ctx.root,
+          allowance,
+          runId,
+          provisionedSoFar: reg.resources.length,
+          // tmpdir and sqlite payloads are handed to the verify identity (only root can chown).
+          ...(ident.runAs && asRoot ? { share: ident.runAs } : {}),
+          secrets,
+          now: ctx.now,
+        });
+        for (const r of usableResources(reg)) addResourceTool(r);
+      } catch (e) {
+        notes.push(`provision  unavailable: ${(e as Error).message}`);
+      }
+      const provisioner: Provisioner | undefined = local
+        ? {
+            kinds: () => local!.kinds(),
+            provision: async (need) => {
+              const r = await local!.provision(need);
+              addResourceTool(r);
+              return r;
+            },
+            release: (id) => local!.release(id),
+            list: () => local!.list(),
+          }
+        : undefined;
+      /**
+       * Stand-ins for every worker step (D10 mock rung): each capability the run's gap ladder resolved to 'mock'
+       * (capability.missing) or a stand-in already serves, plus any the plan names, whose kind has a generic
+       * stand-in (a store or a message sink). The plan's tool lists do not decide it: the step gets the
+       * stand-in's tool (withStandIns). Never for an available or provisioned capability (the broker admits
+       * each one again against the inventory), never under a name a wired tool already has.
+       */
+      const mockDeclarations = async (req: WorkerStepRequest, evs: readonly TeceraEvent[]): Promise<MockToolDeclaration[]> => {
+        const resolved = evs.filter((e) => e.kind === 'capability.missing' || e.kind === 'capability.mocked').map((e) => {
+          const c = (e.payload as { capability?: unknown }).capability;
+          return typeof c === 'string' ? c : typeof (c as { id?: unknown } | undefined)?.id === 'string' ? (c as { id: string }).id : '';
+        });
+        const wanted = [...new Set([...(req.plan.capabilities ?? []), ...resolved])].filter((c) => c && !toolOf.has(c) && !(WIRED_TOOLS as readonly string[]).includes(c));
+        if (!wanted.length) return [];
+        const inv = capabilityInventoryOf(evs, { runId, allowance, secrets });
+        const out: MockToolDeclaration[] = [];
+        for (const id of wanted) {
+          const rec = inv.byId[id];
+          if (rec?.state === 'available' || rec?.state === 'provisioned') continue;
+          const last = lastMissing(evs, id);
+          if (rec?.state !== 'mocked' && last?.resolution !== 'mock') continue;
+          const kind = m.connections[id]?.kind ?? last?.kind ?? rec?.kind ?? 'unknown';
+          const methods = STORE_KINDS.includes(kind) ? STORE_METHODS : MESSAGE_KINDS.includes(kind) ? MESSAGE_METHODS : null;
+          if (!methods) {
+            notes.push(`mock       no generic stand-in for ${id} (kind ${kind}); the step runs without it`);
+            continue;
+          }
+          out.push({ capability: id, kind, tool: id, methods: [...methods], schema: {}, mockId: `mock_${id}`, reason: 'missing, not provisionable within the allowance, mockable: the gap ladder resolved it to a stand-in' });
+        }
+        return out;
+      };
+      const onMocked = async (rid: string, p: CapabilityMockedPayload): Promise<void> => {
+        const goalId = als.getStore()?.trace.goalId;
+        await ledger.append(event('capability.mocked', { id: ctx.ids(), at: ctx.now(), actor: { kind: 'system', id: 'broker' }, runId: rid, trace: goalId ? { goalId } : {}, payload: payloadOf('capability.mocked', p) }));
+      };
+      /**
+       * Before a verify under a contract: a criterion requiring a capability the gap ladder resolved to 'mock'
+       * (mockable, not available or provisioned) that no step's stand-in recorded yet can only be proven against
+       * the code's own fake. It is recorded as mocked now (the goal is then provisional, never achieved) instead
+       * of being refused as missing; a capability resolved to anything else stays missing.
+       */
+      const recordCriterionMocks = async (g: GateContext): Promise<void> => {
+        const ids = [...new Set((g.contract?.criteria ?? []).flatMap((k) => k.requires ?? []))];
+        if (!ids.length) return;
+        const evs = await runEvents();
+        const inv = capabilityInventoryOf(evs, { runId, allowance, secrets });
+        for (const id of ids) {
+          const state = inv.byId[id]?.state;
+          if (state === 'available' || state === 'provisioned' || state === 'mocked') continue;
+          const last = lastMissing(evs, id);
+          if (last?.resolution !== 'mock' || m.connections[id]?.mockable === false) continue;
+          const kind = m.connections[id]?.kind ?? last.kind ?? 'unknown';
+          const p: CapabilityMockedPayload = { capability: id, kind, tool: id, mockId: `mock_${id}`, reason: 'missing and resolved to a stand-in; no step called it, so the criteria requiring it rest on the code\'s own fake' };
+          await ledger.append(event('capability.mocked', { id: ctx.ids(), at: ctx.now(), actor: { kind: 'system', id: 'broker' }, runId, trace: { goalId: g.goal.id }, payload: payloadOf('capability.mocked', p) }));
+        }
+      };
+
       // Lease loss revokes authority in this process: every live sandbox child is disposed (its writes
       // stop), the loop stops on leaseSignal, and the guards below refuse every further tool write and gate.
       const liveRepls = new Set<Repl>();
@@ -581,6 +788,9 @@ export function createWiring(o: WiringOptions = {}): WireFn {
         progressHistory: () => als.getStore()?.history ?? [],
         fingerprintOf: (attempt) => als.getStore()?.fps?.get(attempt) ?? null,
         attempt: () => als.getStore()?.attempt ?? 1,
+        // Under a contract, a worker write to the goal file, to a file a criterion's check runs, or to a script
+        // a criterion runs is refused at the tool call (D8).
+        contract: () => als.getStore()?.contract ?? null,
       });
       try {
         assertMandatory(hooks, m);
@@ -626,13 +836,14 @@ export function createWiring(o: WiringOptions = {}): WireFn {
         };
         return repl;
       };
+      workerTools.unshift(createReadTool(), fencedTool(createEditTool({ ...(o.editToolSeams ?? {}), beforeCommit: mutationCheck(wt) }), wt), createListFilesTool());
       const stepWorker = new StepWorker({
         seats: workerLLMs,
         repl: replFactory,
         // Write-class tools re-prove the lease on the ledger at entry (a copied token is not enough), run with
         // the step's lease-composed WriteGuard (third argument, ctx.fence), and the edit tool re-checks that
         // guard synchronously right before it publishes a write (after every await of the call).
-        tools: [createReadTool(), fencedTool(createEditTool({ ...(o.editToolSeams ?? {}), beforeCommit: mutationCheck(wt) }), wt), createListFilesTool()],
+        tools: workerTools,
         hooks,
         ledger: workerLedger,
         // The worker's runVerify runs repository code in the worktree: it re-proves the lease per run too.
@@ -642,6 +853,10 @@ export function createWiring(o: WiringOptions = {}): WireFn {
         secrets: secretInputs,
         envAllowlist: scrubbedAllowlist(m),
         now: ctx.now,
+        // Stand-ins are admitted against this run's inventory (manifest allowance, secrets) and connections.
+        inventory: async (rid) => capabilityInventoryOf(await runEvents(rid), { runId: rid, allowance, secrets }).records,
+        connections: m.connections,
+        onMocked,
       });
       const brain = await Brain.load(ledger, { runId, budgetTokens: m.memory.contextBudgetTokens, now: ctx.now });
       const leaseAborted = (rid: string, why: string): Outcome => ({ kind: 'aborted', reasons: [{ code: 'cancelled', reason: why, hookId: 'runtime.lease' }], run: { runId: rid, invokeId: 'lease-lost', depth: 0 } });
@@ -658,6 +873,20 @@ export function createWiring(o: WiringOptions = {}): WireFn {
       };
       // The worker port takes the guard as resume's 4th argument (contracts); call it through that signature.
       const resumeStep = stepWorker.resume.bind(stepWorker) as Worker['resume'];
+      /**
+       * The contract of `goalId` in this run, accepted or awaiting sign-off (null = none). A resumed step names no goal: the run's
+       * only goal under a contract is used, and with several none is guessed (the commit gate still refuses a
+       * criterion target the contract protects).
+       */
+      const acceptedContractFor = async (goalId: string | null): Promise<AcceptanceContract | null> => {
+        const evs = await runEvents();
+        const ids = goalId ? [goalId] : [...new Set(evs.filter((e) => e.kind === 'goal.adopted' && e.trace.goalId).map((e) => e.trace.goalId!))];
+        const found = ids.map((g) => {
+          const v = acceptedContractOf(evs, g, { runId });
+          return v.accepted?.contract ?? v.contract ?? null;
+        }).filter((c): c is AcceptanceContract => c !== null);
+        return found.length === 1 ? found[0]! : null;
+      };
       const worker: Worker = {
         run: async (req: WorkerStepRequest, signal?: AbortSignal): Promise<Outcome> => {
           if (wt.lost.aborted) return leaseAborted(req.runId, leaseReason());
@@ -667,23 +896,35 @@ export function createWiring(o: WiringOptions = {}): WireFn {
           const guard: WriteGuard = leaseGuard(wt, req.guard);
           // Brain context (graduated lessons, episodes) joins the loop's inputs; it never replaces them.
           const extra = brain.assembleContext({ query: `${req.goal.statement}\n${req.step.instruction ?? ''}` }).inputs;
-          const inputs = { ...extra, ...(req.inputs ?? {}) };
           const trace: Trace = { goalId: req.goal.id, intentionId: req.intention.id, planId: req.plan.id, stepId: req.step.id };
           const { fps, history } = await attemptFingerprints(ledger, runId, req.intention.id);
           const merged = AbortSignal.any([...(signal ? [signal] : []), guard.signal]);
-          return budgetTerminal(await als.run({ trace, fps, history, attempt: req.intention.attempt }, () => stepGuards.run({ guard }, () => stepWorker.run({ ...req, inputs, guard }, merged))));
+          const evs = await runEvents();
+          const extraMocks = await mockDeclarations(req, evs);
+          const mocks = [...(req.mocks ?? []), ...extraMocks.filter((d) => !(req.mocks ?? []).some((x) => x.capability === d.capability))];
+          const contract = await acceptedContractFor(req.goal.id);
+          // What the step may reach beyond the repository, and what it may import (host data, never the model's).
+          const reg = resourceRegistryOf(evs, { runId, allowance, secrets });
+          const wanted = new Set([...(req.plan.capabilities ?? []), ...(contract?.criteria ?? []).flatMap((k) => k.requires ?? [])]);
+          const access = capabilityAccess({ mocks, resources: usableResources(reg), wanted, tools: toolOf, inventory: capabilityInventoryOf(evs, { runId, allowance, secrets }).records });
+          const host = { runtimeEnvironment: hostBinding('runtime:environment', runtimeEnvironment(facts())), ...(access.length ? { capabilityAccess: hostBinding('runtime:capabilities', access) } : {}) };
+          const inputs = { ...extra, ...host, ...(req.inputs ?? {}) };
+          const served = withStandIns(req, mocks.map((d) => d.tool));
+          return budgetTerminal(await als.run({ trace, fps, history, attempt: req.intention.attempt, contract }, () => stepGuards.run({ guard }, () => stepWorker.run({ ...served, inputs, guard, ...(mocks.length ? { mocks } : {}) }, merged))));
         },
         resume: async (token: string, grant: ApprovalGrant, signal?: AbortSignal, given?: WriteGuard): Promise<Outcome> => {
           if (wt.lost.aborted) return leaseAborted(runId, leaseReason());
           const guard: WriteGuard = leaseGuard(wt, given);
           const merged = AbortSignal.any([...(signal ? [signal] : []), guard.signal]);
-          return budgetTerminal(await als.run({ trace: {} }, () => stepGuards.run({ guard }, () => resumeStep(token, grant, merged, guard))));
+          const contract = await acceptedContractFor(null);
+          return budgetTerminal(await als.run({ trace: {}, contract }, () => stepGuards.run({ guard }, () => resumeStep(token, grant, merged, guard))));
         },
       };
 
       // 6. gates (the reviewer seat is metered: reserve before, settle after every call)
       const reviewerMeter = new SeatMeter({ ledger, runId, seat: 'reviewer', reservation: o.seatReservation ?? SEAT_RESERVATION, signal: runSignal, onExhausted });
       let gates: Gates;
+      let prOptions: ConstructorParameters<typeof PrGate>[0] | null = null;
       try {
         const gateOptions = {
           manifest: m,
@@ -711,6 +952,7 @@ export function createWiring(o: WiringOptions = {}): WireFn {
           ...(o.commitTestHooks ? { commitTestHooks: o.commitTestHooks } : {}),
         };
         gates = createGates(gateOptions as Parameters<typeof createGates>[0]);
+        prOptions = { ledger, manifest: m, worktree: wt.path, sessionId: ctx.sessionId, redactor, now: ctx.now, ids: ctx.ids, runsDir: gateOptions.runsDir, ...(o.gh !== undefined ? { gh: o.gh } : {}), ghEnv: gateOptions.ghEnv, costLine: gateOptions.costLine };
       } catch (e) {
         throw new WiringError(`review seat: ${(e as Error).message}`, 8);
       }
@@ -721,7 +963,7 @@ export function createWiring(o: WiringOptions = {}): WireFn {
       const workerSeats = m.seats.workers.map((w) => ({ id: w.id, provider: w.provider, model: w.model, costPerMTok: priceFor(w.model).inputPerM }));
       let bridge: MeteredPlanner | null = null;
       const innerPlanner: Planner = scripts?.plan
-        ? new ScriptedPlanner([scripts.plan])
+        ? new ScriptedRunPlanner(scripts.plan, { ...(scripts.contracts ? { contracts: scripts.contracts } : {}), connections: m.connections })
         : new LLMPlanner({
             // every planner call is cancelled by the loop meter's signal (deadline, loop stop) and the run's
             llm: cancellableLLM(plannerLLM, runSignal, () => bridge?.meterSignal()),
@@ -730,6 +972,15 @@ export function createWiring(o: WiringOptions = {}): WireFn {
             toolCatalog: WIRED_TOOLS,
             redactor,
             seats: workerSeats,
+            // read-only: a drafted criterion may only run a file the leased worktree already holds, and only
+            // import a package its package.json lists
+            repoFiles: repoFileView(wt.path),
+            repoFacts: facts,
+            onDraftRejected: async (r) => {
+              const key = `criteria.rejected:${runId}:${randomUUID().slice(0, 8)}`;
+              await ledger.evidence({ key, kind: 'criteria.rejected', runId, body: { goalId: r.goalId, attempt: r.attempt, issues: r.issues, contract: r.contract } });
+              await ledger.append(event('evidence.appended', { id: ctx.ids(), at: ctx.now(), actor: { kind: 'system', id: 'planner' }, runId, trace: { goalId: r.goalId }, payload: { kind: 'criteria.rejected', evidenceKey: key, rejected: true, attempt: r.attempt, issues: r.issues } }));
+            },
             lessons: (goal) => brain.recall({ query: goal.statement, tiers: ['semantic'], k: 8 }).map((r) => ({ src: `lesson:${r.entry.id}`, text: r.entry.content })),
             onUsage: async (u) => {
               if (!bridge) throw new LedgerError('planner usage reported before accounting was wired', 'budget');
@@ -744,7 +995,17 @@ export function createWiring(o: WiringOptions = {}): WireFn {
       const planner: Planner = bridge;
 
       // 8. validator, 9. route costs and frontier (metered on the run's pools; exhaustion propagates)
-      const validator: PlanValidator = createPlanValidator({ permissions: ctx.permissions, toolCatalog: WIRED_TOOLS, workerSeats: m.seats.workers.map((w) => w.id), redactor });
+      // Under a contract the capabilities its criteria require may be tools too (a provisioned resource or a
+      // stand-in, served by the broker under the capability's name); the broker still refuses one it cannot serve.
+      const validatorFor = (catalog: readonly string[]): PlanValidator => createPlanValidator({ permissions: ctx.permissions, toolCatalog: catalog, workerSeats: m.seats.workers.map((w) => w.id), redactor });
+      const baseValidator = validatorFor(WIRED_TOOLS);
+      const validator: PlanValidator = {
+        validatePlan: (plan, man, goal, pctx) => {
+          if (!pctx) return baseValidator.validatePlan(plan, man, goal);
+          const caps = [...new Set((pctx.contract?.criteria ?? []).flatMap((k) => k.requires ?? []))];
+          return (caps.length ? validatorFor([...WIRED_TOOLS, ...caps]) : baseValidator).validatePlan(plan, man, goal, pctx);
+        },
+      };
       const seats: SeatCost[] = workerSeats.map((w) => ({ seatId: w.id, costPerMTok: w.costPerMTok }));
       const frontierMeter = new SeatMeter({ ledger, runId, seat: 'frontier', reservation: o.seatReservation ?? SEAT_RESERVATION, signal: runSignal, onExhausted });
       const frontier = new ModelFrontier({ llm: frontierLLM, model: m.seats.planner.model, redactor, meter: frontierMeter, signal: runSignal });
@@ -755,9 +1016,10 @@ export function createWiring(o: WiringOptions = {}): WireFn {
       const isolationDegraded = m.sandbox.isolation === 'node' || verifyDegraded !== null;
       if (isolationDegraded) notes.push('isolation  node: the worker child has no OS isolation beyond what the host provides (recorded as isolation.degraded); writes to the work branch proceed fenced, the PR gate is the approval point');
 
-      // The commit branch is `<branchPrefix><goal name>` (dx.md: tecera/fix-failing-test). The commit gate
-      // derives it from GateContext.goal.id, which in the loop is the goal *id* (`g_<name>`); the gate gets
-      // the goal's name instead. Nothing else in the commit decision depends on the id's prefix.
+      // The commit branch is `<branchPrefix><goal name>` (dx.md: tecera/fix-failing-test). The gates derive it
+      // from GateContext.goal.id, which is also the id they look the goal up by on the ledger (verify.passed,
+      // the accepted contract, resources), so the goal id IS the name (goals.ts). A run adopted before that
+      // (`g_<name>` on the ledger) still commits to the named branch.
       const goalName = ctx.goal.id;
       const forCommit = (g: GateContext): GateContext => (g.goal.id === ctx.goal.goalId ? { ...g, goal: { ...g.goal, id: goalName } } : g);
       const gateTrace = (g: GateContext): Trace => ({ goalId: g.goal.id, intentionId: g.intention.id, planId: g.plan.id, stepId: g.step.id });
@@ -774,10 +1036,29 @@ export function createWiring(o: WiringOptions = {}): WireFn {
         const c = leasedGateContext(g, wt);
         return { ok: true, ctx: { ...c, signal: AbortSignal.any([c.signal ?? wt.lost, runCtl.signal]) } };
       };
+      /** The pending git-remote resource of `goalId` to push to, unless the worktree already has a remote of its name. */
+      const provisionedRemote = async (goalId: string): Promise<{ name: string; locator: string; resourceId: string } | { refuse: string } | null> => {
+        const reg = resourceRegistryOf(await runEvents(), { runId, goalId, allowance, secrets });
+        let place: { root: string; repoRoot: string } | null = null;
+        try {
+          place = { root: resourcesRoot(ctx.env), repoRoot: ctx.root };
+        } catch {
+          place = null;
+        }
+        const r = place ? pushableRemote(reg, place) : null;
+        // A pending git remote that is not in Tecera's own space (the repository, elsewhere on the host) is
+        // refused, never silently skipped: the delivery stops and says which resource.
+        const stray = pushableRemote(reg);
+        if (!r && stray) return { refuse: `gate.pr: the provisioned remote ${stray.id} does not lie under the resources root outside the repository; nothing is pushed to it` };
+        if (!r) return null;
+        const existing = (await hostGit(wt.path, ['config', '--get', `remote.${r.capability}.url`]).catch(() => '')).trim();
+        return existing ? null : { name: r.capability, locator: r.locator, resourceId: r.id };
+      };
       const gatePorts: GateRunner = {
         verify: async (g) => {
           const l = await leased(g);
           if (!l.ok) return { exitCode: 9, evidenceKey: '', terminal: true, reason: l.reason };
+          await recordCriterionMocks(l.ctx);
           return gates.verify(l.ctx);
         },
         review: async (g) => {
@@ -804,7 +1085,22 @@ export function createWiring(o: WiringOptions = {}): WireFn {
           // build without one cannot deliver: a human must (terminal, never a silent success).
           const prGate = (gates as Partial<Pick<GateRunner, 'pr'>>).pr;
           if (typeof prGate !== 'function') return { exitCode: 9, sha, evidenceKey: '', terminal: true, reason: 'gate.pr: the installed @tecera/gates has no PR gate; deliver the work branch by hand', failure: 'human' };
-          return prGate.call(gates, forCommit(l.ctx));
+          // D12: a git remote Tecera provisioned for this goal (pending, inside the allowance) receives the push
+          // when the repository has no remote of the capability's name; it is added for this delivery only.
+          const remote = await provisionedRemote(g.goal.id);
+          if (!remote) return prGate.call(gates, forCommit(l.ctx));
+          if ('refuse' in remote) return { exitCode: 9, sha, evidenceKey: '', terminal: true, reason: remote.refuse, failure: 'human' };
+          try {
+            await hostGit(wt.path, ['remote', 'add', remote.name, remote.locator]);
+          } catch (e) {
+            return { exitCode: 9, sha, evidenceKey: '', terminal: true, reason: `gate.pr: the provisioned remote ${remote.resourceId} could not be added (${(e as Error).message})`, failure: 'human' };
+          }
+          try {
+            const gate = remote.name === 'origin' || !prOptions ? null : new PrGate({ ...prOptions, remote: remote.name });
+            return gate ? await gate.pr(forCommit(l.ctx)) : await prGate.call(gates, forCommit(l.ctx));
+          } finally {
+            await hostGit(wt.path, ['remote', 'remove', remote.name]).catch(() => undefined);
+          }
         },
         reconcile: async (g): Promise<GateReconcileOutcome> => {
           const l = await leased(g);
@@ -843,10 +1139,27 @@ export function createWiring(o: WiringOptions = {}): WireFn {
           }
         },
         costUnrecorded: () => unrecorded,
+        probe,
+        ...(provisioner ? { provisioner } : {}),
+        secrets,
+        sweep: async (): Promise<string[]> => {
+          if (!local) return [];
+          const out: string[] = [];
+          const res = await releaseExpired({ ledger, provisioner: local, actor: { kind: 'system', id: 'expiry' }, ids: () => ctx.ids(), now: ctx.now, allowance, secrets });
+          for (const r of res.released) out.push(`resource   ${r.resourceId} expired and was released (teardown exit 0)`);
+          for (const r of res.failed) out.push(`resource   ${r.resourceId} expired but ${r.unrecorded ? `its release could not be recorded (${r.unrecorded})` : `its teardown exited ${r.teardownExit}${r.reason ? ` (${r.reason})` : ''}`}; it stays a pending debt`);
+          for (const r of res.orphans) out.push(`resource   ${r.resourceId} (never recorded) expired: teardown exit ${r.teardownExit}`);
+          return out;
+        },
         worktreeCheckpoint: async (): Promise<string> => {
           const l = wt.heldReason();
           if (l) throw new Error(`no checkpoint without the lease: ${l}`);
           return wt.checkpoint(runCtl.signal);
+        },
+        worktreeChanges: async (a: { from: string; to: string }): Promise<WorktreeChange[]> => {
+          const l = wt.heldReason();
+          if (l) throw new Error(`no change summary without the lease: ${l}`);
+          return diffTrees(wt.path, a.from, a.to, runCtl.signal);
         },
         restoreWorktree: async (checkpointId: string, signal?: AbortSignal): Promise<string> => {
           await wt.assertHeld();

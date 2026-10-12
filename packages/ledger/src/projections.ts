@@ -1,4 +1,22 @@
-import type { AchievementGoal, Belief, BeliefProjection, Intention, Json, Ledger, TeceraEvent } from '@tecera/contracts';
+import {
+  acceptedContractOf,
+  capabilityInventoryOf,
+  resourceRegistryOf,
+  type AcceptanceOptions,
+  type AcceptanceView,
+  type AchievementGoal,
+  type Belief,
+  type BeliefProjection,
+  type CapabilityInventory,
+  type EventKind,
+  type InventoryOptions,
+  type Intention,
+  type Json,
+  type Ledger,
+  type ProvisioningAllowance,
+  type ResourceRegistry,
+  type TeceraEvent,
+} from '@tecera/contracts';
 
 /**
  * Projections fold the event log into current state. They are rebuilt from the log on demand and can
@@ -88,6 +106,31 @@ export async function projectBoard(ledger: Ledger, runId?: string): Promise<Boar
   const b = new BoardProjection();
   for await (const e of ledger.events(runId ? { runId } : {})) b.apply(e);
   return b;
+}
+
+const ACCEPTANCE_KINDS: EventKind[] = ['goal.adopted', 'criteria.drafted', 'criteria.accepted', 'criteria.amended', 'approval.requested', 'approval.granted', 'approval.consumed'];
+const INVENTORY_KINDS: EventKind[] = ['capability.probed', 'capability.missing', 'capability.mocked', 'resource.provisioned', 'resource.released'];
+const RESOURCE_KINDS: EventKind[] = ['resource.provisioned', 'resource.released', 'resource.transferred'];
+
+async function collect(ledger: Ledger, filter: { runId?: string; kinds: EventKind[] }): Promise<TeceraEvent[]> {
+  const out: TeceraEvent[] = [];
+  for await (const e of ledger.events(filter)) out.push(e);
+  return out;
+}
+
+/** The goal's contract and whether it is accepted (contracts acceptedContractOf over the ledger's events). */
+export async function projectAcceptance(ledger: Ledger, goalId: string, opts: AcceptanceOptions = {}): Promise<AcceptanceView> {
+  return acceptedContractOf(await collect(ledger, { kinds: ACCEPTANCE_KINDS, ...(opts.runId ? { runId: opts.runId } : {}) }), goalId, opts);
+}
+
+/** The run's capability inventory (contracts capabilityInventoryOf; pass the manifest allowance when there is one). */
+export async function projectInventory(ledger: Ledger, runId: string, opts: Omit<InventoryOptions, 'runId'> = {}): Promise<CapabilityInventory> {
+  return capabilityInventoryOf(await collect(ledger, { runId, kinds: INVENTORY_KINDS }), { ...opts, runId });
+}
+
+/** The provisioned-resource registry across runs, or of one run / goal (contracts resourceRegistryOf). */
+export async function projectResources(ledger: Ledger, opts: { runId?: string; goalId?: string; allowance?: ProvisioningAllowance; secrets?: (value: string) => boolean } = {}): Promise<ResourceRegistry> {
+  return resourceRegistryOf(await collect(ledger, { kinds: RESOURCE_KINDS, ...(opts.runId ? { runId: opts.runId } : {}) }), opts);
 }
 
 /** Walk the why-chain for an event: the events that share its step, then intention, then goal, oldest first. */

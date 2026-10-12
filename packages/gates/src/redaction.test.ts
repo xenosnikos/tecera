@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeRedactor, type Json, type Ledger } from '@tecera/contracts';
 import { claim, ignoredBaseline, ignoredBaselineKey } from './evidence.js';
 import { GateMemo } from './evidence.js';
 import { createGates } from './index.js';
-import { ctx, FakeReviewer, FakeRunner, LEDGERS, prGrant, makeRepo, manifest, NOW, WRITERS } from './testkit/fixtures.js';
+import { ctx, FakeReviewer, FakeRunner, LEDGERS, prGrant, makeRepo, manifest, NOW, recordVerify, WRITERS } from './testkit/fixtures.js';
 
 /**
  * Canary scans across EVERY evidence record the gates write (verify, verify start, baseline, ignored
@@ -92,7 +92,7 @@ describe.each(LEDGERS)('every gate evidence record is free of secrets and canari
     expect(Object.values(base.names).filter((n) => n.includes('[REDACTED:'))).toHaveLength(4);
   });
 
-  it('refusal evidence (PR approval refused) and an ignored commit approval are scanned too; the PR bundle is redacted', async () => {
+  it('refusal evidence (PR approval refused) and an ignored commit approval are scanned too; a secret-bearing patch is never delivered', async () => {
     const repo = makeRepo();
     const spy = new SpyLedger(mk());
     const runsDir = mkdtempSync(join(tmpdir(), 'tecera-gates-runs-'));
@@ -100,19 +100,52 @@ describe.each(LEDGERS)('every gate evidence record is free of secrets and canari
     repo.write(`src/${CANARY}.ts`, `export const k = '${KNOWN}';\n`);
     const withGoal = <T extends ReturnType<typeof ctx>>(c: T): T => ({ ...c, goal: { ...c.goal, statement: `ship ${KNOWN} ${CANARY}` } });
     const v = await g.verify(withGoal(ctx('v', { worktree: repo.dir })));
+    await recordVerify(spy.inner, v);
     const r = await g.review(withGoal(ctx('r', { worktree: repo.dir, candidate: { d1: v.fingerprint } })));
     // D6: a grant handed to gate.commit is ignored (its id is recorded redacted), the commit proceeds.
     const c = await g.commit(withGoal(ctx('c', { worktree: repo.dir, candidate: { d1: v.fingerprint, d2: r.fingerprint }, approval: { requestId: `ap-${CANARY}`, sessionId: 's1', actionHash: 'f'.repeat(64) } })));
     expect(c.exitCode).toBe(0);
     const bogus = await g.pr(withGoal(ctx('pr', { worktree: repo.dir, commit: { sha: c.sha!, evidenceKey: c.evidenceKey }, approval: { requestId: `ap-${CANARY}`, sessionId: 's1', actionHash: 'f'.repeat(64) } })));
     expect(bogus).toMatchObject({ exitCode: 8, reason: 'approval' });
-    const ok = await g.pr(withGoal(ctx('pr', { worktree: repo.dir, commit: { sha: c.sha!, evidenceKey: c.evidenceKey }, approval: await prGrant(spy.inner, { sha: c.sha! }) })));
-    expect(ok.exitCode).toBe(0);
+    // The committed change itself carries the secret and the canary: no redaction can leave a valid patch, so
+    // the delivery is refused whole (pr.failed), the grant is not spent and nothing is bundled.
+    const ap = await prGrant(spy.inner, { sha: c.sha! });
+    const refused = await g.pr(withGoal(ctx('pr', { worktree: repo.dir, commit: { sha: c.sha!, evidenceKey: c.evidenceKey }, approval: ap })));
+    expect(refused).toMatchObject({ exitCode: 8, reason: 'secret-in-delivery', terminal: true });
+    expect((await spy.inner.getApproval(ap.requestId))!.state).toBe('granted');
+    expect(existsSync(join(runsDir, 'run1', 'pr'))).toBe(false);
     expect(await spy.scan()).toEqual([]);
-    for (const f of ['body.md', 'request.json']) {
-      const text = readFileSync(join(ok.bundle!, f), 'utf8');
-      for (const n of NEEDLES) expect(text, f).not.toContain(n);
-    }
+  });
+});
+
+describe.each(LEDGERS)('a registered secret inside a run or intention id never reaches an evidence key or a returned result (%s)', (_n, mk) => {
+  it('keys carry a digest of the identifier; the gates still find their own records (commit → PR)', async () => {
+    const repo = makeRepo();
+    const spy = new SpyLedger(mk());
+    const runsDir = mkdtempSync(join(tmpdir(), 'tecera-gates-runs-'));
+    const g = createGates({ manifest: manifest(), ledger: spy.inner, verifyRunner: new FakeRunner(), reviewer: new FakeReviewer('openai'), writers: WRITERS, worktree: repo.dir, now: () => NOW, sessionId: 's1', secrets: [KNOWN], runsDir, gh: null });
+    repo.write('src/a.ts', 'export const a = 2;\n');
+    const intentionId = `i-${KNOWN}`;
+    const v = await g.verify(ctx('v', { worktree: repo.dir, intentionId }));
+    expect(v.exitCode).toBe(0);
+    await recordVerify(spy.inner, v, { intentionId });
+    const r = await g.review(ctx('r', { worktree: repo.dir, intentionId, candidate: { d1: v.fingerprint } }));
+    expect(r.verdict).toBe('approve');
+    const c = await g.commit(ctx('c', { worktree: repo.dir, intentionId, candidate: { d1: v.fingerprint, d2: r.fingerprint } }));
+    expect(c.exitCode).toBe(0);
+    // the PR gate finds the commit record under the same digest key (its body names the id only redacted, so
+    // delivery for such an id is refused, fail closed), and its refusal carries no secret either
+    expect(c.evidenceKey).toMatch(/^commit:h_[0-9a-f]{24}$/);
+    const ap = await prGrant(spy.inner, { sha: c.sha!, intentionId });
+    const pr = await g.pr(ctx('pr', { worktree: repo.dir, intentionId, commit: { sha: c.sha!, evidenceKey: c.evidenceKey }, approval: ap }));
+    expect(pr.reason).not.toBe('commit-evidence-key-mismatch');
+    for (const res of [v, r, c, pr]) expect(JSON.stringify(res)).not.toContain(KNOWN);
+    expect(spy.written.length).toBeGreaterThan(0);
+    for (const w of spy.written) expect(w.key, w.key).not.toContain(KNOWN);
+    expect(await spy.scan()).toEqual([]);
+    // an identifier without a secret keeps its readable key
+    const plain = await g.verify(ctx('v', { worktree: repo.dir, intentionId: 'i9' }));
+    expect(plain.evidenceKey).toMatch(/^verify:run1:i9:v:0:\d+$/);
   });
 });
 

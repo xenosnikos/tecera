@@ -1,0 +1,14 @@
+[
+  {
+    "when": "failing test",
+    "criteria": [
+      {
+        "id": "tests-pass",
+        "statement": "The repository's whole test suite passes, the failing test included.",
+        "check": { "kind": "command", "command": "node --test", "timeoutSec": 300 }
+      }
+    ],
+    "outOfScope": ["changes to tests, configs or lockfiles"],
+    "assumptions": ["the failing test states the intended behaviour"]
+  }
+]

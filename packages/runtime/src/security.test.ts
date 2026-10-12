@@ -148,6 +148,15 @@ function hookCtx(root: string, gitHazards: readonly string[] = []): HookContext 
 }
 
 describe('host hook: links, protected aliases and mediated Bash', () => {
+  it('acceptance and resources are human decisions: agents cannot accept or amend criteria, nor release or transfer a resource, from a mediated shell', () => {
+    const ctx = hookCtx(tmp());
+    for (const cmd of ['tecera criteria accept r_1', 'tecera criteria amend r_1 --file c.json --reason x', 'tecera resources release res_1', 'tecera resources transfer res_1 --to me', 'tecera criteria show r_1']) {
+      const d = decideBash(cmd, ctx);
+      expect(d.allow, cmd).toBe(false);
+      expect((d as { reason: string }).reason).toMatch(/not available to agents/);
+    }
+    expect(decideBash('tecera status', ctx).allow).toBe(true);
+  });
   it('tamper.symlink_hardlink: a permitted src/ path that is a link (live or dangling) or a hard link is blocked', () => {
     const root = tmp();
     mkdirSync(join(root, 'src'));
@@ -190,6 +199,10 @@ describe('host hook: links, protected aliases and mediated Bash', () => {
       'sed -i s/a/b/ tecera.json',
       'echo {} > .claude/settings.json',
       'tecera approve ap_1 --as bob',
+      // provisioned resources are human debts: an agent shell never releases or transfers one, nor signs off a contract
+      'tecera resources release res_1 --as bob',
+      'tecera resources transfer res_1 --to bob --as bob',
+      'tecera criteria accept run_1 --as bob',
       'tecera plans graduate p_1 --rationale x',
       'tecera doctor --fix',
       'TECERA_ALLOW_LOCAL_APPROVER=1 tecera approve ap_1',

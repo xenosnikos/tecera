@@ -42,7 +42,7 @@ describe('installed planner package (fresh build)', () => {
       `import { readFileSync } from 'node:fs';
 import { parseManifest } from '@tecera/contracts';
 import { parsePermissions } from '@tecera/policy';
-import { LLMPlanner, PLAN_WIRE_JSON_SCHEMA, parsePlanOutput } from '@tecera/planner';
+import { LLMPlanner, PLAN_WIRE_JSON_SCHEMA, CONTRACT_WIRE_JSON_SCHEMA, parsePlanOutput } from '@tecera/planner';
 import { OpenAILLM, OpenRouterLLM, SecretHandle, FixtureFetch, openAIStrictSchemaProblems, anthropicSchemaProblems } from '@tecera/providers';
 const sample = (rel) => JSON.parse(readFileSync(${JSON.stringify(join(repoRoot, 'samples', 'fix-failing-test'))} + '/' + rel, 'utf8'));
 const manifest = parseManifest(sample('tecera.json'));
@@ -58,7 +58,7 @@ const wire = {
     { id: 'pr', kind: 'gate.pr', dependsOn: ['commit'], instruction: null, inputsJson: null, outputJson: null, tools: null },
   ],
   allowedModels: [{ step: 'analyze', seats: ['worker'] }, { step: 'edit', seats: ['worker'] }],
-  permissions: { tools: ['read', 'listFiles', 'edit', 'runVerify'], write: ['src/**'], approvals: ['open_pr'] },
+  permissions: { tools: ['read', 'listFiles', 'edit', 'runVerify'], write: ['src/**'], approvals: ['open_pr', 'git_push'] },
   budget: { usd: 1, tokens: 100000, wallClockSec: 900, maxDepth: null, maxIterations: null, maxAttempts: null, maxChangedFiles: null },
   goalKinds: ['fix-failing-test'],
   rationale: 'read, edit, gates',
@@ -76,6 +76,7 @@ const orPlan = await new LLMPlanner({ llm: orLlm, manifest, permissions, model: 
 const rf = fr.calls[0].body.response_format;
 console.log(JSON.stringify({
   openai: openAIStrictSchemaProblems(PLAN_WIRE_JSON_SCHEMA), anthropic: anthropicSchemaProblems(PLAN_WIRE_JSON_SCHEMA),
+  contractOpenai: openAIStrictSchemaProblems(CONTRACT_WIRE_JSON_SCHEMA), contractAnthropic: anthropicSchemaProblems(CONTRACT_WIRE_JSON_SCHEMA),
   planId: plan.id, editInputs: plan.steps[1].inputs, sentStrict: ff.calls[0].body.text.format.strict,
   sentSchemaIsWire: JSON.stringify(ff.calls[0].body.text.format.schema) === JSON.stringify(PLAN_WIRE_JSON_SCHEMA),
   docParses: parsePlanOutput(JSON.stringify(wire)).ok,
@@ -89,6 +90,8 @@ console.log(JSON.stringify({
     const r = JSON.parse(out.trim()) as {
       openai: string[];
       anthropic: string[];
+      contractOpenai: string[];
+      contractAnthropic: string[];
       planId: string;
       editInputs: unknown;
       sentStrict: boolean;
@@ -103,6 +106,9 @@ console.log(JSON.stringify({
     };
     expect(r.openai).toEqual([]);
     expect(r.anthropic).toEqual([]);
+    // The contract-drafting wire schema is inside both vendors' structured-output subset too.
+    expect(r.contractOpenai).toEqual([]);
+    expect(r.contractAnthropic).toEqual([]);
     expect(r.planId).toMatch(/^p_[0-9a-f]{8}$/);
     expect(r.editInputs).toEqual({ hint: 'src' });
     expect(r.sentStrict).toBe(true);

@@ -233,7 +233,7 @@ describe('tecera run end to end (scripted models, real sandbox, real gates)', ()
     // D4: the assistant may not stop while the run is held without a proof
     const blocked = await stopHook(dir);
     expect(blocked.code).toBe(2);
-    expect(blocked.err).toMatch(new RegExp(`goal not achieved: run ${runId} \\(goal g_fix-failing-test\\) is held for a human decision and has no goal.achieved proof`));
+    expect(blocked.err).toMatch(new RegExp(`goal not achieved: run ${runId} \\(goal fix-failing-test\\) is held for a human decision and has no goal.achieved proof`));
 
     // segment 2: a local human approves the PR (D1: $USER); the resume delivers it — no remote: pr.requested
     const s2 = await approveAndResume(dir, env, {}, {}, 'reviewer-human');
@@ -327,7 +327,7 @@ describe('tecera run end to end (scripted models, real sandbox, real gates)', ()
     const replay = await replayRun(l2, runId);
     l2.close();
     expect(replay.chainValid).toBe(true);
-    expect(replay.goals['g_fix-failing-test'], JSON.stringify(replay)).toMatchObject({ derived: 'achieved', recorded: 'achieved', agrees: true });
+    expect(replay.goals['fix-failing-test'], JSON.stringify(replay)).toMatchObject({ derived: 'achieved', recorded: 'achieved', agrees: true });
     expect(replay.problems).toEqual([]);
 
     const st = await cli(dir, ['status', '--run', runId]);
@@ -409,20 +409,28 @@ describe('tecera run end to end (scripted models, real sandbox, real gates)', ()
     const runId = evs.find((e) => e.kind === 'run.started')!.runId!;
     const replay = await replayRun(verifyRec, runId);
     verifyRec.close();
-    expect(replay.goals['g_fix-failing-test']).toMatchObject({ derived: 'achieved', agrees: true });
+    expect(replay.goals['fix-failing-test']).toMatchObject({ derived: 'achieved', agrees: true });
   }, 600_000);
 
-  it('a scripted reviewer reject → exit 6: no PR approval requested, no commit, no branch', async () => {
+  it('a scripted reviewer reject → the edit step is reworked with the findings, re-verified and re-reviewed; a second reject → exit 6: no PR approval requested, no commit, no branch', async () => {
     const { dir, wt } = await sampleRepo();
     const env = { ...KEYS, TECERA_WORKTREES: wt };
     const r = fixtureReplies();
-    const reject = [{ text: JSON.stringify({ verdict: 'reject', findings: [{ title: 'off-by-one in the separator class', path: 'src/slugify.js' }] }) }];
-    const res = await cli(dir, ['run', 'fix-failing-test', '--scripted', scripts({ worker: r.worker, reviewer: reject })], { env });
+    const reject = { text: JSON.stringify({ verdict: 'reject', findings: [{ title: 'off-by-one in the separator class', path: 'src/slugify.js' }] }) };
+    // the rework of the edit step (attempt 2) changes the candidate, so the second review sees a new tree
+    const rework = {
+      expect: 'off-by-one in the separator class',
+      text: js(`await writeFile('src/rework.js', 'export const reworked = 1;\\n');
+return { facts: [{ key: 'changedFiles', value: ['src/rework.js'] }] };`),
+    };
+    const res = await cli(dir, ['run', 'fix-failing-test', '--scripted', scripts({ worker: [...r.worker, rework], reviewer: [reject, reject] })], { env });
     if (res.code !== 6) console.log(await dump(dir));
     expect(res.code, res.err + res.out).toBe(6);
     const evs = await events(dir);
     const kinds = evs.map((e) => e.kind);
-    expect(kinds).toContain('review.rejected');
+    expect(evs.filter((e) => e.kind === 'review.rejected')).toHaveLength(2);
+    expect(evs.filter((e) => e.kind === 'step.completed' && e.trace.stepId === 'edit')).toHaveLength(2);
+    expect(evs.filter((e) => e.kind === 'verify.passed' && e.trace.stepId === 'verify')).toHaveLength(2);
     expect(kinds).toContain('goal.dropped');
     expect(kinds).not.toContain('approval.requested');
     for (const k of ['commit.recorded', 'pr.requested', 'goal.achieved', 'plan.staged']) expect(kinds).not.toContain(k);
@@ -430,7 +438,7 @@ describe('tecera run end to end (scripted models, real sandbox, real gates)', ()
     expect((await stopHook(dir)).code, 'a failed run is not active').toBe(0);
   }, 600_000);
 
-  it('a scripted worker that only edits the test file → the edit is denied and recorded, verify fails twice on the SAME candidate → no progress stops for a human (exit 9), never a commit', async () => {
+  it('a scripted worker that only edits the test file → the edit is denied and recorded; closeOut refuses each return that left the worktree unchanged (L5-F2), so no verify, review or commit ever runs', async () => {
     const { dir, wt } = await sampleRepo();
     const env = { ...KEYS, TECERA_WORKTREES: wt };
     const r = fixtureReplies();
@@ -440,23 +448,53 @@ describe('tecera run end to end (scripted models, real sandbox, real gates)', ()
 try { await writeFile({ path: 'test/slugify.test.js', oldText: "'a-b-c'", newText: "'a--b-c'" }); } catch (e) { denied = String(e.message); }
 return { facts: [{ key: 'testEditDenied', value: denied !== null }] };`),
     };
-    // attempt 1: the test edit is denied, nothing is written; verify fails. The retry re-runs the edit worker
-    // (a new execution): the same denied edit → the identical candidate → no progress
-    const res = await cli(dir, ['run', 'fix-failing-test', '--scripted', scripts({ worker: [r.worker[0], testOnly, testOnly] })], { env });
+    // attempt 1: the denied edit changes nothing and is refused; it re-runs once in the same attempt (refused
+    // again), then attempt 2 does the same: four refusals.
+    const res = await cli(dir, ['run', 'fix-failing-test', '--scripted', scripts({ worker: [r.worker[0], testOnly, testOnly, testOnly, testOnly] })], { env });
     const evs = await events(dir);
-    if (res.code !== 9) console.log(await dump(dir));
-    expect(res.code, res.err + res.out).toBe(9);
-    const failedVerifies = evs.filter((e) => e.kind === 'verify.failed');
-    expect(failedVerifies.some((e) => (e.payload as { noProgress?: boolean }).noProgress === true)).toBe(true);
-    const lastFail = [...evs].reverse().find((e) => e.kind === 'step.failed')!;
-    expect(lastFail.payload).toMatchObject({ terminal: true, failure: 'human' });
+    if (res.code === 0 || res.code === 4) console.log(await dump(dir));
+    expect(res.code, res.err + res.out).not.toBe(0);
+    expect(res.code).not.toBe(4);
+    const refused = evs.filter((e) => e.kind === 'step.failed' && e.trace.stepId === 'edit');
+    expect(refused.length).toBe(4);
+    for (const f of refused) expect((f.payload as { reason?: string }).reason).toMatch(/without changing the worktree/);
+    expect(evs.map((e) => e.kind)).not.toContain('verify.started');
     expect(evs.map((e) => e.kind)).not.toContain('approval.requested');
+    expect(evs.map((e) => e.kind)).not.toContain('commit.recorded');
     const denied = evs.filter((e) => e.kind === 'evidence.appended' && (e.payload as { kind?: string }).kind === 'tool.denied');
     expect(denied.length).toBeGreaterThanOrEqual(1);
     expect(denied[0]!.payload).toMatchObject({ tool: 'edit', path: 'test/slugify.test.js' });
     expect(evs.map((e) => e.kind)).not.toContain('review.started');
     const runId = evs.find((e) => e.kind === 'run.started')!.runId!;
     expect(readFileSync(join(wt, runId, 'test/slugify.test.js'), 'utf8')).toBe(readFileSync(join(dir, 'test/slugify.test.js'), 'utf8'));
+  }, 600_000);
+
+  it('closeOut set to frontier: the frontier question for the first writing step carries a boolean `changed` and the change summary the runtime computes (paths and line counts, no file contents)', async () => {
+    const { dir, wt } = await sampleRepo((d) => {
+      const p = join(d, 'tecera.json');
+      const m = JSON.parse(readFileSync(p, 'utf8'));
+      m.reflexes.closeOut = 'frontier';
+      writeFileSync(p, `${JSON.stringify(m, null, 2)}\n`);
+    });
+    const env = { ...KEYS, TECERA_WORKTREES: wt };
+    const fx = fixtureReplies();
+    const asked: Array<{ seat: string; body: string }> = [];
+    const wire = createWiring({ tap: (seat, _url, body) => void asked.push({ seat, body }) });
+    // one fenced answer followed by prose, per closeOut the frontier is asked
+    const yes = { text: '```json\n{"answer":{"achieved":true}}\n```\nThe change is in place.' };
+    const res = await cli(dir, ['run', 'fix-failing-test', '--scripted', scripts({ worker: fx.worker, reviewer: fx.reviewer, planner: Array.from({ length: 12 }, () => yes) })], { env, wire });
+    if (res.code !== 4) console.log(await dump(dir));
+    expect(res.code, res.err + res.out).toBe(4);
+    const closeOuts = asked.filter((a) => a.body.includes('closeOut') && a.body.includes('expectsChange'));
+    const edit = closeOuts.find((a) => a.body.includes('src/slugify.js'));
+    expect(edit, closeOuts.map((a) => a.body.slice(0, 400)).join('\n')).toBeTruthy();
+    const body = edit!.body.replace(/\\"/g, '"');
+    expect(body).toMatch(/"changed":\s*true/);
+    expect(body).toMatch(/"files":\s*1/);
+    expect(body).toMatch(/"path":\s*"src\/slugify\.js"/);
+    expect(body).not.toMatch(/"files":\s*null/);
+    const evs = await events(dir);
+    expect(evs.some((e) => e.kind === 'step.completed' && e.trace.stepId === 'edit')).toBe(true);
   }, 600_000);
 
   it('D3 budgets off (the default): a worker turn and a review over the token cap are recorded (budget.exhausted, once per pool) and reported, and the run still reaches the PR hold (exit 4)', async () => {
@@ -481,7 +519,7 @@ return { facts: [{ key: 'testEditDenied', value: denied !== null }] };`),
   it('D3 budgets.enforce true: a worker turn that reports more tokens than the run may spend stops the step → exit 7', async () => {
     const { dir, wt } = await sampleRepo(enforced);
     const env = { ...KEYS, TECERA_WORKTREES: wt };
-    const res = await cli(dir, ['run', 'fix-failing-test', '--scripted', scripts({ worker: [{ expect: 'Run verify and read the failing assertion', text: js(`console.log('thinking about it');`), usage: { input: 400000, output: 1000 } }] })], { env });
+    const res = await cli(dir, ['run', 'fix-failing-test', '--scripted', scripts({ worker: [{ expect: 'Read the failing test and the implementation under test', text: js(`console.log('thinking about it');`), usage: { input: 400000, output: 1000 } }] })], { env });
     if (res.code !== 7) console.log(await dump(dir));
     expect(res.code, res.err + res.out).toBe(7);
     const evs = await events(dir);
@@ -537,7 +575,7 @@ return { facts: [{ key: 'testEditDenied', value: denied !== null }] };`),
     expect(JSON.stringify(evs.filter((e) => e.kind === 'step.failed' || e.kind === 'run.ended' || e.kind === 'goal.dropped').map((e) => e.payload))).toMatch(/ledger/);
   }, 600_000);
 
-  it('secret canaries (env, repo file, credential-named env value, provider keys) never reach the ledger file, the run export, the PR bundle, a sandbox child or a model request (incl. the review packet)', async () => {
+  it('secret canaries (env, repo file, credential-named env value, provider keys) never reach the ledger file, the run export, the PR bundle, a sandbox child or a model request (incl. the review packet); a delivery whose patch would carry one is refused (8), nothing pushed or bundled', async () => {
     const ENV_CANARY = 'TECERA_CANARY_envplant_7f3a9c21';
     const REPO_CANARY = 'TECERA_CANARY_repofile_5d1e8b0a';
     const PLAIN = 'plainsecretvalue-4242-zz';
@@ -554,7 +592,12 @@ return { facts: [{ key: 'testEditDenied', value: denied !== null }] };`),
     expect(run.code, run.err + run.out).toBe(4);
     const s = await approveAndResume(dir, env, {}, { wire });
     const outs = [run, s.approve, s.resumed];
-    expect(s.resumed.code, outs.map((o) => o.err + o.out).join('\n')).toBe(0);
+    // The planted line is context of the committed diff: the PR gate refuses a secret-bearing delivery
+    // (secret-in-delivery, exit 8) instead of redacting it into an invalid patch or delivering it.
+    expect(s.resumed.code, outs.map((o) => o.err + o.out).join('\n')).toBe(8);
+    const failed = (await events(dir)).find((e) => e.kind === 'pr.failed');
+    expect(failed?.payload).toMatchObject({ reason: 'secret-in-delivery' });
+    expect((await events(dir)).map((e) => e.kind)).not.toContain('pr.requested');
     const runId = (await events(dir)).find((e) => e.kind === 'run.started')!.runId!;
     expect((await cli(dir, ['evidence', runId], { env })).code).toBe(0);
 
@@ -575,14 +618,14 @@ return { facts: [{ key: 'testEditDenied', value: denied !== null }] };`),
         const p = join(d, n.name);
         if (n.isDirectory()) walk(p, extra);
         else if (n.name.endsWith('.patch')) {
-          // the PR bundle's patch IS the committed diff: the repository's own lines (the planted comment is
-          // in its context) are what is delivered, exactly as on the branch; no credential or env canary may ride along
+          // no bundle is written for a refused delivery; were one there, no credential or env canary may ride along
           const text = readFileSync(p).toString('latin1');
           for (const k of keysOnly) expect(text.includes(k), `${p} contains a credential`).toBe(false);
+          expect(text.includes(REPO_CANARY), `${p} was written for a refused delivery`).toBe(false);
         } else scan(p, readFileSync(p).toString('latin1'), extra);
       }
     };
-    walk(join(dir, '.tecera/runs', runId), [REPO_CANARY]);
+    if (existsSync(join(dir, '.tecera/runs', runId))) walk(join(dir, '.tecera/runs', runId), [REPO_CANARY]);
     scan('run stdout', outs.map((o) => o.out + o.err).join('\n'), [REPO_CANARY]);
   }, 600_000);
 

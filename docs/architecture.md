@@ -27,7 +27,36 @@ onStepDone(r)   facts become beliefs (untrusted); reflex.closeOut decides whethe
 
 A goal is `achieved` only when every verify step has passed in the environment and, for plans that deliver
 a change, the commit and pull-request steps completed. The `goal.achieved` event carries a proof:
-`{command, exitCode: 0, fingerprint, evidenceKey, verifiedAt}`.
+`{command, exitCode: 0, fingerprint, evidenceKey, verifiedAt}` and, under an acceptance contract, one
+proof per criterion with its fidelity. One pure function (`provenAchievement`) decides whether a ledger
+proves a goal; the Stop hook, the run's exit status and replay all call it, so a forged `goal.achieved`
+event with no verification evidence behind it proves nothing.
+
+## Acceptance and capabilities
+
+Before planning, a request becomes an **acceptance contract**: criteria, each with a check (a command
+that must exit 0 on the final candidate, or a question for a human), what is out of scope, and what was
+assumed. The planner seat drafts it; model output is screened (no generic "tests pass" contracts, no
+criteria that import packages the repository lacks or need the network) and recorded as `criteria.drafted`.
+A free-text request holds until the requestor accepts the contract through a local approval bound to
+its hash (`accept_criteria`, approver not the requester); a goal file that carries criteria is accepted
+by the file. An amendment after acceptance (`criteria.amended`) makes the running plan stale and forces a
+re-plan against the new hash.
+
+The criteria name the **capabilities** they need. Connections declared in the manifest are probed for
+real; what a plan needs is resolved through one ladder, `use → provision → mock → ask`:
+
+- **use** the real connection when its probe passes;
+- **provision** a local stand-in inside the manifest allowance (temporary directory, bare git remote,
+  SQLite file, loopback HTTP stub; a count and a lifetime cap). Each `resource.provisioned` carries its
+  locator and teardown and stays a pending debt until a human transfers or releases it;
+- **mock** it behind the broker when the connection is `mockable`: the worker sees a stand-in with the
+  real tool's interface, and everything it returns is provenance-tagged `simulated`;
+- **ask** the requestor otherwise. Tecera never creates access in the requestor's own systems.
+
+Every criterion proof records its **fidelity**, `real`, `provisioned` or `mocked`, capped by what the
+ledger inventory recorded at verification time. A goal with any mocked criterion is `goal.provisional`:
+the PR opens marked provisional, the run exits 10, and the Stop hook keeps blocking.
 
 ## Vocabulary
 
@@ -36,6 +65,7 @@ a change, the commit and pull-request steps completed. The `goal.achieved` event
 | Belief | A fact with provenance, projected from `belief.added` / `belief.removed` events |
 | Goal | `AchievementGoal`: a statement plus an environmental check (a command and a timeout) |
 | Plan | Trigger, context conditions, steps with dependencies, allowed models per step, permissions, budget. Origin `generated` or `graduated`; status `candidate` until a human accepts it |
+| Criterion | One acceptance criterion: a statement, a check (command or human), the capabilities it requires |
 | Step | `worker`, `gate.verify`, `gate.review`, `gate.commit`, `gate.pr`, or `subgoal` |
 | Intention | A committed plan instance with a commitment policy: `blind`, `single-minded` or `open-minded` |
 | Reflex | One of six seams: triage, choosePlan, route, gate, reconsider, closeOut. Each is `rule`, `model` or `frontier`; none can be switched off |
@@ -46,8 +76,10 @@ a change, the commit and pull-request steps completed. The `goal.achieved` event
 - **Writes.** A worker may write inside `repo.allowedChanges` on its leased work branch without approval.
   Every write is fenced by the lease, logged, and refused on protected paths (tests, configuration, CI,
   lockfiles, Tecera's own files).
-- **Verify.** The goal's check runs in a separate contained process with a scrubbed environment. A run that
-  mutates the candidate, overflows its output or leaves descendants behind does not pass.
+- **Verify.** The goal's check and every command criterion run in a separate contained process with a
+  scrubbed environment, on the same frozen candidate. A run that mutates the candidate, overflows its
+  output or leaves descendants behind does not pass. A retried worker receives the failed criteria and the
+  reviewer's findings as untrusted, redacted inputs.
 - **Review.** Mandatory, by a different vendor than every writer, compared by provider and key
   fingerprint. The verdict must be exactly `{verdict, findings}`; `approve` requires empty findings.
 - **Commit.** To `tecera/<goal>`, staged from host-read bytes so repository hooks and filters never run,
@@ -82,7 +114,18 @@ Four tiers over the log: working, episodic, semantic (lessons) and procedural (t
 and generated plans are staged mechanically and enter the library only when a human graduates them with a
 rationale. Rejections and retractions are kept on record.
 
+## Benchmarks
+
+`packages/bench` holds ten scenarios (fixing a failing test, a vague request, a multi-step feature, a
+missing database, a missing mail sender, a tempting test edit, a planted instruction with a canary
+secret, an impossible task, interruption and amendment mid-run, and an audit from the ledger alone).
+The runner drives the real CLI, scripted or with live models, and performs the declared human steps; the
+scorer reads only the ledger and the final repository. The headline numbers are human touches per job
+(autonomy), false achievements and landed violations, which must be zero (control), and the share of
+actions traceable to a step, intention, goal and approval (compliance).
+
 ## Package dependencies
 
 `contracts` ← { `ledger`, `loop`, `reflex`, `worker`, `policy`, `brain`, `providers`, `planner`, `gates` }
-← `runtime` ← `tecera`. Sibling packages talk through the ports defined in `contracts`.
+← `runtime` ← `tecera`, with `adversarial` and `bench` on top. Sibling packages talk through the ports
+defined in `contracts`.

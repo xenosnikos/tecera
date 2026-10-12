@@ -17,6 +17,11 @@ export const EXIT = {
   policy: 8,
   ledger: 9,
   notWired: 9,
+  /**
+   * The goal is provisional (D11): every criterion is proven, one of them on a mocked capability. The PR may
+   * be open (and says so) but the goal is never achieved; the Stop hook keeps blocking. Never 0.
+   */
+  provisional: 10,
   interrupted: 130,
 } as const;
 

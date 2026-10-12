@@ -3,7 +3,8 @@ import type { AchievementGoal, AchievementProof, Belief, Intention, Plan, Princi
 import type { Manifest } from './manifest.js';
 import type { TeceraEvent, EventKind, Trace } from './events.js';
 import type { DecisionRecord, ReflexAnswers, ReflexQuestions, ReflexResult, ReflexSeam } from './reflex.js';
-import type { CapabilitySet, Effect, ExecResult, HookDescriptor, Inputs, Outcome, SpanEvent, SpanKind, ToolRequest, ToolResult, WriteGuard } from './worker.js';
+import type { CapabilitySet, Effect, ExecResult, HookDescriptor, Inputs, MockToolDeclaration, Outcome, SpanEvent, SpanKind, ToolRequest, ToolResult, WriteGuard } from './worker.js';
+import type { AcceptanceContract, CapabilityRecord, ContractDraft, CriterionProof, HumanCriterionAnswer, ProvisionedResource, ProvisioningAllowance } from './acceptance.js';
 
 /**
  * Ports implemented by sibling packages and wired by @tecera/runtime. @tecera/loop depends only on
@@ -260,7 +261,24 @@ export interface PlanLibrary {
  * @tecera/policy / @tecera/planner. The loop runs it on generated AND reused (library) plans before use.
  */
 export interface PlanValidator {
-  validatePlan(plan: Plan, manifest: Manifest, goal: AchievementGoal): string[];
+  /**
+   * `ctx` (optional; absent = the single-check path): the accepted contract and the run's capability
+   * inventory. With it a validator refuses a plan for another contractHash, one missing a gate.verify for a
+   * command criterion, and one naming a capability (plan.capabilities) whose gap resolves to 'ask' or missing.
+   */
+  validatePlan(plan: Plan, manifest: Manifest, goal: AchievementGoal, ctx?: PlanningContext): string[];
+}
+
+/** What the loop knows when a plan is written or validated under an acceptance contract. All optional. */
+export interface PlanningContext {
+  /** The accepted contract (acceptedContractOf(...).accepted.contract) and its hash. */
+  contract?: AcceptanceContract;
+  contractHash?: string;
+  /** The run's capability inventory (capabilityInventoryOf(...).records). */
+  inventory?: readonly CapabilityRecord[];
+  /** The manifest's provisioning allowance and how many resources the run already provisioned (resolveGap). */
+  allowance?: ProvisioningAllowance;
+  provisionedSoFar?: number;
 }
 
 /**
@@ -279,8 +297,18 @@ export interface UsageMeter {
 }
 
 export interface Planner {
-  /** Write a plan for an event when the library has none. Returns a candidate plan; the loop validates it. */
-  write(e: TeceraEvent, beliefs: BeliefProjection, goal: AchievementGoal, meter?: UsageMeter): Promise<Plan>;
+  /**
+   * Write a plan for an event when the library has none. Returns a candidate plan; the loop validates it.
+   * With `ctx.contract` the plan must carry ctx.contractHash, a gate.verify for every command criterion and,
+   * in plan.capabilities, every capability it uses.
+   */
+  write(e: TeceraEvent, beliefs: BeliefProjection, goal: AchievementGoal, meter?: UsageMeter, ctx?: PlanningContext): Promise<Plan>;
+  /**
+   * Draft an acceptance contract for a free-text request (D8). The result must pass contractProblem (at least
+   * one command criterion) with contract.goalId = goal.id; `needs` names every capability a criterion
+   * requires. Optional: a planner without it cannot serve statement runs that need sign-off.
+   */
+  draftContract?(statement: string, goal: AchievementGoal, inventory: readonly CapabilityRecord[], meter?: UsageMeter): Promise<ContractDraft>;
   /** Deliberate between options when the reflex is unsure. */
   deliberate(options: Plan[], intentions: Intention[], beliefs: BeliefProjection, meter?: UsageMeter): Promise<Plan>;
 }
@@ -398,6 +426,8 @@ export interface WorkerStepRequest {
    * must be refused (requireWriteGuard).
    */
   guard?: WriteGuard;
+  /** Stand-ins the broker serves for this step (mockRegistrationProblem accepted each); their results are simulated. */
+  mocks?: readonly MockToolDeclaration[];
 }
 
 export interface Worker {
@@ -452,6 +482,20 @@ export interface GateContext {
    * (object writes, update-ref, index update) and refuse when it is absent (requireWriteGuard).
    */
   guard?: WriteGuard;
+  /**
+   * The accepted contract the goal is held to (absent = the single-check path: goal.check alone). gate.verify
+   * runs every command criterion and returns one CriterionProof each; gate.pr lists every criterion.
+   */
+  contract?: AcceptanceContract;
+  contractHash?: string;
+  /** The run's capability inventory: the fidelity of a criterion is fidelityOf over its `requires`. */
+  inventory?: readonly CapabilityRecord[];
+  /** gate.pr: the command-criterion proofs of the committed candidate (from the verify that preceded the commit). */
+  criterionProofs?: readonly CriterionProof[];
+  /** gate.pr: human criteria answered at the PR hold. */
+  humanAnswers?: readonly HumanCriterionAnswer[];
+  /** gate.pr: resources still pending transfer (resourceRegistryOf(...).pending for this goal); the PR lists them. */
+  pendingResources?: readonly ProvisionedResource[];
 }
 
 interface GateResultBase {
@@ -467,6 +511,13 @@ export interface GateVerifyResult extends GateResultBase {
   exitCode: number;
   /** Fingerprint of the tree the verify ran against (D1 for the commit binding). */
   fingerprint?: string;
+  /**
+   * With ctx.contract: one proof per COMMAND criterion that exited 0 on `fingerprint` (evidence kind
+   * gate.verify under criterionEvidenceKey, fidelity from fidelityFor over the inventory). Any command
+   * criterion that did not pass makes exitCode non-zero and is named in `failedCriteria`.
+   */
+  criteria?: CriterionProof[];
+  failedCriteria?: string[];
 }
 
 export interface GateReviewResult extends GateResultBase {
@@ -496,6 +547,8 @@ export interface GatePrResult extends GateResultBase {
   bundle?: string;
   /** True when the branch was pushed to a remote. */
   pushed?: boolean;
+  /** True when a criterion rests on a mock: the PR title and body say provisional (D11). */
+  provisional?: boolean;
 }
 
 /** Outcome of reconciling a commit interrupted after its grant was consumed (security.md §4 S8). */
@@ -578,7 +631,10 @@ export function prActionHash(a: { intentionId: string; stepId: string; attempt: 
 /** What the host Stop hook knows: the active run of this business case (null = none) and its proof, if any. */
 export interface StopHookInput {
   activeRun: { runId: string; goalId?: string; state?: string } | null;
+  /** Only a proof that provenAchievement / provenRun accepted. */
   achievedProof: AchievementProof | null | undefined;
+  /** The run's goal is provisional (goal.provisional): the hook still blocks and may say why. */
+  provisional?: boolean;
 }
 
 /**
@@ -621,6 +677,8 @@ export interface Tool {
   schema: JsonObject;
   /** Risk class used by the gate reflex's rule fallback. */
   risk: 'read' | 'write' | 'irreversible';
+  /** Set on a stand-in: the capability id it mocks. Its results must carry simulatedProvenance. */
+  standsIn?: string;
   /**
    * `guard` is the mutation-time fence (worker.ts WriteGuard). A tool whose risk is not 'read' MUST call
    * guard.check() immediately before each mutation, and guard.authorizeWrite(w) before each file write when

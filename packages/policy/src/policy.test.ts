@@ -184,7 +184,8 @@ describe('validatePlan', () => {
       { id: 'pr', kind: 'gate.pr', dependsOn: ['c'], inputs: {} },
     ],
     allowedModels: { edit: ['worker'] },
-    permissions: { tools: ['read', 'edit'], write: ['src/**'], approvals: ['open_pr'] },
+    // sprint 5 item 5: a gate.pr plan declares both actions the one commit-bound grant covers
+    permissions: { tools: ['read', 'edit'], write: ['src/**'], approvals: ['open_pr', 'git_push'] },
     budget: { usd: 1 },
   });
   const opts = { toolCatalog: ['read', 'edit', 'runVerify', 'merge'], permissions: DEFAULT_PERMISSIONS, goalHasCheck: true };
@@ -253,7 +254,11 @@ describe('stopDecision (D4 Stop hook)', () => {
     for (const bad of [{ ...proof, exitCode: 1 }, { ...proof, evidenceKey: '' }, { ...proof, fingerprint: undefined }]) {
       expect(stopDecision({ activeRun: { runId: 'r1' }, achievedProof: bad as never }).decision).toBe('block');
     }
-    expect(stopDecision({ activeRun: { runId: 'r1', state: 'budget exhausted' }, achievedProof: proof })).toMatchObject({ decision: 'allow', exitCode: 0 });
+    // sprint 5 item 1: a proof alone is shape only (a forged goal.achieved carries one); only a provenRun
+    // verdict for the run allows, and budget state never matters
+    expect(stopDecision({ activeRun: { runId: 'r1', state: 'budget exhausted' }, achievedProof: proof })).toMatchObject({ decision: 'block', exitCode: 2 });
+    const verdict = { runId: 'r1', achieved: true, provisional: false, why: null, goals: { g_fix: { goalId: 'g_fix', runId: 'r1', achieved: true, provisional: false, why: null, proof } } };
+    expect(stopDecision({ activeRun: { runId: 'r1', state: 'budget exhausted' }, achievedProof: proof, verdict })).toMatchObject({ decision: 'allow', exitCode: 0 });
     expect(stopDecision({ activeRun: { runId: '' }, achievedProof: null }).decision).toBe('allow');
   });
 });

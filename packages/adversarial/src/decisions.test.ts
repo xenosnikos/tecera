@@ -25,7 +25,6 @@ import { SqliteLedger } from '@tecera/ledger';
 import { deliveryChainProblems, DELIVERY_CHAIN } from '@tecera/policy';
 import { ReflexRouter } from '@tecera/reflex';
 import { replayRun } from '@tecera/runtime';
-import { expectGap } from './harness/gap.js';
 import { cli, dump, fixturePlan, fixtureReplies, Flow, git, KEYS, ledgerEvents, requestIdOf, sampleRepo, stopHook, type Ev } from './harness/e2e.js';
 import { manifestInput, StubReviewer, WRITERS } from './harness/gates.js';
 import { environ } from './harness/procs.js';
@@ -270,7 +269,7 @@ describe('owner decisions D1–D7 (2026-10-05)', () => {
     expect(broken.code, broken.out + broken.err).toBe(2);
   }, 300_000);
 
-  it('decision.d4_stop_hook [forged achievement while held] GAP (owner: runtime stopHook.ts): a well-formed goal.achieved appended out of band while the run is still held at its PR (nothing delivered, so the run does not derive as achieved) does not let the assistant stop', async () => {
+  it('decision.d4_stop_hook [forged achievement while held]: a well-formed goal.achieved appended out of band while the run is still held at its PR (nothing delivered, so the run does not derive as achieved) does not let the assistant stop', async () => {
     const h = await heldAtPr();
     const runId = h.flow.runId;
     const verify2 = h.evs.find((e) => e.kind === 'verify.passed' && e.trace.stepId === 'verify2')!.payload as { evidenceKey: string; fingerprint: string };
@@ -296,10 +295,11 @@ describe('owner decisions D1–D7 (2026-10-05)', () => {
     } finally {
       l.close();
     }
+    const before = (await ledgerEvents(h.dir)).length;
     const r = await stopHook(h.dir);
-    await expectGap('decision.d4_stop_hook [forged achievement while held]', 'runtime stopHook.ts (accept a proof only for a run whose achievement derives: deriveGoalStatus with the PR delivered)', { assertion: 'the Stop hook blocks on an underived achievement' }, () => {
-      expect(r.code, 'the Stop hook blocks on an underived achievement').toBe(2);
-    });
+    expect(r.code, 'the Stop hook blocks on an underived achievement').toBe(2);
+    expect(r.err).toMatch(/before delivering it: no PR was delivered/);
+    expect((await ledgerEvents(h.dir)).slice(before).map((e) => e.kind)).toContain('stop.blocked');
   }, 240_000);
 
   it('decision.d4_achieved_proof: every goal.achieved carries a proof bound to the passing final verify of the committed candidate; contracts refuse an achievement without evidence or with a malformed proof; derivation refuses a proof-less achievement', async () => {

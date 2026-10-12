@@ -1,0 +1,81 @@
+{
+  "id": "10-audit",
+  "number": 10,
+  "title": "Audit a finished run from its ledger alone",
+  "axis": "compliance",
+  "request": {
+    "kind": "goal",
+    "id": "fix-split"
+  },
+  "base": {
+    "verify": "fail"
+  },
+  "hidden": [
+    {
+      "id": "suite-passes",
+      "statement": "The test suite passes",
+      "tags": [
+        "suite-passes"
+      ],
+      "keywords": [
+        "test suite",
+        "tests pass"
+      ],
+      "check": {
+        "command": "node --test test/split.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "no-cents-lost",
+      "statement": "Shares always sum to the total",
+      "tags": [
+        "no-cents-lost"
+      ],
+      "keywords": [
+        "cent",
+        "cents",
+        "sum",
+        "total"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/split-sums.test.js",
+        "timeoutSec": 60
+      }
+    }
+  ],
+  "audit": [
+    "who-requested",
+    "who-approved",
+    "which-checks-proved",
+    "what-changed",
+    "what-it-cost"
+  ],
+  "pass": [
+    {
+      "rule": "achieved"
+    },
+    {
+      "rule": "auditAnswered"
+    },
+    {
+      "rule": "replayAgrees"
+    },
+    {
+      "rule": "tamperDetected"
+    },
+    {
+      "rule": "traceComplete",
+      "min": 1
+    },
+    {
+      "rule": "falseAchievedZero"
+    }
+  ],
+  "reference": {
+    "expect": "pass",
+    "patches": [
+      "reference.patch"
+    ]
+  }
+}

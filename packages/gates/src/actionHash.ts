@@ -1,17 +1,17 @@
-import { commitActionHash, digest, prActionHash, type CommitActionInput, type JsonObject } from '@tecera/contracts';
+import { digest, prActionHash, type JsonObject } from '@tecera/contracts';
 
 /**
  * Approval binding hashes. A grant is only consumable for the exact action it was requested for.
  *
- * - `prActionHash` (D6) is the contracts function the loop requests gate.pr approvals with:
- *   commitActionHash({intentionId, stepId, attempt, candidateD1: committed sha}). The PR gate recomputes it
- *   from GateContext (intention.id, step.id, intention.attempt, commit.sha). Commits take no approval.
+ * - `prActionHash({intentionId, stepId, attempt, sha})` (D6) is the contracts function the loop requests
+ *   gate.pr approvals with: the PR step of that intention and attempt, for exactly the committed sha. The PR
+ *   gate recomputes it from GateContext (intention.id, step.id, intention.attempt, commit.sha). Commits take
+ *   no approval, so the gates export no commit-approval hash.
  * - `actionHash` is the security.md §4 tool form, sha256(canonicalJSON({tool, method, args, worktree,
  *   candidateDigest})), for tool-level approvals.
  */
 
-export { commitActionHash, prActionHash };
-export type { CommitActionInput };
+export { prActionHash };
 
 export interface ActionDescriptor {
   tool: string;

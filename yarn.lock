@@ -169,6 +169,20 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@tecera/bench@workspace:packages/bench":
+  version: 0.0.0-use.local
+  resolution: "@tecera/bench@workspace:packages/bench"
+  dependencies:
+    "@tecera/contracts": "workspace:*"
+    "@tecera/ledger": "workspace:*"
+    "@tecera/runtime": "workspace:*"
+    "@types/node": "npm:^22.15.21"
+    typescript: "npm:^5.5.3"
+    vitest: "npm:^4.0.14"
+    zod: "npm:^3.23.8"
+  languageName: unknown
+  linkType: soft
+
 "@tecera/brain@workspace:*, @tecera/brain@workspace:packages/brain":
   version: 0.0.0-use.local
   resolution: "@tecera/brain@workspace:packages/brain"

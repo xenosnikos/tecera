@@ -1,7 +1,28 @@
 import { resolve } from 'node:path';
-import { LedgerError, type EnvironmentalCheck, type Json, type Ledger, type Manifest, type Redactor, type SecretInput, type VerifyOutcome, type VerifyRunner } from '@tecera/contracts';
+import {
+  capabilityInventoryOf,
+  criterionEvidenceKey,
+  LedgerError,
+  resourceRegistryOf,
+  type AcceptanceContract,
+  type CapabilityRecord,
+  type Criterion,
+  type CriterionProof,
+  type EnvironmentalCheck,
+  type Fidelity,
+  type Json,
+  type Ledger,
+  type Manifest,
+  type ProvisionedResource,
+  type Redactor,
+  type SecretInput,
+  type TeceraEvent,
+  type VerifyOutcome,
+  type VerifyRunner,
+} from '@tecera/contracts';
 import { fileManifest, snapshotCandidate, type Candidate } from './candidate.js';
-import { commandDigest, defaultIds, errMsg, GateMemo, IGNORED_BASELINE_VERSION, ignoredBaseline, ignoredBaselineKey, ignoredBaselineOf, obj, redactorFrom, safeText, tail, writeEvidence } from './evidence.js';
+import { commandCriteria, commandUsesResource, contractOf, criterionFidelity, inventoryById, LOCATED_KINDS, resourceEnvName, shellExports, withLedgerMocks } from './criteria.js';
+import { commandDigest, defaultIds, errMsg, GateMemo, IGNORED_BASELINE_VERSION, ignoredBaseline, ignoredBaselineKey, ignoredBaselineOf, keyPart, obj, redactorFrom, safeText, tail, writeEvidence } from './evidence.js';
 import { UnsafeRepo } from './gitx.js';
 import { EXIT, TOOLING_EXITS, type StepContext, type VerifyOutcomeKind, type VerifyResult } from './types.js';
 
@@ -27,6 +48,21 @@ import { EXIT, TOOLING_EXITS, type StepContext, type VerifyOutcomeKind, type Ver
  * key per (run, intention, step, attempt, n); the result is written under the matching key. A later verify
  * of the same step that finds a start without a result (the process died mid-verify, ctx.recovered or not)
  * re-snapshots and must see D1 again: a different tree is 'mutated' (9, terminal, human), never re-run.
+ *
+ * Acceptance contract (D8, D11): with GateContext.contract every command criterion runs in the same contained
+ * process against the same frozen candidate, after the start record and before the goal check, which stays
+ * the final verify of the step. Each criterion gets its own gate.verify evidence (criterionEvidenceKey on
+ * a pass) and, when it exits 0 on D1, one CriterionProof whose fidelity is fidelityOf over the capabilities
+ * it requires in GateContext.inventory. A capability GateContext lists as missing counts as mocked when the run's
+ * ledger inventory records a stand-in for it (capability.mocked after the context was built). A required
+ * capability that is missing proves nothing: the gate refuses (9) before anything runs and names the criterion.
+ * A criterion that requires a provisioned sqlite / tmpdir / http-stub gets its locator in TECERA_RESOURCE_<ID>
+ * (resourceEnvName) inside the contained process, and is proven at fidelity provisioned only when its command
+ * names that variable or the locator; one that ignores the resource (its own :memory: or temp database) proves
+ * nothing about it and is recorded mocked. A criterion that exits non-zero fails the step
+ * (1, retryable, named in failedCriteria) and the goal check does not run; a criterion that mutates the
+ * tree, times out or cannot start is terminal like the goal check. A goal that names a contract while
+ * GateContext carries none is refused (9).
  *
  * Diagnostics: every string a result carries (`reason`, built from runner exceptions, snapshot and
  * repository errors) is redacted with the shared redactor when it is built, before it reaches either the
@@ -73,10 +109,19 @@ export function gateWorktree(ctxWorktree: unknown, configured: string | undefine
 export interface ResolvedCheck {
   command: string;
   timeoutSec: number;
-  source: 'goal' | 'manifest';
+  source: 'goal' | 'manifest' | 'criterion';
   manifestCommand: string;
   /** The goal asked for a longer timeout than the manifest allows; the manifest's applies. */
   timeoutCapped: boolean;
+  /** Variables exported for the command (provisioned resource locators); evidence records their names only. */
+  env?: Readonly<Record<string, string>>;
+}
+
+/** What a verify step's criteria run against (see VerifyGate.runView). */
+interface RunView {
+  inv: { byId: Record<string, CapabilityRecord> };
+  /** Usable pending resources of the run by resource id. */
+  resources: Map<string, ProvisionedResource>;
 }
 
 /**
@@ -91,6 +136,13 @@ export function resolveCheck(goal: { check?: unknown } | undefined, m: Manifest)
   if (!gc || typeof gc !== 'object' || typeof gc.command !== 'string' || gc.command.trim() === '') return { ok: false, reason: 'the goal check has no command (refusing rather than running another check)' };
   if (typeof gc.timeoutSec !== 'number' || !Number.isFinite(gc.timeoutSec) || gc.timeoutSec <= 0) return { ok: false, reason: 'the goal check has no positive timeoutSec' };
   return { ok: true, check: { command: gc.command, timeoutSec: Math.min(gc.timeoutSec, mt), source: 'goal', manifestCommand: mc, timeoutCapped: gc.timeoutSec > mt } };
+}
+
+/** What a beforeRun hook may stop the goal check with (the candidate it saw is still D1). */
+interface Stop {
+  outcome: 'mutated' | 'failed' | 'tooling' | 'refused';
+  reason: string;
+  exitCode?: number;
 }
 
 interface RunOnce {
@@ -123,13 +175,20 @@ export class VerifyGate {
     const stepMeta: Record<string, Json> = { intentionId: ctx.intention.id, stepId: ctx.step.id, attempt: ctx.intention.attempt, recovered: ctx.recovered === true };
     const wt = gateWorktree(ctx.worktree, this.o.worktree);
     const chk = resolveCheck(ctx.goal, this.o.manifest);
+    const con = contractOf(ctx);
+    const view = con.ok && con.contract ? await this.runView(ctx) : null;
+    const gaps = con.ok && con.contract ? this.capabilityGaps(con.contract, view!.inv) : [];
     let r: RunOnce;
     let evidenceKey: string | undefined;
-    if (!wt.ok || !chk.ok) {
-      evidenceKey = `verify-refused:${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${this.ids()}`;
-      r = this.refused(!wt.ok ? wt.reason : (chk as { reason: string }).reason, { startedAt: this.now() });
+    const proofs: CriterionProof[] = [];
+    const failed: string[] = [...gaps];
+    if (!wt.ok || !chk.ok || !con.ok || gaps.length) {
+      evidenceKey = `verify-refused:${keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}`)}:${this.ids()}`;
+      const why = !wt.ok ? wt.reason : !chk.ok ? chk.reason : !con.ok ? con.reason : `criteria ${gaps.join(', ')} require a capability the inventory lacks: nothing can prove them`;
+      r = this.refused(why, { startedAt: this.now(), ...(con.ok && con.hash ? { contractHash: con.hash } : {}) });
     } else {
-      const slot = `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${ctx.intention.attempt}`;
+      const contract = con.contract;
+      const slot = keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${ctx.intention.attempt}`);
       const prior = await this.interrupted(slot);
       r = await this.runOnce(wt.dir, ctx.runId, chk.check, ctx.signal, true, async (before) => {
         // S4: a verify of this step died after freezing D1. The tree must still be D1, else a human looks.
@@ -144,14 +203,129 @@ export class VerifyGate {
           await writeEvidence(this.o.ledger, this.redactor, { key: `verify:${slot}:${prior.n}`, kind: 'gate.verify', runId: ctx.runId, body: { ...stepMeta, outcome: 'interrupted', fingerprint: prior.d1, terminal: false, supersededBy: `verify:${slot}:${n}` } });
         }
         evidenceKey = `verify:${slot}:${n}`;
-        return null;
+        // The contract's command criteria run on this same frozen candidate; the goal check runs last.
+        if (!contract) return null;
+        return this.criteria(ctx, contract, con.hash!, before.fingerprint, evidenceKey, proofs, failed, view!);
       });
       evidenceKey ??= `verify-refused:${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${this.ids()}`;
       if (prior) r.body.interruptedVerify = { key: prior.key, d1: prior.d1 };
+      if (contract) {
+        r.body.contractHash = con.hash!;
+        r.body.criteria = proofs.map((p) => ({ criterionId: p.criterionId, evidenceKey: p.evidenceKey, fidelity: p.fidelity }));
+      }
     }
+    if (failed.length) r.body.failedCriteria = [...failed];
     await writeEvidence(this.o.ledger, this.redactor, { key: evidenceKey!, kind: 'gate.verify', runId: ctx.runId, body: { ...r.body, ...stepMeta } });
     this.memo.verify.set(`${ctx.runId}:${ctx.intention.id}`, { evidenceKey: evidenceKey!, fingerprint: r.fingerprint, outcome: r.outcome, files: r.body.files, ...(typeof r.body.commandDigest === 'string' ? { commandDigest: r.body.commandDigest } : {}) });
-    return this.result(r, evidenceKey!);
+    const out = this.result(r, evidenceKey!);
+    // Proofs only for a step that passed as a whole: one per command criterion, all on `fingerprint`.
+    if (con.ok && con.contract) return { ...out, criteria: r.outcome === 'passed' ? proofs : [], ...(failed.length ? { failedCriteria: [...failed] } : {}) };
+    return out;
+  }
+
+  /** Command criteria whose required capabilities the inventory cannot back (fidelityFor null). */
+  private capabilityGaps(contract: AcceptanceContract, inv: { byId: Record<string, CapabilityRecord> }): string[] {
+    return commandCriteria(contract)
+      .filter((k) => criterionFidelity(k.requires, [inv]) === null)
+      .map((k) => k.id);
+  }
+
+  /**
+   * What the criteria run against: GateContext's inventory with the ledger's stand-ins (withLedgerMocks) and the
+   * usable provisioned resources of the run by id (none while the registry reports a problem or a resource past
+   * the allowance). A ledger that cannot be read adds nothing (missing stays missing; a provisioned criterion
+   * then has no locator and proves nothing about its resource).
+   */
+  private async runView(ctx: StepContext): Promise<RunView> {
+    const own = inventoryById(ctx.inventory);
+    const events: TeceraEvent[] = [];
+    try {
+      for await (const e of this.o.ledger.events({ runId: ctx.runId })) events.push(e);
+    } catch {
+      return { inv: own, resources: new Map() };
+    }
+    const secrets = (v: string) => this.redactor.containsSecret(v) !== null;
+    const allowance = this.o.manifest.provisioning;
+    const inv = withLedgerMocks(own, capabilityInventoryOf(events, { runId: ctx.runId, allowance, secrets }));
+    const reg = resourceRegistryOf(events, { runId: ctx.runId, allowance, secrets });
+    const usable = reg.problems.length || reg.overAllowance.length ? [] : reg.pending;
+    return { inv, resources: new Map(usable.map((r) => [r.id, r])) };
+  }
+
+  /**
+   * One criterion's fidelity and the resource variables its process gets. A required capability that is
+   * provisioned as a located kind is exported as resourceEnvName(id); the criterion keeps fidelity provisioned
+   * for it only when its command uses it (commandUsesResource), else it is mocked (it never touched the resource).
+   */
+  private criterionUse(k: Criterion & { check: { command: string } }, view: RunView): { fidelity: Fidelity | null; env: Record<string, string>; unused: string[] } {
+    let fidelity = criterionFidelity(k.requires, [view.inv]);
+    const env: Record<string, string> = {};
+    const unused: string[] = [];
+    for (const id of k.requires ?? []) {
+      const rec = view.inv.byId[id];
+      if (rec?.state !== 'provisioned' || !LOCATED_KINDS.has(rec.kind)) continue;
+      const res = rec.resourceId ? view.resources.get(rec.resourceId) : undefined;
+      if (res) env[resourceEnvName(id)] = res.locator;
+      if (!res || !commandUsesResource(k.check.command, id, res.locator)) unused.push(id);
+    }
+    if (unused.length && fidelity !== null) fidelity = 'mocked';
+    return { fidelity, env, unused };
+  }
+
+  /**
+   * Run every command criterion on the frozen candidate `d1` (inside the goal check's start record) and
+   * record one gate.verify evidence each. Pushes a proof per criterion that exited 0 on d1 and the id of
+   * every one that did not. Returns a Stop for the goal check (failed or terminal), or null to run it.
+   */
+  private async criteria(ctx: StepContext, contract: AcceptanceContract, hash: string, d1: string, verifyKey: string, proofs: CriterionProof[], failed: string[], view: RunView): Promise<Stop | null> {
+    const mt = this.o.manifest.verify.timeoutSec;
+    for (const k of commandCriteria(contract)) {
+      const use = this.criterionUse(k, view);
+      const fidelity = use.fidelity as Fidelity;
+      const check: ResolvedCheck = { command: k.check.command, timeoutSec: Math.min(k.check.timeoutSec, mt), source: 'criterion', manifestCommand: this.o.manifest.verify.command, timeoutCapped: k.check.timeoutSec > mt, ...(Object.keys(use.env).length ? { env: use.env } : {}) };
+      const c = await this.runOnce(ctx.worktree, ctx.runId, check, ctx.signal, true);
+      // The criterion must have seen exactly the frozen candidate, before and after its command.
+      const drift = c.outcome !== 'refused' && c.outcome !== 'tooling' && c.fingerprint !== d1;
+      const outcome = drift ? 'mutated' : c.outcome;
+      const meta: Record<string, Json> = { criterionId: k.id, runId: ctx.runId, contractHash: hash, fidelity, requires: [...(k.requires ?? [])], verifyKey, intentionId: ctx.intention.id, stepId: ctx.step.id, attempt: ctx.intention.attempt, ...(use.unused.length ? { resourceUnused: use.unused } : {}) };
+      const { files: _files, ...body } = c.body;
+      void _files;
+      if (outcome === 'passed') {
+        const key = await this.recordCriterion(ctx.runId, criterionEvidenceKey(ctx.runId, k.id, d1), { ...body, ...meta }, check.command, d1);
+        if (key) {
+          const at = typeof c.body.startedAt === 'number' ? c.body.startedAt + (typeof c.body.durationMs === 'number' ? c.body.durationMs : 0) : this.now();
+          proofs.push({ criterionId: k.id, fidelity, via: 'command', command: k.check.command, exitCode: 0, fingerprint: d1, evidenceKey: key, verifiedAt: at });
+          continue;
+        }
+        failed.push(k.id);
+        return { outcome: 'refused', reason: `criterion ${k.id}: its evidence key already holds another record`, exitCode: EXIT.human };
+      }
+      const why = drift ? `criterion ${k.id} saw another candidate than D1 (the tree changed)` : `criterion ${k.id}: ${c.reason}`;
+      await writeEvidence(this.o.ledger, this.redactor, { key: `verify-criterion:${ctx.runId}:${k.id}:${this.ids()}`, kind: 'gate.verify', runId: ctx.runId, body: { ...body, ...meta, outcome, ...(drift ? { exitCode: EXIT.human, terminal: true } : {}), reason: this.diag(why) } });
+      failed.push(k.id);
+      if (outcome !== 'failed') return { outcome, reason: why, exitCode: drift ? EXIT.human : c.exitCode };
+    }
+    if (failed.length) return { outcome: 'failed', reason: `criteria failed: ${failed.join(', ')}`, exitCode: EXIT.failed };
+    return null;
+  }
+
+  /**
+   * Record a passing criterion under its deterministic key (create-if-absent). A key already holding a
+   * passing record of the same criterion command on the same candidate is that proof again (a second
+   * verify step on an unchanged candidate); anything else under the key is refused (null).
+   */
+  private async recordCriterion(runId: string, key: string, body: Record<string, Json>, command: string, d1: string): Promise<string | null> {
+    const same = (b: Record<string, Json> | null) => !!b && b.outcome === 'passed' && b.exitCode === 0 && b.fingerprint === d1 && b.commandDigest === commandDigest(command) && b.criterionId === body.criterionId;
+    const existing = await this.o.ledger.getEvidence(key);
+    if (existing) return existing.kind === 'gate.verify' && existing.runId === runId && same(obj(existing.body)) ? key : null;
+    try {
+      await writeEvidence(this.o.ledger, this.redactor, { key, kind: 'gate.verify', runId, body });
+      return key;
+    } catch (err) {
+      if (!(err instanceof LedgerError && err.code === 'evidence')) throw err;
+      const won = await this.o.ledger.getEvidence(key);
+      return won && won.kind === 'gate.verify' && same(obj(won.body)) ? key : null;
+    }
   }
 
   /** The returned result: diagnostics redacted (again, idempotently), terminal results classified. */
@@ -234,7 +408,7 @@ export class VerifyGate {
     check: ResolvedCheck,
     signal?: AbortSignal,
     useBaseline = true,
-    beforeRun?: (before: Candidate) => Promise<{ outcome: 'mutated'; reason: string } | null>,
+    beforeRun?: (before: Candidate) => Promise<Stop | null>,
   ): Promise<RunOnce> {
     const { manifest } = this.o;
     const cap = this.o.tailCap ?? 8 * 1024;
@@ -250,6 +424,7 @@ export class VerifyGate {
       timeoutCapped: check.timeoutCapped,
       envAllowlist,
       startedAt,
+      ...(check.env && Object.keys(check.env).length ? { resourceEnv: Object.keys(check.env).sort() } : {}),
     };
     const baseline = useBaseline ? await ignoredBaseline(this.o.ledger, this.memo, runId) : undefined;
 
@@ -263,21 +438,26 @@ export class VerifyGate {
 
     const stop = beforeRun ? await beforeRun(before) : null;
     if (stop) {
+      // The goal check never ran: a failed criterion is retryable (1), anything else is terminal.
       const reason = this.diag(stop.reason);
+      const terminal = stop.outcome !== 'failed';
+      const exitCode = stop.exitCode ?? (terminal ? EXIT.human : EXIT.failed);
       return {
-        outcome: 'mutated',
-        exitCode: EXIT.human,
+        outcome: stop.outcome,
+        exitCode,
         fingerprint: before.fingerprint,
-        terminal: true,
+        terminal,
         reason,
         before,
-        body: { ...meta, outcome: 'mutated', exitCode: EXIT.human, reason, humanNeeded: true, retryable: false, terminal: true, fingerprint: before.fingerprint, files: fileManifest(before), ran: false, stdoutTail: '', stderrTail: '', durationMs: 0 },
+        body: { ...meta, outcome: stop.outcome, exitCode, reason, humanNeeded: terminal, retryable: !terminal, terminal, fingerprint: before.fingerprint, files: fileManifest(before), ran: false, stdoutTail: '', stderrTail: '', durationMs: 0 },
       };
     }
 
     let out: VerifyOutcome;
     try {
-      out = await this.o.runner.run({ cwd: worktree, command, timeoutSec: check.timeoutSec, envAllowlist }, signal);
+      // Resource locators are exported in the same shell; the evidence binds the criterion's own command.
+      const run = check.env ? `${shellExports(check.env)}${command}` : command;
+      out = await this.o.runner.run({ cwd: worktree, command: run, timeoutSec: check.timeoutSec, envAllowlist }, signal);
     } catch (err) {
       return this.tooling(before.fingerprint, signal?.aborted ? EXIT.timeout : EXIT.notFound, `verify runner failed: ${errMsg(err)}`, { ...meta, files: fileManifest(before) });
     }

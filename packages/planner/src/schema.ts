@@ -19,6 +19,8 @@ const NAME_RE = /^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$/;
 /** Glob characters only: no spaces, quotes, angle brackets or control characters can reach a diagnostic. */
 const GLOB_RE = /^[A-Za-z0-9_.*?/{}[\],!@+=-]{1,256}$/;
 const SEAT_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+/** Capability ids: manifest `connections` keys and the needs a contract names (contracts acceptance ids). */
+export const CAPABILITY_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 const jsonValue: z.ZodType<Json> = z.lazy(() =>
   z.union([z.string().max(8000), z.number().finite(), z.boolean(), z.null(), z.array(jsonValue).max(256), z.record(jsonValue)]),
@@ -80,6 +82,8 @@ export const PlanDocumentSchema = z
     goalKinds: unique(z.array(z.string().regex(NAME_RE, 'goal kinds are identifiers')).min(1).max(8), 'goalKinds'),
     rationale: z.string().min(1).max(2000),
     context: z.array(BeliefPatternDocSchema).max(16).default([]),
+    /** Capability ids the plan uses (inventory ids). The host adds every capability the accepted contract requires. */
+    capabilities: unique(z.array(z.string().regex(CAPABILITY_ID_RE, 'capability ids are lowercase identifiers')).max(32), 'capabilities').optional(),
   })
   .strict();
 
@@ -158,6 +162,7 @@ export const PLAN_DOCUMENT_JSON_SCHEMA: JsonObject = {
         properties: { key: str({ minLength: 1 }), equals: {}, exists: { type: 'boolean' } },
       },
     },
+    capabilities: nameList(32, CAPABILITY_ID_RE.source),
   },
 };
 
@@ -235,6 +240,7 @@ export const PLAN_WIRE_JSON_SCHEMA: JsonObject = wClosed({
     description: 'Belief preconditions.',
     items: wClosed({ key: wStr(), equalsJson: wNullable(wStr(), 'Expected value as JSON text, or null.'), exists: wNullable({ type: 'boolean' }) }),
   },
+  capabilities: wNullable(wStrings(), 'Capability ids the plan uses (connections and contract needs), or null for none.'),
 });
 
 const wireJson = z.string().max(MAX_WIRE_JSON_CHARS).nullish();
@@ -261,6 +267,7 @@ export const PlanWireSchema = z
     goalKinds: z.array(z.string().max(128)).max(64),
     rationale: z.string().max(4000),
     context: z.array(z.object({ key: z.string().max(400), equalsJson: wireJson, exists: z.boolean().nullish() }).strict()).max(64).nullish(),
+    capabilities: z.array(z.string().max(128)).max(64).nullish(),
   })
   .strict();
 
@@ -330,6 +337,7 @@ export function wireToDocument(v: unknown): { ok: true; doc: Record<string, unkn
         goalKinds: [...d.goalKinds],
         rationale: d.rationale,
         context,
+        ...(d.capabilities != null ? { capabilities: [...d.capabilities] } : {}),
       },
     };
   } catch (err) {
@@ -339,8 +347,13 @@ export function wireToDocument(v: unknown): { ok: true; doc: Record<string, unkn
 
 // ---------- stamping ----------
 
-/** `p_` + first 8 hex of sha256 over the canonical plan content (id, origin, status, rationale excluded). */
-export function planId(p: Pick<Plan, 'trigger' | 'context' | 'steps' | 'allowedModels' | 'permissions' | 'budget' | 'goalKinds'>): string {
+/**
+ * `p_` + first 8 hex of sha256 over the canonical plan content (id, origin, status, rationale excluded). The
+ * contract hash and capabilities count when present, so a plan for another contract has another id.
+ */
+export function planId(
+  p: Pick<Plan, 'trigger' | 'context' | 'steps' | 'allowedModels' | 'permissions' | 'budget' | 'goalKinds'> & Partial<Pick<Plan, 'contractHash' | 'capabilities'>>,
+): string {
   const body = normalizeJson({
     trigger: p.trigger,
     context: p.context,
@@ -349,6 +362,8 @@ export function planId(p: Pick<Plan, 'trigger' | 'context' | 'steps' | 'allowedM
     permissions: p.permissions,
     budget: p.budget,
     goalKinds: p.goalKinds,
+    ...(p.contractHash !== undefined ? { contractHash: p.contractHash } : {}),
+    ...(p.capabilities !== undefined ? { capabilities: p.capabilities } : {}),
   } as unknown as Json);
   return `p_${digest(body).slice(0, 8)}`;
 }
@@ -356,10 +371,12 @@ export function planId(p: Pick<Plan, 'trigger' | 'context' | 'steps' | 'allowedM
 /**
  * Turn a parsed plan document into a Plan: host-stamped id, trigger, origin and status. `budget` replaces
  * the document's budget (the planner passes the materialised effective budget so the id covers it).
+ * `contractHash` is the accepted contract the plan was written for; `capabilities` replaces the document's
+ * list (the planner passes it with the contract's requirements added). Both are covered by the id.
  */
 export function toPlan(
   doc: PlanDocument,
-  stamp: { trigger: EventPattern; origin?: PlanOrigin; status?: PlanStatus; budget?: Plan['budget'] },
+  stamp: { trigger: EventPattern; origin?: PlanOrigin; status?: PlanStatus; budget?: Plan['budget']; contractHash?: string; capabilities?: readonly string[] },
 ): Plan {
   const steps = doc.steps.map((s) => {
     const step: Plan['steps'][number] = { id: s.id, kind: s.kind, dependsOn: [...s.dependsOn], inputs: s.inputs };
@@ -383,9 +400,15 @@ export function toPlan(
     budget: { ...(stamp.budget ?? doc.budget) },
     goalKinds: [...doc.goalKinds],
   };
+  const caps = stamp.capabilities ?? doc.capabilities;
+  const extra: Pick<Plan, 'contractHash' | 'capabilities'> = {
+    ...(stamp.contractHash !== undefined ? { contractHash: stamp.contractHash } : {}),
+    ...(caps !== undefined ? { capabilities: [...caps] } : {}),
+  };
   return {
-    id: planId(body),
+    id: planId({ ...body, ...extra }),
     ...body,
+    ...extra,
     origin: stamp.origin ?? 'generated',
     status: stamp.status ?? 'candidate',
     rationale: doc.rationale,

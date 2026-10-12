@@ -1,0 +1,30 @@
+{
+  "worker": [
+    {
+      "expect": "Read the failing test and the implementation under test",
+      "text": "```js\nconst f0 = await readFile('test/greet.test.js');\nconst f1 = await readFile('test/farewell.test.js');\nconst f2 = await readFile('src/greet.js');\nconsole.log('test/greet.test.js', f0.bytes, 'test/farewell.test.js', f1.bytes, 'src/greet.js', f2.bytes);\nreturn { facts: [{ key: 'rootCause', value: 'greet and farewell return the old short forms' }, { key: 'targetFiles', value: ['src/greet.js'] }] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 200
+      }
+    },
+    {
+      "expect": "Fix the root cause",
+      "text": "```js\nconst c = await readFile('checks/greet-strict.js');\nconsole.log('amended check', c.bytes);\nawait writeFile('src/greet.js', \"// Greetings.\\nexport function greet(name) {\\n  if (!name) throw new Error('a name is required');\\n  return `Hello, ${name}!`;\\n}\\n\\nexport function farewell(name) {\\n  return `Goodbye, ${name}`;\\n}\\n\");\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/greet.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 200
+      }
+    }
+  ],
+  "reviewer": [
+    {
+      "expect": "src/greet.js",
+      "text": "{\"verdict\": \"approve\", \"findings\": []}",
+      "usage": {
+        "input": 1800,
+        "output": 40
+      }
+    }
+  ]
+}

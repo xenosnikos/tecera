@@ -1,0 +1,53 @@
+[
+  {
+    "when": "persist sessions",
+    "criteria": [
+      {
+        "id": "sessions-persist",
+        "statement": "Sessions survive a process restart (kept in a SQLite file at options.path)",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { createSessionStore } from \"./src/sessions.js\"; const path = process.env.TECERA_RESOURCE_DB; const a = createSessionStore({ path }); a.set(\"s1\", { user: \"ada\" }); a.close(); const b = createSessionStore({ path }); assert.deepEqual(b.get(\"s1\"), { user: \"ada\" }); b.close();'",
+          "timeoutSec": 60
+        },
+        "requires": [
+          "db"
+        ]
+      },
+      {
+        "id": "delete-persists",
+        "statement": "A deleted session stays deleted after a restart",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { createSessionStore } from \"./src/sessions.js\"; const path = process.env.TECERA_RESOURCE_DB; const a = createSessionStore({ path }); a.set(\"s1\", { user: \"ada\" }); a.set(\"s2\", { user: \"bob\" }); a.delete(\"s1\"); a.close(); const b = createSessionStore({ path }); assert.equal(b.get(\"s1\"), undefined); assert.deepEqual(b.get(\"s2\"), { user: \"bob\" }); b.close();'",
+          "timeoutSec": 60
+        },
+        "requires": [
+          "db"
+        ]
+      },
+      {
+        "id": "api-unchanged",
+        "statement": "The store keeps its API and its own tests pass",
+        "check": {
+          "kind": "command",
+          "command": "node --test",
+          "timeoutSec": 60
+        }
+      }
+    ],
+    "outOfScope": [
+      "session expiry"
+    ],
+    "assumptions": [
+      "options.path names the database file"
+    ],
+    "needs": [
+      {
+        "id": "db",
+        "kind": "sqlite",
+        "mockable": true
+      }
+    ]
+  }
+]

@@ -66,13 +66,25 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
     expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
   });
 
-  it('a hardlink added inside the synchronous commit window never carries the write: the original inode is never mutated', async () => {
+  it('a hardlink added inside the synchronous commit window is refused before the first mutation: neither name changes', async () => {
     const racing = createEditTool({ beforeCommit: () => linkSync(join(root, 'src/a.ts'), join(root, 'test/late.test.ts')) });
     const r = await racing.call(req('src/a.ts', 'new content'), ctx);
-    expect(r.ok).toBe(true);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('new content');
-    // the protected link still points at the OLD inode with the OLD bytes
+    expect(r.ok).toBe(false);
+    expect(r.error?.message).toMatch(/hardlinked file \(nlink=2, a link was added during the write\)/);
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
     expect(await readFile(join(root, 'test/late.test.ts'), 'utf8')).toBe('export const a = 1;\n');
+    const { readdir } = await import('node:fs/promises');
+    expect((await readdir(join(root, 'src'))).filter((n) => n.startsWith('.tecera-'))).toEqual([]);
+    expect(worktreeTaint(root)).toBeNull();
+  });
+
+  it('a file planted at a new path inside the synchronous commit window is never overwritten', async () => {
+    const racing = createEditTool({ beforeCommit: () => linkSync(join(root, 'test/p.test.ts'), join(root, 'src/new.ts')) });
+    const r = await racing.call(req('src/new.ts', 'mine'), ctx);
+    expect(r.ok).toBe(false);
+    expect(r.error?.message).toMatch(/appeared between authorization and commit/);
+    expect(await readFile(join(root, 'test/p.test.ts'), 'utf8')).toBe(PROTECTED);
+    expect(await readFile(join(root, 'src/new.ts'), 'utf8')).toBe(PROTECTED);
   });
 
   it('a parent directory replaced between authorization and open (inode changed) is refused; neither copy is written', async () => {
@@ -133,6 +145,21 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
     expect(r.ok).toBe(false);
     expect(r.error?.message).toMatch(/cancelled/);
     expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+  });
+
+  it('a write cancelled inside the synchronous commit window (after the pre-commit verification) changes nothing', async () => {
+    for (const path of ['src/a.ts', 'src/d/new.ts']) {
+      const ac = new AbortController();
+      const cancelling = createEditTool({ beforeCommit: () => ac.abort() });
+      const r = await cancelling.call(req(path, 'cancelled late'), { ...ctx, signal: ac.signal } as WorkerToolContext);
+      expect(r.ok, path).toBe(false);
+      expect(r.error?.message, path).toMatch(/write cancelled before commit/);
+    }
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    await expect(stat(join(root, 'src/d/new.ts'))).rejects.toThrow();
+    const { readdir } = await import('node:fs/promises');
+    expect((await readdir(join(root, 'src'))).filter((n) => n.startsWith('.tecera-'))).toEqual([]);
+    expect((await readdir(join(root, 'src/d'))).filter((n) => n.startsWith('.tecera-'))).toEqual([]);
   });
 
   it('the temp-file commit keeps the file mode and leaves no temp file behind', async () => {

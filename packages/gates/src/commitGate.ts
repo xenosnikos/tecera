@@ -1,7 +1,7 @@
-import { FenceLost, type Json, type Ledger, type Manifest, type Redactor, type SecretInput, type WriteGuard } from '@tecera/contracts';
+import { FenceLost, type Json, type Ledger, type Manifest, type Redactor, type SecretInput } from '@tecera/contracts';
 import { BoundaryViolation, DEFAULT_CONFIG_GLOBS, DEFAULT_TEST_GLOBS, enforceChanges, matchesAny, tamperFindings } from '@tecera/policy';
 import { addedLines, buildCandidateTree, fileManifest, lsTree, manifestMismatch, policyChanges, sameEntries, snapshotCandidate, type BuiltTree, type Candidate } from './candidate.js';
-import { claim, commandDigest, defaultIds, errMsg, GateMemo, ignoredBaseline, latestReview, latestVerify, obj, redactorFrom, safeText, writeEvidence, type ReviewMemo, type VerifyMemo } from './evidence.js';
+import { claim, commandDigest, commitEvidenceKey, defaultIds, errMsg, GateMemo, ignoredBaseline, keyPart, latestReview, latestVerify, obj, redactorFrom, safeText, usableGuard, writeEvidence, type ReviewMemo, type VerifyMemo } from './evidence.js';
 import { assertSafeRepo, DEFAULT_IDENTITY, hostGit, refSafe, UnsafeRepo, type GitIdentity } from './gitx.js';
 import { EXIT, type CommitResult, type StepContext } from './types.js';
 import { gateWorktree, resolveCheck } from './verifyGate.js';
@@ -9,7 +9,8 @@ import { gateWorktree, resolveCheck } from './verifyGate.js';
 /**
  * Commit gate (security.md §4 S7–S8, §5). Nothing is committed unless, in order:
  *  1. the GateContext names the gate's worktree and the repository cannot make git run programs (9);
- *  2. HEAD is the base commit, verify passed on D1 running the adopted goal's check (its command digest),
+ *  2. HEAD is the base commit, verify passed on D1 running the adopted goal's check (its command digest;
+ *     there is no option to commit without it),
  *     review approved D2, and the host snapshot now (D3) equals both: fingerprints AND per-file {status,
  *     mode, sha256, oid} records (else 9);
  *  3. every change is readable UTF-8 text (binary/unreadable 8), inside allowedChanges and the plan's
@@ -50,8 +51,6 @@ export interface CommitGateOptions {
   base?: string;
   /** Kept for callers; the commit gate takes no approval (D6). */
   sessionId?: string;
-  /** Require passing verify evidence on D1. Default true. */
-  requireVerify?: boolean;
   /** Only tightens: true forces tests read-only; the derived rule (testsReadOnlyFor) cannot be relaxed. */
   testsReadOnly?: boolean;
   protectedExceptions?: string[];
@@ -80,11 +79,6 @@ export interface CommitTestHooks {
   afterHead?: () => void | Promise<void>;
   /** After update-ref moved the branch, before HEAD is pointed at it (the HEAD-recovery window). */
   afterUpdateRef?: () => void | Promise<void>;
-}
-
-/** A usable guard, or null (a guard without check() or signal is no guard). */
-function usableGuard(g: WriteGuard | undefined): WriteGuard | null {
-  return g && typeof g.check === 'function' && g.signal ? g : null;
 }
 
 interface Finding {
@@ -131,13 +125,13 @@ export class CommitGate {
   }
 
   private keys(ctx: StepContext): { intent: string; final: string } {
-    const id = `${ctx.intention.id}:${ctx.step.id}:${ctx.intention.attempt}`;
-    return { intent: `commit-intent:${ctx.runId}:${id}`, final: `commit:${ctx.runId}:${id}` };
+    const id = keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${ctx.intention.attempt}`);
+    return { intent: `commit-intent:${id}`, final: commitEvidenceKey(this.redactor, ctx.runId, ctx.intention.id, ctx.step.id, ctx.intention.attempt) };
   }
 
   private failer(ctx: StepContext, record: Record<string, Json>) {
     return async (exitCode: number, reason: string, detail: Json = null): Promise<CommitResult> => {
-      const evidenceKey = `commit-refused:${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${this.ids()}`;
+      const evidenceKey = `commit-refused:${keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}`)}:${this.ids()}`;
       await writeEvidence(this.o.ledger, this.redactor, {
         key: evidenceKey,
         kind: 'gate.commit',
@@ -187,6 +181,10 @@ export class CommitGate {
     if (committable.length === 0) return fail(EXIT.human, 'empty-change');
     const unreadable = snap.files.filter((f) => f.unreadable).map((f) => ({ path: f.path, detail: f.unreadable! }));
     if (unreadable.length) return fail(EXIT.policy, 'unreadable', unreadable);
+    // A second name of another inode is refused as such, before any boundary check: an unchanged tracked file
+    // that is now a hard link is listed only for its link, and must not read as an edit of its path.
+    const links: Finding[] = committable.filter((f) => f.nlink !== undefined && f.nlink > 1).map((f) => ({ code: 'hardlink', path: f.path, detail: `st_nlink=${f.nlink}` }));
+    if (links.length) return fail(EXIT.policy, 'tamper', links as unknown as Json);
     const binary = snap.files.filter((f) => f.status !== 'D' && f.binary).map((f) => f.path);
     if (binary.length) return fail(EXIT.policy, 'binary', binary);
     const limit = Math.min(this.o.manifest.budgets.maxChangedFiles, ctx.plan.budget?.maxChangedFiles ?? Infinity, ctx.goal.budget?.maxChangedFiles ?? Infinity);
@@ -214,7 +212,9 @@ export class CommitGate {
     let findings: Finding[];
     try {
       findings = [
-        ...tamperFindings(changes, await addedLines(dir, snap, ctx.signal), { testGlobs: DEFAULT_TEST_GLOBS, configGlobs: DEFAULT_CONFIG_GLOBS, testsReadOnly, maxFileBytes: this.o.maxFileBytes }),
+        // Under an acceptance contract the goal file and whatever a criterion's check runs are the requestor's
+        // (D8): a candidate that changes them is tampering, inside allowedChanges or not.
+        ...tamperFindings(changes, await addedLines(dir, snap, ctx.signal), { testGlobs: DEFAULT_TEST_GLOBS, configGlobs: DEFAULT_CONFIG_GLOBS, testsReadOnly, maxFileBytes: this.o.maxFileBytes, ...(ctx.contract ? { contract: ctx.contract } : {}) }),
         ...(await this.localFindings(dir, snap)),
       ];
     } catch (err) {
@@ -437,8 +437,7 @@ export class CommitGate {
       if (!chk.ok) return h('goal-check-invalid', chk.reason);
       if (verify.commandDigest !== commandDigest(chk.check.command)) return h('verify-check-mismatch', { expected: chk.check.source, note: 'the passing verify did not run the goal check' });
       d1 = verify.fingerprint;
-    } else if (this.o.requireVerify === false) d1 = review.d1;
-    else return h('no-verify-evidence');
+    } else return h('no-verify-evidence');
     if (ctx.candidate?.d1 !== undefined && ctx.candidate.d1 !== d1) return h('verify-digest-mismatch', { ctx: ctx.candidate.d1, evidence: d1 });
     if (!d1) return p('null-d1', 'refusing to commit a candidate with no verified fingerprint');
     if (d1 !== d2 || d1 !== d3) return h('digest-drift', { d1, d2, d3 });

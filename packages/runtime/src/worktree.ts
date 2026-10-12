@@ -1,6 +1,6 @@
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Lease, Ledger } from '@tecera/contracts';
 import { assertSafeRepo, hostGit, UnsafeRepo } from '@tecera/gates';
 import type { Env } from './util/proc.js';
@@ -10,7 +10,11 @@ import type { Env } from './util/proc.js';
  * the developer's checkout).
  *
  * - Location: `<worktreesRoot>/<runId>`, where worktreesRoot is `$TECERA_WORKTREES` or `~/.tecera/worktrees`.
- *   It must lie outside the business case (a worktree inside it would be scanned, copied and committed).
+ *   It must lie outside the business case (a worktree inside it would be scanned, copied and committed). The
+ *   verify identity (an unprivileged uid) runs the check inside the worktree, so the root is created 0711
+ *   (others traverse, never list) and the default moves to `<tmpdir>/tecera-<uid>/worktrees` when the home
+ *   directory does not let others traverse it (root's 0700 home); that directory must be owned by this uid
+ *   and writable by nobody else.
  * - Git repository whose top level is the business-case root: `git worktree add --detach <dir> <base>` under
  *   the gates' host-controlled git (no hooks, no filters, no user config) after `assertSafeRepo`. HEAD is the
  *   base commit, which the commit gate requires; the commit lands on `<branchPrefix><goal>` in the same repo.
@@ -37,13 +41,47 @@ export class WiringError extends Error {
 
 export const WORKTREES_ENV = 'TECERA_WORKTREES';
 
-export function worktreesRoot(env: Env): string {
+export function worktreesRoot(env: Env, o: { home?: string; tmp?: string } = {}): string {
   const v = env[WORKTREES_ENV];
   if (v !== undefined && v !== '') {
     if (!isAbsolute(v)) throw new WiringError(`${WORKTREES_ENV} must be an absolute path`);
     return resolve(v);
   }
-  return join(homedir(), '.tecera', 'worktrees');
+  const home = o.home ?? homedir();
+  if (othersTraverse(home)) return join(home, '.tecera', 'worktrees');
+  const uid = typeof process.geteuid === 'function' ? process.geteuid() : 'user';
+  return join(o.tmp ?? tmpdir(), `tecera-${uid}`, 'worktrees');
+}
+
+/** Every existing directory from `/` down to `p` lets others traverse it (o+x): the verify uid can reach below. */
+export function othersTraverse(p: string): boolean {
+  let cur = resolve(p);
+  for (;;) {
+    try {
+      const st = lstatSync(cur);
+      if (st.isDirectory() && (st.mode & 0o001) === 0) return false;
+    } catch {
+      /* not created yet: it will be created traversable */
+    }
+    const up = dirname(cur);
+    if (up === cur) return true;
+    cur = up;
+  }
+}
+
+/**
+ * Create the worktrees root traversable by the verify identity (0711). Under a shared temp directory the
+ * per-uid parent must be a real directory owned by this uid and writable by nobody else, or the run is refused.
+ */
+function ensureWorktreesRoot(wtRoot: string): void {
+  mkdirSync(wtRoot, { recursive: true, mode: 0o711 });
+  const uid = typeof process.geteuid === 'function' ? process.geteuid() : null;
+  for (const d of [wtRoot, dirname(wtRoot)].filter((x) => /[\\/]tecera-[^\\/]+$/.test(x) || x === wtRoot)) {
+    const st = lstatSync(d);
+    if (st.isSymbolicLink() || !st.isDirectory()) throw new WiringError(`worktrees root ${d} is not a directory`);
+    if (uid !== null && st.uid !== uid) throw new WiringError(`worktrees root ${d} is owned by uid ${st.uid}, not by this process (uid ${uid})`);
+    if (st.mode & 0o022) throw new WiringError(`worktrees root ${d} is writable by group or others`);
+  }
 }
 
 export interface LeasedWorktree {
@@ -247,7 +285,7 @@ export async function leaseWorktree(o: LeaseOptions): Promise<LeasedWorktree> {
       baseSha = (await hostGit(path, ['rev-parse', '--verify', `${o.base}^{commit}`], { signal: o.signal })).trim();
     } else {
       if (existsSync(path)) throw new WiringError(`a worktree for run ${o.runId} already exists (${path}); refusing to reuse it for a new run`);
-      mkdirSync(wtRoot, { recursive: true, mode: 0o700 });
+      ensureWorktreesRoot(wtRoot);
       if (isGit) {
         await assertSafeRepo(rootAbs, o.signal);
         baseSha = (await hostGit(rootAbs, ['rev-parse', '--verify', `${o.base}^{commit}`], { signal: o.signal })).trim();
@@ -321,6 +359,44 @@ export async function snapshotTree(dir: string, signal?: AbortSignal): Promise<s
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+/**
+ * A read-only existence test for repository-relative paths under `root` (the planner's repository view). A path
+ * that is absolute, climbs out with `..`, or resolves (through a link) outside the root is reported absent.
+ */
+export function repoFileView(root: string): (path: string) => boolean {
+  const real = realpathSync(root);
+  return (p) => {
+    if (typeof p !== 'string' || p === '' || isAbsolute(p) || p.split(/[\\/]/).includes('..')) return false;
+    try {
+      const r = realpathSync(join(real, p));
+      return r === real || r.startsWith(real + sep);
+    } catch {
+      return false;
+    }
+  };
+}
+
+/**
+ * Files that differ between two checkpoints (`tree:<oid>` each), with added/removed line counts (binary: 0).
+ * Paths and counts only; no file content leaves this function. Throws on a malformed id or a git failure.
+ */
+export async function diffTrees(dir: string, from: string, to: string, signal?: AbortSignal): Promise<{ path: string; added: number; removed: number }[]> {
+  const oid = (id: string): string => {
+    const m = TREE_ID.exec(id);
+    if (!m) throw new Error(`not a worktree checkpoint: ${JSON.stringify(id)}`);
+    return m[1]!;
+  };
+  const out = await hostGit(dir, ['diff-tree', '-r', '--no-renames', '--numstat', '-z', oid(from), oid(to)], { signal, maxBuffer: 16 * 1024 * 1024 });
+  const files: { path: string; added: number; removed: number }[] = [];
+  // -z numstat without renames: "<added>\t<removed>\t<path>\0" per file; '-' counts mark a binary file
+  for (const rec of out.split('\0')) {
+    const m = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(rec);
+    if (!m) continue;
+    files.push({ path: m[3]!, added: m[1] === '-' ? 0 : Number(m[1]), removed: m[2] === '-' ? 0 : Number(m[2]) });
+  }
+  return files;
 }
 
 /**

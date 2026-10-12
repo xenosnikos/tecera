@@ -3,11 +3,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { newIntention, type CapabilitySet, type Effect, type Hook, type Outcome, type Plan, type SpanEvent, type VerifyRequest, type VerifyRunner, type WorkerStepRequest } from '@tecera/contracts';
-import { createEditTool } from '../tools/edit.js';
+import { createEditTool as writeRiskEditTool, type EditToolOptions } from '../tools/edit.js';
+import { irreversibleDouble } from './fakes.js';
 import { createListFilesTool } from '../tools/listFiles.js';
 import { createReadTool } from '../tools/read.js';
 import { FakeLedger, FakeLLM, FakeRepl, liveWriteGuard } from './fakes.js';
 import { StepWorker } from './stepWorker.js';
+
+/** D6: a write-risk tool is never held for approval; the approval tests here hold an irreversible double of edit. */
+const createEditTool = (o?: EditToolOptions) => irreversibleDouble(writeRiskEditTool(o));
 
 const js = (body: string): string => `\`\`\`js\n${body}\n\`\`\``;
 const caps: CapabilitySet = { tools: ['read', 'edit', 'listFiles', 'runVerify'], paths: { read: ['**'], write: ['src/**'], protected: ['test/**'] }, network: 'none', limits: { usd: 1, tokens: 100_000, calls: 50, wallMs: 60_000, depth: 3, iterations: 8 } };

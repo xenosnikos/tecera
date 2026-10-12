@@ -33,10 +33,11 @@ import { requireWriteGuard, sha256, type WriteGuard, type WriteIntent } from '@t
  *    segment); a parent swapped or moved after open is refused BEFORE anything is written into it.
  *  - No in-place mutation: the new content is written to a fresh O_CREAT|O_EXCL|O_NOFOLLOW temp file in
  *    the verified directory, fsync'ed, and then committed with synchronous calls only (no await, so nothing
- *    in this process interleaves): re-verify (target identity, nlink, directory path and identity, signal,
- *    guard) → keep a backup link of the original → rename over the target (or link(2) for a new file, which
- *    can never overwrite) → post-commit verify. The original inode is never written, so a hardlink or a
- *    move of the target after the checks can never carry the write into a protected file.
+ *    in this process interleaves): re-verify (directory path and identity, target identity and nlink) →
+ *    the last signal, guard and target checks immediately before the first mutation → keep a backup link of
+ *    the original → rename over the target (or link(2) for a new file, which can never overwrite) →
+ *    post-commit verify. The original inode is never written, so a hardlink or a move of the target after
+ *    the checks can never carry the write into a protected file.
  *  - Post-commit verification with rollback: if the directory chain or the committed entry is not what was
  *    authorized after the commit (an outside process raced the synchronous window), the commit is undone
  *    in the same directory inode (the original inode goes back under its name; a new entry is removed), so
@@ -359,7 +360,10 @@ export interface WriteOptions {
   afterRead?: (r: Resolved) => Promise<void>;
   /** Test seam: runs after the temp file was created and verified, immediately before its data is written. */
   beforeData?: (r: Resolved) => Promise<void>;
-  /** Test seam: runs synchronously after the pre-commit verification, immediately before the commit. */
+  /**
+   * Test seam: runs synchronously after the pre-commit chain verification; the final cancellation, guard and
+   * target (identity, nlink) checks run after it, immediately before the first commit mutation.
+   */
   beforeCommit?: (r: Resolved) => void;
   /** Test seam: pretend /proc/self/fd is unavailable (unsupported platform). */
   assumeNoProcFd?: boolean;
@@ -552,32 +556,40 @@ const NO_LINK = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']);
  */
 function commitSync(root: string, r: Resolved, dirFd: number, tmpFd: number, tmpName: string, name: string, expectedDir: string, chain: FsIdentity[], o: WriteOptions, guard: WriteGuard): void {
   const at = (n: string): string => `/proc/self/fd/${dirFd}/${n}`;
+  /** The target is still the authorized single-link inode (or, for a new file, still absent). */
+  const targetCheck = (): void => {
+    if (r.exists) {
+      let st: BigIntStats;
+      try {
+        st = lstatSync(at(name), { bigint: true });
+      } catch {
+        throw new PathError(`${r.rel} moved or vanished before commit; refused`);
+      }
+      if (!st.isFile() || !sameId(r.identity!.target, st)) throw new PathError(`${r.rel} was replaced before commit; refused`);
+      if (st.nlink !== 1n) throw new PathError(`refusing to write a hardlinked file (nlink=${st.nlink}, a link was added during the write): ${r.rel}`);
+    } else {
+      try {
+        lstatSync(at(name));
+        throw new PathError(`${r.rel} appeared between authorization and commit; refused`);
+      } catch (e) {
+        if (e instanceof PathError) throw e;
+      }
+    }
+  };
   if (o.signal?.aborted) throw new PathError(`write cancelled before commit: ${r.rel}`);
   verifyChainSync(root, expectedDir, dirFd, chain, (m) => new PathError(`${m}; refused before commit: ${r.rel}`));
-  if (r.exists) {
-    let st: BigIntStats;
-    try {
-      st = lstatSync(at(name), { bigint: true });
-    } catch {
-      throw new PathError(`${r.rel} moved or vanished before commit; refused`);
-    }
-    if (!st.isFile() || !sameId(r.identity!.target, st)) throw new PathError(`${r.rel} was replaced before commit; refused`);
-    if (st.nlink !== 1n) throw new PathError(`refusing to write a hardlinked file (nlink=${st.nlink}, a link was added during the write): ${r.rel}`);
-  } else {
-    try {
-      lstatSync(at(name));
-      throw new PathError(`${r.rel} appeared between authorization and commit; refused`);
-    } catch (e) {
-      if (e instanceof PathError) throw e;
-    }
-  }
+  targetCheck();
   const tmpSt = fstatSync(tmpFd, { bigint: true });
   // Backup of the original inode (same directory), so a commit that turns out to have landed in a moved
   // directory can be undone. Filesystems without hard links move the original aside instead.
   const bakName = `.tecera-bak-${randomBytes(8).toString('hex')}`;
   let backup: 'link' | 'moved' | null = null;
-  guard.check();
   o.beforeCommit?.(r);
+  // The last cancellation, fence and target checks run after every seam and immediately before the first
+  // mutation: a fence lost, a cancellation or a link added up to this point changes nothing.
+  if (o.signal?.aborted) throw new PathError(`write cancelled before commit: ${r.rel}`);
+  guard.check();
+  targetCheck();
   if (r.exists) {
     try {
       linkSync(at(name), at(bakName));

@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
-import type { Plan } from '@tecera/contracts';
+import type { AchievementGoal, BeliefProjection, CapabilityRecord, ContractDraft, Intention, Manifest, Plan, Planner, PlanningContext, TeceraEvent, UsageMeter } from '@tecera/contracts';
+import { ScriptedPlanner, type ScriptedContract } from '@tecera/planner';
 import type { FetchLike } from '@tecera/providers';
 import { wireOf } from './providerSetup.js';
 import { WiringError } from './worktree.js';
@@ -11,7 +12,14 @@ import { WiringError } from './worktree.js';
  * scan, response sanitising, usage and cost), the real worker sandbox, the real gates and the real ledger
  * all run. The directory holds:
  *
- * - `plan.json` (optional): a Plan the ScriptedPlanner returns instead of asking the planner seat;
+ * - `plan.json` (optional): a Plan the ScriptedPlanner returns instead of asking the planner seat. Under an
+ *   accepted acceptance contract it is stamped with the contract's hash and capabilities, and every
+ *   gate.verify step that lists no `inputs.criteria` is bound to the contract's command criteria (the planner
+ *   lane's convention), then checked exactly like a model's plan;
+ * - `contract.json` (optional): the acceptance contract the planner drafts for a statement run, as a
+ *   proposal `{criteria, outOfScope?, assumptions?, needs?}` (goal id and statement are stamped by the host)
+ *   or a list of them with `when` (a substring of the statement) — the scripted counterpart of the planner
+ *   seat's draft. A statement run with plan.json and no matching contract is refused (fail closed);
  * - `replies.json`: `{ "<seat>": [reply, ...] }` keyed by seat id (`planner`, every worker id, `reviewer`).
  *   A reply is a string (the assistant text) or `{ text, usage?: {input, output}, expect?: <regex> }`;
  *   `expect` must match the outgoing request body or the call fails (a mis-ordered script is an error,
@@ -33,6 +41,8 @@ export interface ScriptReply {
 export interface ScriptSet {
   dir: string;
   plan?: Plan;
+  /** Scripted contract drafts (contract.json). */
+  contracts?: ScriptedContract[];
   replies: Record<string, ScriptReply[]>;
 }
 
@@ -59,6 +69,14 @@ export function loadScripts(dirArg: string, cwd: string): ScriptSet {
     const p = readJson(planPath);
     if (!p || typeof p !== 'object' || Array.isArray(p) || typeof (p as Plan).id !== 'string') throw new WiringError('scripted: plan.json must be a Plan object with an id');
     set.plan = p as Plan;
+  }
+  const contractPath = join(dir, 'contract.json');
+  if (existsSync(contractPath)) {
+    const c = readJson(contractPath);
+    const list = Array.isArray(c) ? c : [c];
+    if (!list.length || list.some((x) => !x || typeof x !== 'object' || Array.isArray(x) || !Array.isArray((x as ScriptedContract).criteria))) throw new WiringError('scripted: contract.json must be a contract proposal {criteria, …} or a list of them');
+    for (const x of list) if ((x as { when?: unknown }).when !== undefined && typeof (x as { when?: unknown }).when !== 'string') throw new WiringError('scripted: contract.json `when` must be a string');
+    set.contracts = list as ScriptedContract[];
   }
   const repliesPath = join(dir, 'replies.json');
   if (existsSync(repliesPath)) {
@@ -163,4 +181,43 @@ export function scriptedFetch(seat: string, _kind: 'anthropic' | 'openai' | 'ope
     }
     return json(200, wireBody(wireOf(String(url)), model, seq, next));
   };
+}
+
+/**
+ * `plan` bound to the accepted contract in `ctx`: every gate.verify step that lists no `inputs.criteria` lists
+ * the contract's command criteria. Without a contract the plan is returned unchanged.
+ */
+export function bindVerifyCriteria(plan: Plan, ctx?: PlanningContext): Plan {
+  const contract = ctx?.contract;
+  if (!contract) return plan;
+  const ids = contract.criteria.filter((k) => k.check.kind === 'command').map((k) => k.id);
+  return { ...plan, steps: plan.steps.map((st) => (st.kind === 'gate.verify' && (st.inputs as { criteria?: unknown } | undefined)?.criteria === undefined ? { ...st, inputs: { ...(st.inputs ?? {}), criteria: ids } } : st)) };
+}
+
+/**
+ * The planner of a scripted run: @tecera/planner's ScriptedPlanner over the scripted plan (bound to the
+ * accepted contract per write, see bindVerifyCriteria) and the scripted contracts. Same checks as the model's
+ * path (contractPlanIssues, assembleDraft); nothing here relaxes them.
+ */
+export class ScriptedRunPlanner implements Planner {
+  private readonly drafts: ScriptedPlanner;
+  constructor(
+    private readonly plan: Plan,
+    private readonly o: { contracts?: readonly ScriptedContract[]; connections?: Manifest['connections'] } = {},
+  ) {
+    this.drafts = new ScriptedPlanner({ plans: [plan], ...(o.contracts ? { contracts: o.contracts } : {}), ...(o.connections ? { connections: o.connections } : {}) });
+  }
+
+  write(e: TeceraEvent, beliefs: BeliefProjection, goal: AchievementGoal, meter?: UsageMeter, ctx?: PlanningContext): Promise<Plan> {
+    const inner = new ScriptedPlanner({ plans: [bindVerifyCriteria(this.plan, ctx)], ...(this.o.connections ? { connections: this.o.connections } : {}) });
+    return inner.write(e, beliefs, goal, meter, ctx);
+  }
+
+  draftContract(statement: string, goal: AchievementGoal, inventory: readonly CapabilityRecord[]): Promise<ContractDraft> {
+    return this.drafts.draftContract(statement, goal, inventory);
+  }
+
+  deliberate(options: Plan[], intentions: Intention[]): Promise<Plan> {
+    return this.drafts.deliberate(options, intentions);
+  }
 }

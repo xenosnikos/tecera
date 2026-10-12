@@ -19,6 +19,7 @@ export const VALUE_FLAGS = [
   'to',
   'session',
   'scripted',
+  'file',
 ] as const;
 
 export const BOOL_FLAGS = [

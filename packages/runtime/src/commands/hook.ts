@@ -6,6 +6,7 @@ import { listGoalIds, loadGoal } from '../goals.js';
 import { decidePreTool, parseHookInput, stopReminder, type HookInput } from '../hook.js';
 import { loadManifest, loadPermissions, locateManifest, ManifestLoadError } from '../manifest/load.js';
 import { Runtime } from '../runtime.js';
+import { provenOptionsOf } from '../proof.js';
 import { evaluateStop } from '../stopHook.js';
 import { hostGitExecHazards } from '../util/proc.js';
 
@@ -13,8 +14,9 @@ import { hostGitExecHazards } from '../util/proc.js';
  * `tecera hook pre-tool|stop`, called by the host with the hook JSON on stdin. pre-tool: exit 0 allows,
  * exit 2 blocks with the reason on stderr (Claude Code feeds it back to the model); any error blocks.
  * stop (D4): exit 2 with `goal not achieved: <what is missing>` while a run of this business case is active
- * without a goal.achieved proof (stopHook.ts), exit 0 otherwise; budget is never considered. Each decision
- * is recorded as stop.blocked / stop.allowed. A business case whose ledger cannot be read blocks.
+ * and not proven achieved (stopHook.ts; a provisional goal always blocks), exit 0 otherwise; budget is never
+ * considered. Each decision is recorded as stop.blocked / stop.allowed. A business case whose ledger cannot be
+ * read, or whose hash chain does not verify, blocks.
  */
 export const hookCommand: Command = async (c) => {
   const which = c.args.positionals[0];
@@ -70,8 +72,11 @@ async function stopHook(c: CommandContext, text: string): Promise<number> {
   try {
     locateManifest(from, c.args.values.manifest);
   } catch (e) {
+    // A manifest named with --manifest that is gone is a broken hook, not the absence of a business case.
+    if (e instanceof ManifestLoadError && c.args.values.manifest) return block(`stop hook failed closed: ${e.message}`);
     if (e instanceof ManifestLoadError) {
-      // Not a Tecera business case: there is no run to protect.
+      // Not a Tecera business case (no tecera.json from the payload's cwd upward): there is no run to protect.
+      // A manifest that exists but cannot be read or validated blocks below (new Runtime throws).
       c.out.say('tecera: no business case here; nothing to prove');
       c.out.set('decision', 'allow');
       return EXIT.ok;
@@ -91,7 +96,7 @@ async function stopHook(c: CommandContext, text: string): Promise<number> {
       return EXIT.ok;
     }
     const ledger = rt.ledger();
-    const ev = await evaluateStop(ledger);
+    const ev = await evaluateStop(ledger, provenOptionsOf(rt.manifest, rt.redactor));
     const runId = ev.activeRun?.runId ?? ev.provedRunId;
     const payload: Record<string, Json> = {
       reason: ev.decision.reason,
@@ -100,6 +105,7 @@ async function stopHook(c: CommandContext, text: string): Promise<number> {
       ...(typeof input.session_id === 'string' ? { hostSession: input.session_id.slice(0, 128) } : {}),
       ...(ev.proof ? { proof: ev.proof as unknown as Json } : {}),
       ...(ev.missing ? { missing: ev.missing } : {}),
+      ...(ev.provisional ? { provisional: true } : {}),
     };
     try {
       await rt.append(ev.decision.decision === 'block' ? 'stop.blocked' : 'stop.allowed', { ...(runId ? { runId } : {}), payload, actor: { kind: 'system', id: 'hook.stop' } });

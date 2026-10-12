@@ -1,11 +1,33 @@
 import { randomUUID } from 'node:crypto';
 import {
+  ACCEPT_CRITERIA_ACTION,
+  ANSWER_CRITERION_ACTION,
   AccountingFailure,
   FencedWriteGuard,
   LedgerError,
+  acceptCriteriaActionHash,
+  acceptedContractOf,
   achievementProofProblem,
+  answerCriterionActionHash,
+  capabilityInventoryOf,
+  contractHash,
+  contractProblem,
+  criteriaProofProblem,
+  fidelityFor,
+  isFidelity,
+  ledgerOrder,
+  markProvisional,
+  payloadOf,
+  provenAchievement,
+  resolveGap,
+  resourceProblem,
+  resourceRegistryOf,
+  signoffTrace,
+  simulatedProvenance,
+  weakestFidelity,
   commitActionHash,
   isWritingStep,
+  READ_ONLY_TOOLS,
   meteredCall,
   prActionHash,
   reviewEvidenceKey,
@@ -22,8 +44,30 @@ import {
   transitionIntention,
   transitionStep,
   validatePlanShape,
+  type AcceptanceContract,
+  type AcceptanceView,
+  type AcceptedContract,
   type AchievementGoal,
   type AchievementProof,
+  type AchievementVerdict,
+  type CapabilityNeed,
+  type ChainVerdict,
+  type ContractDraft,
+  type Criterion,
+  type CapabilityProbe,
+  type CapabilityRecord,
+  type CriterionProof,
+  type EvidenceRecord,
+  type FailedCriterionContext,
+  type FailureContext,
+  type ReviewFindingContext,
+  type Fidelity,
+  type GapResolution,
+  type HumanCriterionAnswer,
+  type PlanningContext,
+  type ProvisionedResource,
+  type Provisioner,
+  type ProvisioningAllowance,
   type ApprovalGrant,
   type ApprovalView,
   type AttemptFingerprint,
@@ -114,6 +158,13 @@ export interface WorktreeRequirement {
   reset: string[];
 }
 
+/** One file a worker step changed (LoopPorts.worktreeChanges). Binary files count 0 lines. */
+export interface WorktreeChange {
+  path: string;
+  added: number;
+  removed: number;
+}
+
 /** resume() found the approval expired: the step was routed back (a gate.commit returns through verify) and must be approved afresh. */
 export class ApprovalExpired extends Error {
   constructor(public readonly requestId: string) {
@@ -168,17 +219,48 @@ export interface LoopPorts {
   /** Cap for the run's 'calls' pool, opened at start()/restore() (default DEFAULT_CALLS_CAP; never widens an existing cap). */
   callsCap?: number;
   /**
-   * Snapshot the worktree and return a checkpoint id (e.g. a git tree object). Called after every worker step
-   * completes and when a worker suspends; the id is recorded on step.completed / step.held and in the
-   * intention (checkpointId). S2 recovery asks the runtime to restore the latest one (or 'base' when there is
-   * none). A throwing port fails the step terminally ('human'): a write that cannot be checkpointed cannot be
-   * recovered.
+   * Snapshot the worktree and return a checkpoint id (e.g. a git tree object): equal ids mean equal trees.
+   * Called before every writing worker step starts ('baseline', recorded on step.started: closeOut compares the
+   * tree after the step with it), after every worker step completes and when a worker suspends; the
+   * completed / suspended id is recorded on step.completed / step.held and in the intention (checkpointId).
+   * S2 recovery asks the runtime to restore the latest completed one (or 'base' when there is none). A
+   * throwing port fails the step terminally ('human'): a write that cannot be checkpointed cannot be
+   * recovered. Declared as a method so a port written before 'baseline' existed still type-checks.
    */
-  worktreeCheckpoint?: (a: { runId: string; intentionId: string; stepId: string; attempt: number; reason: 'completed' | 'suspended' }) => Promise<string>;
+  worktreeCheckpoint?(a: { runId: string; intentionId: string; stepId: string; attempt: number; reason: 'baseline' | 'completed' | 'suspended' }): Promise<string>;
+  /**
+   * The files that differ between two checkpoints, with added / removed line counts (never contents). Used
+   * only as closeOut evidence; absent or throwing = the question carries `changed` without a summary.
+   */
+  worktreeChanges?(a: { runId: string; intentionId: string; stepId: string; from: string; to: string }): Promise<WorktreeChange[]>;
   /** Applied to every event payload before it reaches the ledger (e.g. makeRedactor(secrets).redactJson). */
   redact?: (value: Json) => Json;
+  /**
+   * Probes a declared connection (manifest `connections`) for real before a contract's work is planned. Absent:
+   * nothing is probed, so no capability is ever taken as available.
+   */
+  probe?: CapabilityProbe;
+  /** Creates resources in Tecera's own space inside manifest.provisioning. Absent: the provision rung is skipped. */
+  provisioner?: Provisioner;
+  /** Known secret values (containsSecret): a resource whose locator carries one is never recorded. */
+  secrets?: (value: string) => boolean;
   now?: () => number;
   ids?: () => string;
+}
+
+/** How a goal is held to an acceptance contract (D8). Absent = the single-check path (goal.check alone). */
+export interface AdoptOptions {
+  /**
+   * A free-text request: the planner drafts an acceptance contract (Planner.draftContract) and the goal holds
+   * for the requestor's sign-off (an accept_criteria approval) before anything is planned.
+   */
+  draftContract?: boolean;
+  /**
+   * The goal file's contract (criteria, out of scope, assumptions). Its hash becomes goal.contractHash; under
+   * acceptance.signoff 'statement' the file accepts it, under 'always' it holds for sign-off. A goal carrying
+   * `criteria` without this is held to {statement, criteria, outOfScope: [], assumptions: []}.
+   */
+  contract?: AcceptanceContract;
 }
 
 /** One recovery decision Loop.restore() took for a step (or a goal) it found unfinished. */
@@ -243,6 +325,39 @@ class AccountingBroken extends Error {
 
 /** Who consumes the approval of a held step. Exactly one owner per approval. */
 type ApprovalOwner = 'gate' | 'worker' | 'loop';
+
+/** The approval action of a capability the loop may neither use, provision nor mock: the requestor must provide it. */
+const PROVIDE_CAPABILITY_ACTION = 'provide_capability';
+
+/**
+ * A goal-level hold, before any intention exists: a criteria sign-off (accept_criteria, bound to the contract
+ * hash) or a missing capability asked of the requestor (provide_capability). The loop consumes the grant.
+ */
+interface GoalHold {
+  kind: 'signoff' | 'ask';
+  goalId: string;
+  requestId: string;
+  actionHash: string;
+  trace: { goalId: string; intentionId: string; stepId: string };
+  contractHash?: string;
+  capabilities?: string[];
+  /** approval.consumed is already on the ledger (restore: the crash came before criteria.accepted). */
+  consumedRecorded?: boolean;
+}
+
+/** A human criterion asked at the PR hold (answer_criterion): one approval per criterion, contract and candidate. */
+interface AnswerRequest {
+  goalId: string;
+  intentionId: string;
+  criterionId: string;
+  requestId: string;
+  actionHash: string;
+  contractHash: string;
+  fingerprint: string;
+  trace: { goalId: string; intentionId: string; planId?: string; stepId: string };
+  /** Set once the grant was consumed (the answer is yes). */
+  answer?: HumanCriterionAnswer;
+}
 
 interface Held {
   intentionId: string;
@@ -347,6 +462,37 @@ export class Loop {
   private readonly llmInFlight = new Set<AbortController>();
   /** Loop-owned approvals restore() found already consumed: execute without asking again. */
   private readonly preApproved = new Map<string, GateApproval>();
+  /** Goals held to an acceptance contract (drafted from a statement, a goal file's, or criteria events seen). */
+  private readonly contractual = new Set<string>();
+  /** Goals whose statement the planner drafts into a contract (adoptGoal draftContract). */
+  private readonly drafting = new Set<string>();
+  /** Goal-file contracts handed to adoptGoal. */
+  private readonly fileContracts = new Map<string, AcceptanceContract>();
+  /** The accepted contract hash per goal; absent while drafted, stale or none. */
+  private readonly acceptedHash = new Map<string, string>();
+  /** The contract hash each intention was planned against (recorded on intention.pushed). */
+  private readonly intentionContract = new Map<string, string>();
+  /** Goal-level holds (sign-off, capability asked of the requestor) by request id. */
+  private readonly goalHolds = new Map<string, GoalHold>();
+  /** Human criterion answers asked at the PR hold, by request id. */
+  private readonly answerReqs = new Map<string, AnswerRequest>();
+  /** Command-criterion proofs of each intention's latest passed verify, with the candidate they ran on. */
+  private readonly criterionProofs = new Map<string, { fingerprint?: string; proofs: CriterionProof[] }>();
+  /** Return values of completed worker steps (heldKey), handed to the worker steps that depend on them. */
+  private readonly stepOutputs = new Map<string, Json>();
+  /**
+   * The worktree checkpoint each running worker step started from (null: none). A writing step's is its own
+   * baseline (stepBaseline); a reading step's is the intention's latest checkpoint.
+   */
+  private readonly stepBefore = new Map<string, string | null>();
+  /** Baseline checkpoint of each writing worker step (heldKey), recorded on step.started; restore rebuilds it. */
+  private readonly stepBaseline = new Map<string, string>();
+  /** Writing steps already given their one no-change retry, keyed `heldKey#attempt` (restore rebuilds it). */
+  private readonly noChangeRetried = new Set<string>();
+  /** The latest verify result per intention (closeOut evidence). */
+  private readonly lastVerify = new Map<string, { exitCode: number; passed: boolean; attempt: number }>();
+  /** Capability needs the goal's drafts named (kind, mockable), by goal and capability id. */
+  private readonly goalNeeds = new Map<string, Map<string, CapabilityNeed>>();
   private readonly actor: Principal;
   private readonly now: () => number;
   private readonly ids: () => string;
@@ -412,6 +558,22 @@ export class Loop {
   /** Fail closed: the manifest's node isolation is degraded whatever the port says. */
   private get isolationDegraded(): boolean {
     return this.p.isolationDegraded === true || this.p.manifest.sandbox.isolation === 'node';
+  }
+
+  /** Who records Tecera's own decisions (approval.consumed, a goal file's acceptance): always a system principal. */
+  private get system(): Principal {
+    return this.actor.kind === 'system' ? this.actor : { kind: 'system', id: 'loop' };
+  }
+
+  /** manifest.provisioning as the allowance resolveGap and the projections check against. */
+  private get allowance(): ProvisioningAllowance {
+    const p = this.p.manifest.provisioning;
+    return { scope: p.scope, kinds: [...p.kinds], maxResources: p.maxResources, ttlSec: p.ttlSec };
+  }
+
+  /** acceptance.signoff 'always': every contract holds for a human sign-off, goal files included. */
+  private get signoffAlways(): boolean {
+    return this.p.manifest.acceptance.signoff === 'always';
   }
 
   /** D3: budgets end the run only when the manifest enforces them. */
@@ -504,12 +666,58 @@ export class Loop {
     return this.intentions.dispatchable().filter((b) => !this.awaitingWorktree.has(b.intention.id));
   }
 
-  async adoptGoal(g: Omit<AchievementGoal, 'status' | 'evidence' | 'commitment'> & { commitment?: Commitment }): Promise<AchievementGoal> {
-    const goal: AchievementGoal = { ...g, commitment: g.commitment ?? this.p.manifest.commitment, status: 'open', evidence: [] };
+  /**
+   * Adopt a goal. Without options (and without criteria) it is the single-check path: goal.check alone.
+   * `opts.draftContract` (a free-text request) or a goal-file contract (`criteria` / `opts.contract`) hold the
+   * goal to an acceptance contract: nothing is planned, and no worker step dispatched, before criteria.accepted
+   * for the contract's current hash. A malformed contract, or a contractHash that is not the contract's, throws.
+   */
+  async adoptGoal(g: Omit<AchievementGoal, 'status' | 'evidence' | 'commitment'> & { commitment?: Commitment }, opts: AdoptOptions = {}): Promise<AchievementGoal> {
+    let goal: AchievementGoal = { ...g, commitment: g.commitment ?? this.p.manifest.commitment, status: 'open', evidence: [] };
+    const contract = opts.contract ?? (g.criteria?.length ? { goalId: g.id, statement: g.statement, criteria: g.criteria, outOfScope: [], assumptions: [] } : undefined);
+    if (contract) {
+      if (opts.draftContract) throw new Error(`goal ${g.id} carries criteria: a goal file's contract is not drafted`);
+      const why = contractProblem(contract);
+      if (why) throw new Error(`goal ${g.id}: ${why}`);
+      if (contract.goalId !== g.id) throw new Error(`goal ${g.id}: the contract names goal ${contract.goalId}`);
+      const hash = contractHash(contract);
+      if (g.contractHash !== undefined && g.contractHash !== hash) throw new Error(`goal ${g.id}: contractHash ${g.contractHash} is not the contract's ${hash}`);
+      goal = { ...goal, criteria: contract.criteria, contractHash: hash };
+      this.fileContracts.set(g.id, contract);
+      this.contractual.add(g.id);
+    } else if (g.contractHash !== undefined) {
+      throw new Error(`goal ${g.id} names a contractHash without its criteria`);
+    }
+    if (opts.draftContract) {
+      this.drafting.add(g.id);
+      this.contractual.add(g.id);
+    }
     this.goals.set(goal.id, goal);
-    await this.emit('goal.adopted', { goal: goal as unknown as Json }, { goalId: goal.id });
+    await this.emit('goal.adopted', { goal: goal as unknown as Json, ...(opts.draftContract ? { draftContract: true } : {}), ...(contract ? { contract: contract as unknown as Json } : {}) }, { goalId: goal.id });
     this.throwIfStopped();
     return this.goals.get(goal.id)!;
+  }
+
+  /**
+   * Amend a goal's acceptance contract (criteria.amended, by `by` or Tecera). Any acceptance becomes stale: a
+   * running intention is reconsidered and dropped (a plan for a superseded contract cannot prove the goal), and
+   * the goal holds for a sign-off of the new contract before it is planned again. Returns the new hash.
+   */
+  async amendCriteria(goalId: string, contract: AcceptanceContract, reason: string, by?: Principal): Promise<string> {
+    this.throwIfStopped();
+    const goal = this.goals.get(goalId);
+    if (!goal || goal.status !== 'open') throw new Error(`goal ${goalId} is not open`);
+    if (by && by.kind === 'agent') throw new Error('an agent cannot amend acceptance criteria');
+    const why = contractProblem(contract);
+    if (why) throw new Error(`amended contract: ${why}`);
+    if (contract.goalId !== goalId) throw new Error(`amended contract names goal ${contract.goalId}`);
+    const { view } = await this.acceptance(goalId);
+    if (!view.current) throw new Error(`goal ${goalId} has no contract to amend`);
+    const to = contractHash(contract);
+    if (to === view.current) throw new Error(`goal ${goalId}: the amendment does not change contract ${to}`);
+    await this.emit('criteria.amended', payloadOf('criteria.amended', { from: view.current, to, contract, reason }), { goalId }, { actor: by ?? this.system });
+    this.throwIfStopped();
+    return to;
   }
 
   /** Publish an external fact. The projection updates and running intentions reconsider. */
@@ -546,6 +754,10 @@ export class Loop {
   async resume(requestId: string, grant: ApprovalGrant): Promise<void> {
     this.throwIfStopped();
     if (this.leaseLost()) throw new LoopStopped(this.stopped!.reason);
+    const gh = this.goalHolds.get(requestId);
+    if (gh) return this.resumeGoalHold(gh, grant);
+    const ans = this.answerReqs.get(requestId);
+    if (ans && !ans.answer) return this.resumeAnswer(ans, grant);
     const h = [...this.held.values()].find((x) => x.requestId === requestId);
     if (!h) throw new Error(`no held step for approval ${requestId}`);
     if (this.awaitingWorktree.has(h.intentionId)) throw new Error(`intention ${h.intentionId} waits for its worktree to be restored (confirmWorktreeRestored) before anything resumes`);
@@ -588,7 +800,7 @@ export class Loop {
         await this.failStep(i, plan, step, `approval ${requestId} could not be consumed: ${msgOf(err)}`, { terminal: true, failure: 'policy' });
         return;
       }
-      await this.emit('approval.consumed', { requestId, by: 'loop', approver: grant.approver as unknown as Json }, this.traceFor(i.id, step.id));
+      await this.emit('approval.consumed', { requestId, by: 'loop', approver: grant.approver as unknown as Json }, this.traceFor(i.id, step.id), { actor: this.system });
     }
     await this.execute(i.id, step, { kind: 'approved', approval });
   }
@@ -629,6 +841,9 @@ export class Loop {
     const pendingWt = new Map<string, WorktreeRequirement>();
     let deadline: number | undefined;
     let firstAt: number | undefined;
+    /** Goal-level approval requests (sign-off, capability ask), the requests a criteria.accepted names, the consumed ones. */
+    const goalReqs = new Map<string, GoalHold>();
+    const acceptedBy = new Set<string>();
     await this.openCallsPool();
     for await (const e of this.p.ledger.events({ runId: this.p.runId })) {
       const seq = (e as TeceraEvent & { seq: number }).seq;
@@ -637,6 +852,7 @@ export class Loop {
       const pl = e.payload as Record<string, unknown>;
       const iid = e.trace.intentionId;
       const sid = e.trace.stepId;
+      this.scanContract(e, goalReqs, acceptedBy);
       if (e.kind === 'run.started') {
         if (typeof pl.deadline === 'number') deadline = deadline === undefined ? pl.deadline : Math.min(deadline, pl.deadline);
       } else if (e.kind === 'goal.adopted' || e.kind === 'goal.achieved' || e.kind === 'goal.dropped' || e.kind === 'goal.demoted') {
@@ -660,12 +876,14 @@ export class Loop {
             pendingWt.set(it.id, { checkpointId: wr.checkpointId, stepId: wr.stepId, attempt: typeof wr.attempt === 'number' ? wr.attempt : it.attempt, reason: typeof wr.reason === 'string' ? wr.reason : 'worktree restore required', reset: Array.isArray(wr.reset) ? wr.reset.filter((x): x is string => typeof x === 'string') : [] });
           }
           if (e.kind === 'intention.advanced' && typeof pl.worktreeRestored === 'string' && pendingWt.get(it.id)?.checkpointId === pl.worktreeRestored) pendingWt.delete(it.id);
+          if (e.kind === 'intention.advanced' && pl.sameAttempt === true && typeof pl.retry === 'string' && typeof pl.attempt === 'number') this.noChangeRetried.add(`${heldKey(it.id, pl.retry)}#${pl.attempt}`);
         }
       } else if (e.kind.startsWith('step.') && iid && sid) {
         const k = heldKey(iid, sid);
         if (!stepEvs.has(iid)) stepEvs.set(iid, []);
         stepEvs.get(iid)!.push({ seq, kind: e.kind, stepId: sid, payload: e.payload });
         if (e.kind === 'step.started') scan.startedSeq.set(k, seq);
+        if (e.kind === 'step.started' && typeof pl.baseline === 'string') this.stepBaseline.set(k, pl.baseline);
         if (e.kind === 'step.failed') scan.failedPayload.set(k, e.payload);
         if (e.kind === 'step.held' && typeof pl.requestId === 'string') {
           if (!scan.heldEvents.has(k)) scan.heldEvents.set(k, []);
@@ -687,6 +905,7 @@ export class Loop {
       if ((e.kind === 'verify.passed' || e.kind === 'verify.failed') && iid) {
         if (typeof pl.fingerprint === 'string') this.verifyFp.set(iid, pl.fingerprint);
         const attempt = typeof pl.attempt === 'number' ? pl.attempt : (attemptNow.get(iid) ?? 1);
+        if (typeof pl.exitCode === 'number') this.lastVerify.set(iid, { exitCode: pl.exitCode, passed: e.kind === 'verify.passed', attempt });
         this.recordAttemptFp(iid, attempt, typeof pl.fingerprint === 'string' ? pl.fingerprint : null, typeof pl.workerExec === 'number' ? pl.workerExec : undefined);
       } else if ((e.kind === 'review.passed' || e.kind === 'review.rejected') && iid) {
         if (typeof pl.fingerprint === 'string') this.reviewFp.set(iid, pl.fingerprint);
@@ -731,8 +950,29 @@ export class Loop {
       this.cpState.set(i.id, cp);
     }
 
-    // Recover every unfinished step of every active intention.
+    // Goal-level holds still open: a sign-off not yet turned into criteria.accepted, a capability ask not consumed.
+    for (const h of goalReqs.values()) {
+      if (h.kind === 'signoff' && acceptedBy.has(h.requestId)) continue;
+      if (h.kind === 'ask' && h.consumedRecorded) continue;
+      this.goalHolds.set(h.requestId, h);
+    }
     const notes: RecoveryNote[] = [];
+    // D8: an intention planned for a contract that is no longer the accepted one (amended before the restart)
+    // never runs again: it is dropped, and its goal holds for a sign-off of the new contract (below).
+    for (const g of this.contractual) await this.acceptance(g);
+    for (const snap of [...this.intentions.all()]) {
+      if (this.stopped || !this.isActive(snap)) continue;
+      const stale = this.contractStale(snap);
+      if (!stale) continue;
+      for (const k of [...this.held.keys()]) if (k.startsWith(`${snap.id}:`)) this.held.delete(k);
+      this.awaitingWorktree.delete(snap.id);
+      const dropped = clearHold({ ...snap, status: 'dropped' });
+      this.intentions.update(dropped);
+      await this.emit('intention.dropped', { intention: dropped as unknown as Json, cause: 'criteria.amended', reason: stale, recovered: true }, this.traceFor(snap.id));
+      notes.push({ intentionId: snap.id, stepId: '', kind: 'goal', goalId: snap.goalId, action: 'dropped', reason: stale });
+    }
+
+    // Recover every unfinished step of every active intention.
     for (const snap of [...this.intentions.all()]) {
       if (this.stopped) break;
       if (!this.isActive(snap)) continue;
@@ -774,10 +1014,22 @@ export class Loop {
         notes.push({ intentionId: snap.id, stepId: pend.stepId, kind: plan.steps.find((s) => s.id === pend.stepId)?.kind ?? 'worker', action: 'restore-worktree', reason: `worktree restore to ${pend.checkpointId} still unconfirmed` });
       }
     }
-    // A goal adopted but never planned (the process died while deliberating): deliberate again.
+    // A goal adopted but never planned (the process died while deliberating, or holds for a sign-off or a
+    // capability, or its intention was dropped and not yet replaced): deliberate again. A live hold is kept as
+    // it is (no new events); a contract goal whose intention is done with every human answer in is settled again.
     for (const goal of [...this.goals.values()]) {
       if (this.stopped || goal.status !== 'open') continue;
-      if (this.intentions.all().some((x) => x.goalId === goal.id)) continue;
+      const mine = this.intentions.all().filter((x) => x.goalId === goal.id);
+      const done = mine.find((x) => x.status === 'done');
+      if (done && this.contractual.has(goal.id) && !goal.provisional) {
+        // Every human answer in, or one denied: settle again (achieved, provisional, or dropped on a 'no').
+        const asked = [...this.answerReqs.values()].filter((a) => a.goalId === goal.id);
+        let denied = false;
+        for (const a of asked) if (!a.answer && (await requireApproval(this.p.ledger, a.requestId).catch(() => null))?.state === 'denied') denied = true;
+        if (asked.length && (denied || asked.every((a) => a.answer))) await this.settleGoal(done, this.intentions.planOf(done.id));
+        continue;
+      }
+      if (mine.some((x) => x.status !== 'dropped')) continue;
       if (await this.deadlineStops()) {
         await this.dropGoal(goal, 'budget: run deadline exceeded', undefined, { terminal: true, failure: 'budget' });
         notes.push({ intentionId: '', stepId: '', kind: 'goal', goalId: goal.id, action: 'failed', reason: 'run deadline exceeded' });
@@ -785,10 +1037,59 @@ export class Loop {
       }
       const adopted = await this.lastEvent('goal.adopted', goal.id);
       if (!adopted) continue;
-      notes.push({ intentionId: '', stepId: '', kind: 'goal', goalId: goal.id, action: 're-deliberate', reason: 'goal adopted but never planned' });
+      const waiting = [...this.goalHolds.values()].find((h) => h.goalId === goal.id);
+      notes.push({ intentionId: '', stepId: '', kind: 'goal', goalId: goal.id, action: waiting ? 'held' : 're-deliberate', reason: waiting ? `${waiting.kind === 'signoff' ? 'criteria sign-off' : 'capability'} approval ${waiting.requestId}` : 'goal adopted but never planned' });
       await this.deliberate(goal, adopted);
     }
     return { ...this.status(), recovered: notes };
+  }
+
+  /** restore(): the acceptance-contract state one event carries (contract goals, holds, answers, proofs, outputs). */
+  private scanContract(e: TeceraEvent, goalReqs: Map<string, GoalHold>, acceptedBy: Set<string>): void {
+    const pl = e.payload as Record<string, unknown>;
+    const gid = e.trace.goalId;
+    const iid = e.trace.intentionId;
+    const sid = e.trace.stepId;
+    if (e.kind === 'goal.adopted' && gid) {
+      const g = pl.goal as Partial<AchievementGoal> | undefined;
+      if (pl.draftContract === true) {
+        this.drafting.add(gid);
+        this.contractual.add(gid);
+      }
+      if ((Array.isArray(g?.criteria) && g!.criteria.length) || typeof g?.contractHash === 'string') this.contractual.add(gid);
+      if (pl.contract && typeof pl.contract === 'object' && contractProblem(pl.contract) === null) this.fileContracts.set(gid, pl.contract as unknown as AcceptanceContract);
+    } else if ((e.kind === 'criteria.drafted' || e.kind === 'criteria.amended' || e.kind === 'criteria.accepted') && gid) {
+      this.contractual.add(gid);
+      if (e.kind === 'criteria.accepted' && typeof pl.requestId === 'string') acceptedBy.add(pl.requestId);
+    } else if (e.kind === 'intention.pushed' && typeof pl.contractHash === 'string') {
+      const it = pl.intention as { id?: unknown } | undefined;
+      if (typeof it?.id === 'string') this.intentionContract.set(it.id, pl.contractHash);
+    } else if (e.kind === 'approval.requested' && typeof pl.requestId === 'string' && typeof pl.actionHash === 'string' && gid && iid && sid) {
+      if (pl.action === ACCEPT_CRITERIA_ACTION || pl.action === PROVIDE_CAPABILITY_ACTION) {
+        goalReqs.set(pl.requestId, {
+          kind: pl.action === ACCEPT_CRITERIA_ACTION ? 'signoff' : 'ask',
+          goalId: gid,
+          requestId: pl.requestId,
+          actionHash: pl.actionHash,
+          trace: { goalId: gid, intentionId: iid, stepId: sid },
+          ...(typeof pl.contractHash === 'string' ? { contractHash: pl.contractHash } : {}),
+          ...(Array.isArray(pl.capabilities) ? { capabilities: pl.capabilities.filter((x): x is string => typeof x === 'string') } : {}),
+        });
+      } else if (pl.action === ANSWER_CRITERION_ACTION && typeof pl.criterionId === 'string' && typeof pl.contractHash === 'string' && typeof pl.fingerprint === 'string') {
+        this.answerReqs.set(pl.requestId, { goalId: gid, intentionId: iid, criterionId: pl.criterionId, requestId: pl.requestId, actionHash: pl.actionHash, contractHash: pl.contractHash, fingerprint: pl.fingerprint, trace: { goalId: gid, intentionId: iid, ...(e.trace.planId ? { planId: e.trace.planId } : {}), stepId: sid } });
+      }
+    } else if (e.kind === 'approval.consumed' && typeof pl.requestId === 'string') {
+      const h = goalReqs.get(pl.requestId);
+      if (h) h.consumedRecorded = true;
+      const a = this.answerReqs.get(pl.requestId);
+      const ap = pl.approver as { kind?: unknown; id?: unknown } | undefined;
+      if (a && ap?.kind === 'human' && typeof ap.id === 'string') a.answer = { criterionId: a.criterionId, approver: { kind: 'human', id: ap.id }, verdict: 'yes', requestId: a.requestId, answeredAt: e.at };
+    } else if ((e.kind === 'verify.passed' || e.kind === 'verify.failed') && iid) {
+      if (e.kind === 'verify.passed' && typeof pl.fingerprint === 'string') this.criterionProofs.set(iid, { fingerprint: pl.fingerprint, proofs: Array.isArray(pl.criteria) ? (pl.criteria as unknown as CriterionProof[]) : [] });
+      else this.criterionProofs.delete(iid);
+    } else if (e.kind === 'step.completed' && iid && sid && pl.output !== undefined) {
+      this.stepOutputs.set(heldKey(iid, sid), pl.output as Json);
+    }
   }
 
   status(): LoopStatus {
@@ -798,7 +1099,11 @@ export class Loop {
       ...(this.stopped?.failure ? { failure: this.stopped.failure } : {}),
       goals: [...this.goals.values()],
       intentions: this.intentions.all(),
-      held: [...this.held.values()].map(({ intentionId, stepId, requestId }) => ({ intentionId, stepId, requestId })),
+      held: [
+        ...[...this.goalHolds.values()].filter((h) => this.goals.get(h.goalId)?.status === 'open').map((h) => ({ intentionId: h.trace.intentionId, stepId: h.trace.stepId, requestId: h.requestId })),
+        ...[...this.held.values()].map(({ intentionId, stepId, requestId }) => ({ intentionId, stepId, requestId })),
+        ...[...this.answerReqs.values()].filter((a) => !a.answer && this.goals.get(a.goalId)?.status === 'open').map((a) => ({ intentionId: a.intentionId, stepId: a.trace.stepId, requestId: a.requestId })),
+      ],
       deadline: this.deadline,
       dispatchable: this.dispatchable().length,
       ...(this.awaitingWorktree.size ? { requiredWorktreeState: Object.fromEntries([...this.awaitingWorktree].map(([k, v]) => [k, { ...v, reset: [...v.reset] }])) } : {}),
@@ -1055,7 +1360,7 @@ export class Loop {
     }
     // consumed
     if (owner === 'loop') {
-      if (!scan.consumedEv.has(view.requestId)) await this.emit('approval.consumed', { requestId: view.requestId, by: 'loop', recovered: true }, this.traceFor(intentionId, step.id));
+      if (!scan.consumedEv.has(view.requestId)) await this.emit('approval.consumed', { requestId: view.requestId, by: 'loop', recovered: true }, this.traceFor(intentionId, step.id), { actor: this.system });
       this.preApproved.set(k, { requestId: view.requestId, sessionId: view.sessionId, actionHash: view.actionHash });
       await this.requeue(intentionId, step, { approved: view.requestId });
       note('approved', `approval ${view.requestId} was consumed by the loop before the step started`);
@@ -1226,7 +1531,7 @@ export class Loop {
     const p = scan.failedPayload.get(heldKey(intentionId, step.id)) ?? {};
     const reason = typeof p.reason === 'string' ? p.reason : 'step failed before the restart';
     const failure = p.failure === 'budget' || p.failure === 'human' || p.failure === 'policy' ? p.failure : undefined;
-    await this.failStep(this.intentions.get(intentionId)!, plan, step, reason, { terminal: p.terminal === true, blocked: p.blocked === true, ...(failure ? { failure } : {}), recorded: true });
+    await this.failStep(this.intentions.get(intentionId)!, plan, step, reason, { terminal: p.terminal === true, blocked: p.blocked === true, ...(failure ? { failure } : {}), ...(p.noChange === true ? { noChange: true } : {}), recorded: true });
     notes.push({ intentionId, stepId: step.id, kind: step.kind, action: 'failed', reason });
   }
 
@@ -1255,16 +1560,44 @@ export class Loop {
       if (goal) await this.deliberate(goal, e);
       return;
     }
+    if (e.kind === 'criteria.amended' && e.trace.goalId) {
+      await this.onAmended(e.trace.goalId, e);
+      return;
+    }
     if (e.kind === 'belief.added' || e.kind === 'belief.removed' || e.kind === 'goal.dropped') {
       await this.triageAndReconsider(e);
     }
   }
 
+  /**
+   * criteria.amended: the accepted contract no longer stands. Every running intention of the goal is
+   * reconsidered (an amended contract interrupts under any commitment) and dropped, and the goal holds for a
+   * sign-off of the new contract; it is re-planned only after that (the dispatch guard backs this up).
+   */
+  private async onAmended(goalId: string, e: TeceraEvent): Promise<void> {
+    this.contractual.add(goalId);
+    this.acceptedHash.delete(goalId);
+    const goal = this.goals.get(goalId);
+    if (!goal || goal.status !== 'open') return;
+    let interrupted = false;
+    for (const i of this.intentions.active().filter((x) => x.goalId === goalId)) {
+      const r = await this.ask('reconsider', { state: { commitment: i.commitment, eventKind: e.kind, invalidatesContext: false, goalChanged: true, contractChanged: true } });
+      if (r.answer.interrupt) {
+        await this.interrupt(i, e.kind);
+        interrupted = true;
+      }
+    }
+    if (!interrupted && !this.intentions.active().some((x) => x.goalId === goalId)) {
+      const adopted = await this.lastEvent('goal.adopted', goalId);
+      if (adopted) await this.deliberate(goal, adopted);
+    }
+  }
+
   /** Library plans are re-validated against the goal before use; invalid ones are rejected, never run. */
-  private async validOptions(goal: AchievementGoal, matched: Plan[]): Promise<Plan[]> {
+  private async validOptions(goal: AchievementGoal, matched: Plan[], ctx?: PlanningContext): Promise<Plan[]> {
     const ok: Plan[] = [];
     for (const plan of matched) {
-      const errors = this.validate(plan, goal);
+      const errors = this.validate(plan, goal, ctx);
       if (errors.length) {
         await this.emit('plan.rejected', { plan: plan as unknown as Json, errors, reused: true }, { goalId: goal.id, planId: plan.id });
         continue;
@@ -1274,9 +1607,15 @@ export class Loop {
     return ok;
   }
 
-  private validate(plan: Plan, goal: AchievementGoal): string[] {
+  /**
+   * Shape, then the validator (with the planning context under a contract). Under a contract the loop itself
+   * also refuses a plan written for another contract hash.
+   */
+  private validate(plan: Plan, goal: AchievementGoal, ctx?: PlanningContext): string[] {
     try {
-      return [...validatePlanShape(plan), ...this.p.validator.validatePlan(plan, this.p.manifest, goal)];
+      const own: string[] = [];
+      if (ctx?.contractHash !== undefined && plan.contractHash !== undefined && plan.contractHash !== ctx.contractHash) own.push(`plan ${plan.id} was written for contract ${plan.contractHash}, not the accepted ${ctx.contractHash}`);
+      return [...validatePlanShape(plan), ...own, ...(ctx ? this.p.validator.validatePlan(plan, this.p.manifest, goal, ctx) : this.p.validator.validatePlan(plan, this.p.manifest, goal))];
     } catch (err) {
       return [`plan validation failed: ${msgOf(err)}`];
     }
@@ -1344,11 +1683,18 @@ export class Loop {
 
   private async deliberate(goal: AchievementGoal, e: TeceraEvent): Promise<void> {
     try {
-      let options = await this.validOptions(goal, await this.p.library.match(e, this.beliefs));
+      // D8: under a contract nothing is planned before criteria.accepted for its current hash.
+      let ctx: PlanningContext | undefined;
+      if (this.contractual.has(goal.id)) {
+        const gated = await this.contractGate(goal);
+        if (!gated) return;
+        ctx = gated;
+      }
+      let options = await this.validOptions(goal, await this.p.library.match(e, this.beliefs), ctx);
       if (options.length === 0) {
         let plan: Plan;
         try {
-          plan = await this.metered('planner.write', (meter) => this.p.planner.write(e, this.beliefs, goal, meter));
+          plan = await this.metered('planner.write', (meter) => (ctx ? this.p.planner.write(e, this.beliefs, goal, meter, ctx) : this.p.planner.write(e, this.beliefs, goal, meter)));
         } catch (err) {
           if (err instanceof LoopStopped || this.stopped) throw err;
           if (isBudgetError(err)) {
@@ -1369,7 +1715,7 @@ export class Loop {
           return;
         }
         const planId = plan && typeof plan === 'object' && typeof plan.id === 'string' && plan.id ? plan.id : `p_invalid_${goal.id}`;
-        const errors = this.validate(plan, goal);
+        const errors = this.validate(plan, goal, ctx);
         if (errors.length) {
           await this.emit('plan.rejected', { plan: plan as unknown as Json, errors }, { goalId: goal.id, planId });
           await this.dropGoal(goal, 'generated plan rejected', errors);
@@ -1405,15 +1751,522 @@ export class Loop {
         // Deliberation may only pick among validated options.
         chosen = options.find((o) => o.id === d?.id) ?? chosen;
       }
+      if (ctx) {
+        // Capabilities the plan names beyond the contract's needs are resolved before anything dispatches.
+        const extra = (chosen.capabilities ?? []).filter((id) => (ctx.inventory?.find((r) => r.id === id)?.state ?? 'missing') === 'missing');
+        if (extra.length && !(await this.capabilitiesReady(goal, ctx.contract!, extra))) return;
+      }
       const intention = newIntention({ id: this.ids(), goalId: goal.id, plan: chosen, commitment: goal.commitment });
       this.intentions.add(intention, chosen);
-      await this.emit('intention.pushed', { intention: intention as unknown as Json }, this.traceFor(intention.id));
+      if (ctx?.contractHash) this.intentionContract.set(intention.id, ctx.contractHash);
+      await this.emit('intention.pushed', { intention: intention as unknown as Json, ...(ctx?.contractHash ? { contractHash: ctx.contractHash } : {}) }, this.traceFor(intention.id));
     } catch (err) {
       if (err instanceof LoopStopped || this.stopped) throw err;
       if (isBudgetError(err)) await this.dropGoal(goal, `budget: ${msgOf(err)}`, undefined, { terminal: true, failure: 'budget' });
       else if (isAccountingBroken(err)) await this.terminateAccounting(msgOf(err), { goal });
       else await this.dropGoal(goal, `deliberation failed: ${msgOf(err)}`);
     }
+  }
+
+  // ---------- acceptance contracts and capabilities (D8–D12) ----------
+
+  /** Every event of this run. */
+  private async runEvents(): Promise<TeceraEvent[]> {
+    const out: TeceraEvent[] = [];
+    for await (const e of this.p.ledger.events({ runId: this.p.runId })) out.push(e);
+    return out;
+  }
+
+  /** Options every inventory / registry fold of this run uses: the manifest allowance and the known secrets. */
+  private get foldOptions(): { runId: string; allowance: ProvisioningAllowance; secrets?: (value: string) => boolean } {
+    return { runId: this.p.runId, allowance: this.allowance, ...(this.p.secrets ? { secrets: this.p.secrets } : {}) };
+  }
+
+  /**
+   * The goal's contract as the ledger has it (acceptedContractOf; requireApproval under signoff 'always') and
+   * the capability needs its drafts named. Keeps acceptedHash in step with the ledger.
+   */
+  private async acceptance(goalId: string): Promise<{ view: AcceptanceView; events: TeceraEvent[] }> {
+    const events = await this.runEvents();
+    let view = acceptedContractOf(events, goalId, { runId: this.p.runId, ...(this.signoffAlways ? { requireApproval: true } : {}) });
+    // The events rebuild the sign-off; the approvals table is its authority. A sign-off whose request the
+    // table does not hold as granted (or consumed) by that same human accepts nothing, however well formed
+    // its appended events are.
+    const row = view.state === 'accepted' && view.accepted?.via === 'approval' ? await this.signoffRowProblem(view.accepted) : null;
+    if (row) view = { goalId, state: 'drafted', ...(view.current ? { current: view.current } : {}), ...(view.contract ? { contract: view.contract } : {}), problems: [...view.problems, row] };
+    const needs = new Map<string, CapabilityNeed>();
+    for (const e of ledgerOrder(events, this.p.runId)) {
+      if (e.kind !== 'criteria.drafted' || e.trace.goalId !== goalId) continue;
+      const list = (e.payload as { needs?: unknown }).needs;
+      if (Array.isArray(list)) for (const n of list as unknown[]) if (n && typeof n === 'object' && typeof (n as CapabilityNeed).id === 'string' && typeof (n as CapabilityNeed).kind === 'string') needs.set((n as CapabilityNeed).id, n as CapabilityNeed);
+    }
+    this.goalNeeds.set(goalId, needs);
+    if (view.state === 'accepted' && view.accepted) this.acceptedHash.set(goalId, view.accepted.hash);
+    else this.acceptedHash.delete(goalId);
+    return { view, events };
+  }
+
+  /** Why the approvals table does not back an approval sign-off (null when it does). */
+  private async signoffRowProblem(a: AcceptedContract): Promise<string | null> {
+    if (!a.requestId) return `criteria.accepted ${a.eventId} names no sign-off request`;
+    let row: Awaited<ReturnType<Ledger['getApproval']>> = null;
+    try {
+      row = await this.p.ledger.getApproval(a.requestId);
+    } catch (e) {
+      return `criteria.accepted ${a.eventId}: the sign-off ${a.requestId} could not be read from the approvals table (${(e as Error).message})`;
+    }
+    if (!row || (row.state !== 'granted' && row.state !== 'consumed')) return `criteria.accepted ${a.eventId}: the approvals table holds sign-off ${a.requestId} as ${row?.state ?? 'absent'}, not granted`;
+    if (row.approver?.kind !== 'human' || (a.approver && (a.approver.kind !== row.approver.kind || a.approver.id !== row.approver.id))) return `criteria.accepted ${a.eventId}: sign-off ${a.requestId} was not granted by the human the events name`;
+    return null;
+  }
+
+  /**
+   * D8 before planning: draft the contract when there is none (the planner for a statement, the file for a goal
+   * file); a goal file accepts its own contract under signoff 'statement' (criteria.accepted via 'goal-file', by
+   * Tecera); anything else holds for a human sign-off. Once accepted, the capabilities its criteria require are
+   * resolved (D9/D10). Returns the planning context, or null when the goal holds or was dropped.
+   */
+  private async contractGate(goal: AchievementGoal): Promise<PlanningContext | null> {
+    let { view } = await this.acceptance(goal.id);
+    if (view.state === 'none') {
+      if (!(await this.draftContract(goal))) return null;
+      ({ view } = await this.acceptance(goal.id));
+      if (view.state === 'none') {
+        await this.dropGoal(goal, 'the drafted contract was not recorded', view.problems, { terminal: true, failure: 'policy' });
+        return null;
+      }
+    }
+    if (view.state === 'drafted' && !this.signoffAlways && goal.contractHash !== undefined && view.current === goal.contractHash) {
+      await this.emit('criteria.accepted', payloadOf('criteria.accepted', { hash: view.current, via: 'goal-file' }), { goalId: goal.id }, { actor: this.system });
+      ({ view } = await this.acceptance(goal.id));
+    }
+    if (view.state !== 'accepted' || !view.accepted) return this.holdForSignoff(goal, view);
+    const { contract, hash } = view.accepted;
+    const ids = [...new Set(contract.criteria.flatMap((k) => k.requires ?? []))];
+    if (ids.length && !(await this.capabilitiesReady(goal, contract, ids))) return null;
+    const events = await this.runEvents();
+    return { contract, contractHash: hash, inventory: capabilityInventoryOf(events, this.foldOptions).records, allowance: this.allowance, provisionedSoFar: resourceRegistryOf(events, this.foldOptions).resources.length };
+  }
+
+  /** criteria.drafted for a goal without a contract yet: the goal file's, or the planner's draft of the statement. False when the goal was dropped. */
+  private async draftContract(goal: AchievementGoal): Promise<boolean> {
+    const file = this.fileContracts.get(goal.id) ?? (goal.criteria?.length ? { goalId: goal.id, statement: goal.statement, criteria: goal.criteria, outOfScope: [], assumptions: [] } : undefined);
+    if (file) {
+      const needs = this.fileNeeds(file);
+      await this.emit('criteria.drafted', payloadOf('criteria.drafted', { contract: file, hash: contractHash(file), needs, source: 'goal-file' }), { goalId: goal.id });
+      return true;
+    }
+    if (!this.drafting.has(goal.id)) {
+      await this.dropGoal(goal, 'the goal is held to an acceptance contract but none was drafted or given', undefined, { terminal: true, failure: 'policy' });
+      return false;
+    }
+    const drafter = this.p.planner.draftContract?.bind(this.p.planner);
+    if (!drafter) {
+      await this.dropGoal(goal, 'the planner cannot draft an acceptance contract (no draftContract): a statement run needs one', undefined, { terminal: true, failure: 'policy' });
+      return false;
+    }
+    let draft: ContractDraft;
+    try {
+      const events = await this.runEvents();
+      draft = await this.metered('planner.draftContract', (meter) => drafter(goal.statement, goal, capabilityInventoryOf(events, this.foldOptions).records, meter));
+    } catch (err) {
+      if (err instanceof LoopStopped || this.stopped || isBudgetError(err) || isAccountingBroken(err)) throw err;
+      await this.dropGoal(goal, `contract drafting failed: ${msgOf(err)}`);
+      return false;
+    }
+    const why = contractProblem(draft?.contract) ?? (draft.contract.goalId !== goal.id ? `the draft names goal ${draft.contract.goalId}` : null) ?? (Array.isArray(draft.needs) ? null : 'the draft lists no capability needs');
+    if (why) {
+      await this.dropGoal(goal, `drafted contract refused: ${why}`, [why]);
+      return false;
+    }
+    await this.emit('criteria.drafted', payloadOf('criteria.drafted', { contract: draft.contract, hash: contractHash(draft.contract), needs: draft.needs, source: 'planner' }), { goalId: goal.id });
+    return true;
+  }
+
+  /** The capability needs of a goal file's contract: declared connections give kind and mockable; anything else is unknown. */
+  private fileNeeds(c: AcceptanceContract): CapabilityNeed[] {
+    const ids = [...new Set(c.criteria.flatMap((k) => k.requires ?? []))];
+    return ids.map((id) => {
+      const conn = this.p.manifest.connections[id];
+      return { id, kind: conn?.kind ?? 'unknown', criteria: c.criteria.filter((k) => k.requires?.includes(id)).map((k) => k.id), mockable: conn ? conn.mockable : false };
+    });
+  }
+
+  /**
+   * Hold the goal for a sign-off of the current contract (an accept_criteria approval bound to its hash; Tecera
+   * requests, a human other than it grants, the loop consumes). Idempotent: a live request for this hash is kept
+   * (no new events); one for a superseded hash no longer counts; a consumed one (a restart between consumption
+   * and criteria.accepted) is finished; a denied one drops the goal; an expired one is replaced.
+   */
+  private async holdForSignoff(goal: AchievementGoal, view: AcceptanceView): Promise<PlanningContext | null> {
+    const hash = view.current!;
+    for (const h of [...this.goalHolds.values()]) {
+      if (h.kind !== 'signoff' || h.goalId !== goal.id) continue;
+      this.goalHolds.delete(h.requestId);
+      if (h.contractHash !== hash) continue;
+      const v = await requireApproval(this.p.ledger, h.requestId).catch(() => null);
+      if (v && (v.state === 'pending' || v.state === 'granted') && v.expiresAt > this.now()) {
+        this.goalHolds.set(h.requestId, h);
+        return null;
+      }
+      if (v?.state === 'consumed' && v.approver) {
+        await this.goalHoldConsumed(goal, h, v.approver, v.sessionId, h.consumedRecorded === true);
+        return this.contractGate(goal);
+      }
+      if (v?.state === 'denied') {
+        await this.dropGoal(goal, `the requestor did not accept contract ${hash}`, undefined, { terminal: true, failure: 'human' });
+        return null;
+      }
+      if (v) await this.emit('approval.expired', { requestId: h.requestId, recovered: true }, h.trace);
+    }
+    const n = view.contract?.criteria.length ?? 0;
+    await this.requestGoalHold({ kind: 'signoff', goalId: goal.id, actionHash: acceptCriteriaActionHash({ goalId: goal.id, runId: this.p.runId, contractHash: hash }), trace: signoffTrace(goal.id), contractHash: hash }, `${ACCEPT_CRITERIA_ACTION} ${goal.id}: accept the acceptance contract ${hash} (${n} criteria) before work starts`, { contractHash: hash });
+    return null;
+  }
+
+  /** Request a goal-level hold: the ledger approval (Tecera requests), then approval.requested on the hold's trace. */
+  private async requestGoalHold(h: Omit<GoalHold, 'requestId'>, reason: string, extra: JsonObject): Promise<void> {
+    const requestId = `ap_${this.ids()}`;
+    await this.requestLoopApproval(requestId, h.actionHash, reason);
+    this.goalHolds.set(requestId, { ...h, requestId });
+    await this.emit('approval.requested', { requestId, actionHash: h.actionHash, sessionId: this.sessionId, action: h.kind === 'signoff' ? ACCEPT_CRITERIA_ACTION : PROVIDE_CAPABILITY_ACTION, owner: 'loop', ...extra }, h.trace, { actor: this.system });
+  }
+
+  /** A loop-owned approval with Tecera as the requester: only a human other than it can grant it. */
+  private async requestLoopApproval(requestId: string, actionHash: string, reason: string): Promise<void> {
+    const redacted = this.p.redact ? this.p.redact(reason) : reason;
+    try {
+      await this.p.ledger.requestApproval({ requestId, runId: this.p.runId, sessionId: this.sessionId, actionHash, requester: this.system, reason: typeof redacted === 'string' ? redacted : String(redacted), expiresAt: this.now() + this.p.manifest.policy.approvals.ttlSec * 1000 });
+    } catch (err) {
+      this.stop(`ledger refused approval request ${requestId}: ${msgOf(err)}`);
+      throw new LoopStopped(this.stopped!.reason);
+    }
+  }
+
+  /** Record a consumed goal-level grant (approval.consumed by Tecera) and, for a sign-off, criteria.accepted. */
+  private async goalHoldConsumed(goal: AchievementGoal, h: GoalHold, approver: Principal, sessionId: string, consumedRecorded: boolean): Promise<void> {
+    if (!consumedRecorded) await this.emit('approval.consumed', { requestId: h.requestId, actionHash: h.actionHash, sessionId, by: 'loop', approver: { kind: approver.kind, id: approver.id } }, h.trace, { actor: this.system });
+    if (h.kind === 'signoff' && h.contractHash) {
+      await this.emit('criteria.accepted', payloadOf('criteria.accepted', { hash: h.contractHash, via: 'approval', requestId: h.requestId, approver: { kind: approver.kind, id: approver.id } }), { goalId: goal.id }, { actor: this.system });
+    }
+  }
+
+  /**
+   * The checks every loop-consumed grant passes (state granted, unexpired, same session, same action, same
+   * approver). An expired approval runs `onExpired` and throws ApprovalExpired.
+   */
+  private async grantedView(requestId: string, actionHash: string, grant: ApprovalGrant, onExpired: (v: ApprovalView) => Promise<void>): Promise<ApprovalView> {
+    if (grant.requestId !== requestId) throw new Error(`grant is for ${grant.requestId}, not ${requestId}`);
+    const view = await requireApproval(this.p.ledger, requestId);
+    if (!view) throw new Error(`approval ${requestId} is unknown to the ledger`);
+    if (view.state === 'expired' || ((view.state === 'granted' || view.state === 'pending') && view.expiresAt <= this.now())) {
+      await onExpired(view);
+      throw new ApprovalExpired(requestId);
+    }
+    if (view.state !== 'granted') throw new Error(`approval ${requestId} is ${view.state}, not granted`);
+    if (view.sessionId !== this.sessionId) throw new Error(`approval ${requestId} belongs to another session`);
+    if (view.actionHash !== actionHash) throw new Error(`approval ${requestId} is bound to a different action`);
+    if (view.approver && (view.approver.kind !== grant.approver.kind || view.approver.id !== grant.approver.id)) throw new Error(`grant approver does not match the ledger for ${requestId}`);
+    return view;
+  }
+
+  /** Resume a sign-off (criteria.accepted, then planning) or a capability ask (re-probe, then planning). */
+  private async resumeGoalHold(h: GoalHold, grant: ApprovalGrant): Promise<void> {
+    const goal = this.goals.get(h.goalId);
+    if (!goal || goal.status !== 'open') throw new Error(`goal ${h.goalId} is not open`);
+    const view = await this.grantedView(h.requestId, h.actionHash, grant, async (v) => {
+      this.goalHolds.delete(h.requestId);
+      await this.emit('approval.expired', { requestId: v.requestId }, h.trace);
+      const adopted = await this.lastEvent('goal.adopted', goal.id);
+      if (adopted) await this.deliberate(goal, adopted);
+    });
+    if (h.kind === 'signoff') {
+      const { view: acc } = await this.acceptance(goal.id);
+      if (acc.current !== h.contractHash) throw new Error(`approval ${h.requestId} signs off contract ${h.contractHash}; the current contract is ${acc.current ?? 'none'}`);
+    }
+    try {
+      await this.p.ledger.consume(h.requestId, h.actionHash, view.sessionId, `consume:${h.requestId}`, this.now());
+    } catch (err) {
+      throw new Error(`approval ${h.requestId} could not be consumed: ${msgOf(err)}`);
+    }
+    this.goalHolds.delete(h.requestId);
+    await this.goalHoldConsumed(goal, h, view.approver ?? grant.approver, view.sessionId, false);
+    const adopted = await this.lastEvent('goal.adopted', goal.id);
+    if (adopted) await this.deliberate(goal, adopted);
+    this.throwIfStopped();
+  }
+
+  /**
+   * D9/D10: resolve each capability the goal's work needs before anything dispatches. A declared connection is
+   * probed for real (capability.probed); a missing one goes down the gap ladder (resolveGap): provisioned in
+   * Tecera's own space (resource.provisioned), served by a stand-in (capability.missing 'mock'; the broker
+   * records capability.mocked on first use), or asked of the requestor (capability.missing 'ask' and a
+   * provide_capability hold). The loop never records a capability it did not probe or provision. False when the goal holds.
+   */
+  private async capabilitiesReady(goal: AchievementGoal, contract: AcceptanceContract, ids: readonly string[]): Promise<boolean> {
+    const asked: string[] = [];
+    for (const id of ids) if ((await this.resolveCapability(goal, contract, id)) === 'ask') asked.push(id);
+    if (!asked.length) return true;
+    await this.holdForCapabilities(goal, asked);
+    return false;
+  }
+
+  private async resolveCapability(goal: AchievementGoal, contract: AcceptanceContract, id: string): Promise<GapResolution> {
+    const events = await this.runEvents();
+    const known = capabilityInventoryOf(events, this.foldOptions).byId[id];
+    if (known?.state === 'available') return 'use';
+    if (known?.state === 'provisioned') return 'provision';
+    const last = lastResolution(events, id);
+    if (known?.state === 'mocked' || last === 'mock') return 'mock';
+    // Already asked and the requestor has not answered yet: the same hold stands (nothing is recorded again).
+    if (last === 'ask' && [...this.goalHolds.values()].some((h) => h.kind === 'ask' && h.goalId === goal.id && h.capabilities?.includes(id))) return 'ask';
+    const conn = this.p.manifest.connections[id];
+    const need = this.goalNeeds.get(goal.id)?.get(id);
+    const kind = conn?.kind ?? need?.kind ?? 'unknown';
+    // An undeclared need nobody described may not be stood in for: the loop never invents a capability.
+    const mockable = conn ? conn.mockable : (need?.mockable ?? false);
+    const criteria = contract.criteria.filter((k) => k.requires?.includes(id)).map((k) => k.id);
+    const trace = { goalId: goal.id };
+    if (conn && this.p.probe) {
+      const rec = await this.probeCapability(id, kind);
+      await this.emit('capability.probed', payloadOf('capability.probed', { capability: rec }), trace);
+      if (rec.state === 'available') return 'use';
+    }
+    const allowance = this.allowance;
+    let kinds: string[] = [];
+    try {
+      kinds = this.p.provisioner ? allowance.kinds.filter((k) => this.p.provisioner!.kinds().includes(k)) : [];
+    } catch {
+      kinds = [];
+    }
+    const soFar = resourceRegistryOf(events, this.foldOptions).resources.length;
+    let resolution = resolveGap({ kind, available: false, mockable }, { ...allowance, kinds }, soFar);
+    await this.emit('capability.missing', payloadOf('capability.missing', { capability: { id, kind, state: 'missing' }, criteria, resolution }), trace);
+    if (resolution === 'provision') {
+      const why = await this.provision(goal, id, kind);
+      if (why) {
+        resolution = mockable ? 'mock' : 'ask';
+        await this.emit('capability.missing', { ...payloadOf('capability.missing', { capability: { id, kind, state: 'missing' }, criteria, resolution }), reason: `provisioning failed: ${why}` }, trace);
+      }
+    }
+    return resolution;
+  }
+
+  /** Probe one declared connection. Only a probe that ran a command to exit 0 makes it available. */
+  private async probeCapability(id: string, kind: string): Promise<CapabilityRecord> {
+    let r: CapabilityRecord;
+    try {
+      r = await this.p.probe!.probe(id);
+    } catch {
+      return { id, kind, state: 'missing' };
+    }
+    const probe = r && r.probe && typeof r.probe.command === 'string' && r.probe.command.trim() && typeof r.probe.exitCode === 'number' ? { command: r.probe.command, exitCode: r.probe.exitCode } : undefined;
+    const available = r?.id === id && r.state === 'available' && probe?.exitCode === 0;
+    return { id, kind: typeof r?.kind === 'string' && r.kind ? r.kind : kind, state: available ? 'available' : 'missing', ...(probe ? { probe } : {}) };
+  }
+
+  /** Provision `id` inside the allowance; null on success, else why (an unrecordable resource is torn down at once). */
+  private async provision(goal: AchievementGoal, id: string, kind: string): Promise<string | null> {
+    let r: ProvisionedResource;
+    try {
+      r = await this.p.provisioner!.provision({ capability: id, kind, goalId: goal.id });
+    } catch (err) {
+      return msgOf(err);
+    }
+    const resource: ProvisionedResource = { ...r, goalId: goal.id, runId: this.p.runId };
+    const why = r && r.capability === id && r.kind === kind ? resourceProblem(resource, this.allowance, this.p.secrets) : `the provisioner returned ${String(r?.kind)} for ${String(r?.capability)}, not ${kind} for ${id}`;
+    if (why) {
+      if (r && typeof r.id === 'string' && r.id) await this.p.provisioner!.release(r.id).catch(() => undefined);
+      return why;
+    }
+    await this.emit('resource.provisioned', payloadOf('resource.provisioned', { resource }), { goalId: goal.id });
+    return null;
+  }
+
+  /** Hold the goal until the requestor provides capabilities Tecera may neither use, provision nor mock (idempotent per set). */
+  private async holdForCapabilities(goal: AchievementGoal, ids: string[]): Promise<void> {
+    const capabilities = [...new Set(ids)].sort();
+    const actionHash = digest({ action: PROVIDE_CAPABILITY_ACTION, goalId: goal.id, runId: this.p.runId, capabilities });
+    for (const h of [...this.goalHolds.values()]) {
+      if (h.kind !== 'ask' || h.goalId !== goal.id) continue;
+      if (h.actionHash === actionHash) {
+        const v = await requireApproval(this.p.ledger, h.requestId).catch(() => null);
+        if (v && (v.state === 'pending' || v.state === 'granted') && v.expiresAt > this.now()) return;
+      }
+      this.goalHolds.delete(h.requestId);
+    }
+    const trace = { goalId: goal.id, intentionId: `capability:${goal.id}`, stepId: PROVIDE_CAPABILITY_ACTION };
+    await this.requestGoalHold({ kind: 'ask', goalId: goal.id, actionHash, trace, capabilities }, `${PROVIDE_CAPABILITY_ACTION} ${goal.id}: the work needs ${capabilities.join(', ')}, which Tecera may neither use, provision nor mock; provide it and approve to continue`, { capabilities });
+  }
+
+  /** Why intention `i` may not run now under its goal's contract (null when it may, or the goal has none). */
+  private contractStale(i: Intention): string | null {
+    if (!this.contractual.has(i.goalId)) return null;
+    const accepted = this.acceptedHash.get(i.goalId);
+    if (!accepted) return `the contract of goal ${i.goalId} is not accepted`;
+    const planned = this.intentionContract.get(i.id);
+    if (planned !== accepted) return `intention ${i.id} was planned for contract ${planned ?? 'none'}, the accepted one is ${accepted}`;
+    return null;
+  }
+
+  /** GateContext fields under a contract: the contract and inventory; for gate.pr the proofs, answers and pending resources. */
+  private async contractFields(i: Intention, step: Step): Promise<Partial<GateContext>> {
+    if (!this.contractual.has(i.goalId)) return {};
+    const { view, events } = await this.acceptance(i.goalId);
+    if (!view.accepted) return {};
+    const hash = view.accepted.hash;
+    const out: Partial<GateContext> = { contract: view.accepted.contract, contractHash: hash, inventory: capabilityInventoryOf(events, this.foldOptions).records };
+    if (step.kind === 'gate.pr') {
+      const fp = this.committed.get(i.id)?.d1;
+      const cmd = this.criterionProofs.get(i.id);
+      out.criterionProofs = cmd && fp !== undefined && cmd.fingerprint === fp ? cmd.proofs : [];
+      out.humanAnswers = [...this.answerReqs.values()].filter((a) => a.answer && a.goalId === i.goalId && a.contractHash === hash && a.fingerprint === fp).map((a) => a.answer!);
+      out.pendingResources = resourceRegistryOf(events, { ...this.foldOptions, goalId: i.goalId }).pending;
+    }
+    return out;
+  }
+
+  /** At the PR hold: ask every human criterion of the accepted contract about the committed candidate. */
+  private async askHumanCriteria(i: Intention): Promise<void> {
+    if (!this.contractual.has(i.goalId)) return;
+    const goal = this.goals.get(i.goalId);
+    const fp = this.committed.get(i.id)?.d1 ?? this.verifyFp.get(i.id);
+    if (!goal || !fp) return;
+    const { view } = await this.acceptance(goal.id);
+    if (!view.accepted || this.intentionContract.get(i.id) !== view.accepted.hash) return;
+    for (const k of view.accepted.contract.criteria) if (k.check.kind === 'human') await this.humanAnswer(i, goal, k, view.accepted.hash, fp);
+  }
+
+  /**
+   * The answer to human criterion `k` on `fingerprint`: its own answer_criterion approval (bound by
+   * answerCriterionActionHash), requested when there is none still live. Denied = the human said no.
+   */
+  private async humanAnswer(i: Intention, goal: AchievementGoal, k: Criterion, hash: string, fingerprint: string): Promise<{ answer: HumanCriterionAnswer } | { pending: string } | { denied: string }> {
+    const mine = [...this.answerReqs.values()].filter((a) => a.goalId === goal.id && a.criterionId === k.id && a.contractHash === hash && a.fingerprint === fingerprint);
+    const done = mine.find((a) => a.answer);
+    if (done) return { answer: done.answer! };
+    for (const a of mine) {
+      const v = await requireApproval(this.p.ledger, a.requestId).catch(() => null);
+      if (v?.state === 'denied') return { denied: `criterion ${k.id} was answered no${v.approver ? ` by ${v.approver.id}` : ''}` };
+      if (v && (v.state === 'pending' || v.state === 'granted') && v.expiresAt > this.now()) return { pending: a.requestId };
+      if (v?.state === 'consumed' && v.approver?.kind === 'human') {
+        // Consumed before approval.consumed was recorded (a restart in between): record it now.
+        await this.emit('approval.consumed', { requestId: a.requestId, actionHash: a.actionHash, sessionId: v.sessionId, by: 'loop', approver: { kind: 'human', id: v.approver.id }, recovered: true }, a.trace, { actor: this.system });
+        a.answer = { criterionId: k.id, approver: { kind: 'human', id: v.approver.id }, verdict: 'yes', requestId: a.requestId, answeredAt: this.now() };
+        return { answer: a.answer };
+      }
+      this.answerReqs.delete(a.requestId);
+    }
+    return { pending: await this.requestAnswer(i.id, goal, k, hash, fingerprint) };
+  }
+
+  private async requestAnswer(intentionId: string, goal: AchievementGoal, k: Criterion, hash: string, fingerprint: string): Promise<string> {
+    const requestId = `ap_${this.ids()}`;
+    const actionHash = answerCriterionActionHash({ goalId: goal.id, runId: this.p.runId, contractHash: hash, criterionId: k.id, fingerprint });
+    await this.requestLoopApproval(requestId, actionHash, `${ANSWER_CRITERION_ACTION} ${goal.id}/${k.id} on ${fingerprint}: ${k.check.kind === 'human' ? k.check.prompt : k.statement}`);
+    const i = this.intentions.get(intentionId);
+    const trace = { goalId: goal.id, intentionId, ...(i ? { planId: i.planId } : {}), stepId: `answer:${k.id}` };
+    this.answerReqs.set(requestId, { goalId: goal.id, intentionId, criterionId: k.id, requestId, actionHash, contractHash: hash, fingerprint, trace });
+    await this.emit('approval.requested', { requestId, actionHash, sessionId: this.sessionId, action: ANSWER_CRITERION_ACTION, criterionId: k.id, contractHash: hash, fingerprint, owner: 'loop' }, trace, { actor: this.system });
+    return requestId;
+  }
+
+  /** A human answered a criterion (grant = yes): consume it, record the answer, and settle the goal again when its intention is done. */
+  private async resumeAnswer(a: AnswerRequest, grant: ApprovalGrant): Promise<void> {
+    const goal = this.goals.get(a.goalId);
+    if (!goal || goal.status !== 'open') throw new Error(`goal ${a.goalId} is not open`);
+    const view = await this.grantedView(a.requestId, a.actionHash, grant, async (v) => {
+      this.answerReqs.delete(a.requestId);
+      await this.emit('approval.expired', { requestId: v.requestId }, a.trace);
+      const { view: acc } = await this.acceptance(goal.id);
+      const k = acc.accepted?.hash === a.contractHash ? acc.accepted.contract.criteria.find((x) => x.id === a.criterionId) : undefined;
+      if (k) await this.requestAnswer(a.intentionId, goal, k, a.contractHash, a.fingerprint);
+    });
+    const approver = view.approver ?? grant.approver;
+    if (approver.kind !== 'human') throw new Error(`approval ${a.requestId} was not granted by a human`);
+    try {
+      await this.p.ledger.consume(a.requestId, a.actionHash, view.sessionId, `consume:${a.requestId}`, this.now());
+    } catch (err) {
+      throw new Error(`approval ${a.requestId} could not be consumed: ${msgOf(err)}`);
+    }
+    await this.emit('approval.consumed', { requestId: a.requestId, actionHash: a.actionHash, sessionId: view.sessionId, by: 'loop', approver: { kind: 'human', id: approver.id } }, a.trace, { actor: this.system });
+    a.answer = { criterionId: a.criterionId, approver: { kind: 'human', id: approver.id }, verdict: 'yes', requestId: a.requestId, answeredAt: this.now() };
+    const i = this.intentions.get(a.intentionId);
+    if (i && i.status === 'done') await this.settleGoal(i, this.intentions.planOf(i.id));
+    this.throwIfStopped();
+  }
+
+  /**
+   * The contract part of the proof: one CriterionProof per criterion. Command criteria from the latest passed
+   * verify on the proof's candidate (fidelity never stronger than the inventory allows); human criteria from
+   * their consumed answer_criterion approvals. Anything missing keeps the goal open; a 'no' drops it.
+   */
+  private async criteriaProof(i: Intention, goal: AchievementGoal, proof: AchievementProof): Promise<{ proof: AchievementProof; mocked: string[] } | { why: string } | { denied: string }> {
+    const { view, events } = await this.acceptance(goal.id);
+    if (view.state !== 'accepted' || !view.accepted) return { why: `the contract is ${view.state === 'none' ? 'not drafted' : view.state}, not accepted` };
+    const { contract, hash } = view.accepted;
+    if (this.intentionContract.get(i.id) !== hash) return { why: `the intention was planned for contract ${this.intentionContract.get(i.id) ?? 'none'}, the accepted one is ${hash}` };
+    const inv = capabilityInventoryOf(events, this.foldOptions);
+    const cmd = this.criterionProofs.get(i.id);
+    const proofs: CriterionProof[] = [];
+    const pending: string[] = [];
+    for (const k of contract.criteria) {
+      const allowed = fidelityFor(inv, k.requires);
+      if (allowed === null) return { why: `criterion ${k.id} requires a capability the run lacks (${(k.requires ?? []).join(', ')})` };
+      if (k.check.kind === 'command') {
+        const p = cmd && cmd.fingerprint === proof.fingerprint ? cmd.proofs.find((x) => x && x.criterionId === k.id) : undefined;
+        if (!p) return { why: `criterion ${k.id} has no passing proof on candidate ${proof.fingerprint}` };
+        proofs.push({ ...p, fidelity: weakestFidelity([isFidelity(p.fidelity) ? p.fidelity : allowed, allowed]) });
+      } else {
+        const a = await this.humanAnswer(i, goal, k, hash, proof.fingerprint);
+        if ('denied' in a) return a;
+        if ('pending' in a) {
+          pending.push(k.id);
+          continue;
+        }
+        proofs.push({ criterionId: k.id, fidelity: allowed, via: 'human', approver: a.answer.approver.id, evidenceKey: a.answer.requestId, verifiedAt: a.answer.answeredAt });
+      }
+    }
+    if (pending.length) return { why: `awaiting the human answer to ${pending.join(', ')}` };
+    const problem = criteriaProofProblem(contract, proofs);
+    if (problem) return { why: problem };
+    return { proof: { ...proof, contractHash: hash, criteria: proofs, fidelity: weakestFidelity(proofs.map((p) => p.fidelity)) }, mocked: proofs.filter((p) => p.fidelity === 'mocked').map((p) => p.criterionId) };
+  }
+
+  /**
+   * The single-source decision (provenAchievement) on the goal.achieved the loop is about to append: the run's
+   * events plus the candidate (no seq, so it sorts last), the evidence the proof names, the chain verdict.
+   */
+  private async proven(goalId: string, payload: JsonObject, proof: AchievementProof): Promise<AchievementVerdict> {
+    const events = await this.runEvents();
+    const redacted = this.p.redact ? this.p.redact(payload) : payload;
+    const candidate = event('goal.achieved', { id: `candidate_${this.p.runId}_${this.nonce}`, at: this.now(), actor: this.actor, payload: normalizeJson(redacted as JsonObject), trace: { goalId }, runId: this.p.runId });
+    const evidence = new Map<string, EvidenceRecord>();
+    for (const key of new Set([proof.evidenceKey, ...(proof.criteria ?? []).filter((c) => c.via === 'command').map((c) => c.evidenceKey)])) {
+      const rec = await this.p.ledger.getEvidence(key).catch(() => null);
+      if (rec) evidence.set(key, rec);
+    }
+    const chain: ChainVerdict = await this.p.ledger.verifyChain().catch((err: unknown) => ({ ok: false as const, brokenAtSeq: -1, reason: msgOf(err) }));
+    return provenAchievement([...events, candidate], evidence, { runId: this.p.runId, goalId, allowance: this.allowance, chain, ...(this.signoffAlways ? { requireApproval: true } : {}), ...(this.p.secrets ? { secrets: this.p.secrets } : {}) });
+  }
+
+  /** Return values of the completed worker steps upstream of `step` (L5-F2), by step id. */
+  private dependencyOutputs(intentionId: string, plan: Plan, step: Step): Record<string, Json> {
+    const byId = new Map(plan.steps.map((s) => [s.id, s]));
+    const out: Record<string, Json> = {};
+    const seen = new Set<string>();
+    const stack = [...step.dependsOn];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const s = byId.get(id);
+      if (!s) continue;
+      const v = this.stepOutputs.get(heldKey(intentionId, id));
+      if (s.kind === 'worker' && v !== undefined) out[id] = v;
+      stack.push(...s.dependsOn);
+    }
+    return out;
   }
 
   private async dropGoal(goal: AchievementGoal, reason: string, errors?: string[], opts: { terminal?: boolean; failure?: TerminalFailure } = {}): Promise<void> {
@@ -1438,11 +2291,11 @@ export class Loop {
       const invalidatesContext = e.kind.startsWith('belief.') && !!key && plan.context.some((c) => c.key === key) && !plan.context.every((c) => this.beliefs.match(c));
       const goalChanged = e.kind === 'goal.dropped' && e.trace.goalId === i.goalId;
       const r = await this.ask('reconsider', { state: { commitment: i.commitment, eventKind: e.kind, invalidatesContext, goalChanged } });
-      if (r.answer.interrupt) await this.interrupt(i, e);
+      if (r.answer.interrupt) await this.interrupt(i, e.kind);
     }
   }
 
-  private async interrupt(stale: Intention, cause: TeceraEvent): Promise<void> {
+  private async interrupt(stale: Intention, cause: string): Promise<void> {
     // Always transition the latest state: steps may have advanced while the reflex was consulted.
     const i = this.intentions.get(stale.id)!;
     if (i.status === 'done' || i.status === 'dropped' || i.status === 'failed') return;
@@ -1450,7 +2303,7 @@ export class Loop {
     for (const k of [...this.held.keys()]) if (k.startsWith(`${i.id}:`)) this.held.delete(k);
     const dropped = clearHold(transitionIntention(i, 'dropped'));
     this.intentions.update(dropped);
-    await this.emit('intention.dropped', { intention: dropped as unknown as Json, cause: cause.kind }, this.traceFor(i.id));
+    await this.emit('intention.dropped', { intention: dropped as unknown as Json, cause }, this.traceFor(i.id));
     const goal = this.goals.get(i.goalId);
     if (goal && goal.status === 'open') {
       // Re-deliberate: the goal still stands, the plan did not.
@@ -1492,6 +2345,11 @@ export class Loop {
     try {
       if (this.leaseLost()) return;
       if (this.awaitingWorktree.has(intentionId)) return; // S2: nothing runs until the worktree is restored
+      // D8: no step of a contract-bound intention runs unless its contract is the accepted one, now.
+      if (this.contractStale(i)) {
+        await this.interrupt(i, 'criteria.amended');
+        return;
+      }
       i = transitionStep(i, stepId, 'ready');
       if (i.status === 'committed') i = transitionIntention(i, 'running');
       this.intentions.update(i);
@@ -1577,6 +2435,8 @@ export class Loop {
     await this.emit('approval.requested', { requestId, actionHash, step: step.id, sessionId: this.sessionId, owner, candidateD1, attempt: i.attempt, isolationDegraded: this.isolationDegraded, ...(pr ? { sha: pr.sha, reviewedD1: pr.d1 ?? null } : {}) }, this.traceFor(i.id, step.id));
     await this.emit('step.held', { requestId, owner }, this.traceFor(i.id, step.id));
     await this.emit('intention.held', { intention: i as unknown as Json, requestId }, this.traceFor(i.id));
+    // D8: human criteria are answered at the PR hold, one answer_criterion approval each.
+    if (pr) await this.askHumanCriteria(i);
   }
 
   /**
@@ -1633,6 +2493,11 @@ export class Loop {
   private async execute(intentionId: string, step: Step, mode: ExecMode): Promise<void> {
     if (this.leaseLost()) return; // no mutation without the lease (resume and pre-approved paths included)
     let i = this.intentions.get(intentionId)!;
+    if (this.contractStale(i)) {
+      // D8 on every path (dispatch, resume, pre-approved): nothing runs for a contract that is not the accepted one.
+      await this.interrupt(i, 'criteria.amended');
+      return;
+    }
     const plan = this.intentions.planOf(intentionId);
     let seatId = 'host';
     if (step.kind === 'worker' && mode.kind !== 'resume-worker') {
@@ -1646,8 +2511,28 @@ export class Loop {
     const k = heldKey(intentionId, step.id);
     const recovery = this.recovering.get(k);
     this.recovering.delete(k);
+    // A writing worker step snapshots the tree it starts from, so closeOut can always tell whether the step
+    // changed it (the first writing step of an intention has no earlier checkpoint). A resumed worker keeps
+    // the baseline of the execution it continues; it is recorded on every step.started, so a restart keeps it.
+    let baseline: string | undefined;
+    if (step.kind === 'worker' && this.riskOf(plan, step) === 'write' && this.p.worktreeCheckpoint) {
+      if (mode.kind === 'resume-worker') baseline = this.stepBaseline.get(k);
+      else {
+        try {
+          baseline = await this.p.worktreeCheckpoint({ runId: this.p.runId, intentionId, stepId: step.id, attempt: i.attempt, reason: 'baseline' });
+        } catch (err) {
+          await this.failStep(i, plan, step, `worktree checkpoint failed before ${step.id}: ${msgOf(err)}`, { terminal: true, failure: 'human' });
+          return;
+        }
+        if (typeof baseline !== 'string' || !baseline) {
+          await this.failStep(i, plan, step, `worktree checkpoint before ${step.id} returned no id`, { terminal: true, failure: 'human' });
+          return;
+        }
+        this.stepBaseline.set(k, baseline);
+      }
+    }
     await this.emit('step.requested', { step: step.id, kind: step.kind, seatId, resumed, ...(recovery ? { recovered: true } : {}) }, this.traceFor(intentionId, step.id));
-    await this.emit('step.started', { step: step.id }, this.traceFor(intentionId, step.id));
+    await this.emit('step.started', { step: step.id, ...(baseline ? { baseline } : {}) }, this.traceFor(intentionId, step.id));
 
     const ac = new AbortController();
     this.running.set(k, ac);
@@ -1659,8 +2544,9 @@ export class Loop {
     timer?.unref?.();
     if (enforced && remaining <= 0) ac.abort(new BudgetExhausted('run deadline exceeded'));
     const guard = this.writeGuard(intentionId, step.id, ac.signal);
-    const ctx: GateContext = { ...this.gateContext(i, plan, step, ac.signal, mode.kind === 'approved' ? mode.approval : undefined, recovery !== undefined), guard };
+    if (step.kind === 'worker') this.stepBefore.set(k, this.riskOf(plan, step) === 'write' && this.p.worktreeCheckpoint ? (baseline ?? null) : (this.cpState.get(intentionId)?.checkpointId ?? null));
     try {
+      const ctx: GateContext = { ...this.gateContext(i, plan, step, ac.signal, mode.kind === 'approved' ? mode.approval : undefined, recovery !== undefined), guard, ...(await this.contractFields(i, step)) };
       let result = await this.runStep(ctx, seatId, ac.signal, mode, recovery);
       const delivered = (result.kind === 'gate.commit' || result.kind === 'gate.pr') && result.exitCode === 0 && !result.terminal;
       // Past an enforced deadline the result is not progress (a commit or PR that already happened stands).
@@ -1675,6 +2561,7 @@ export class Loop {
     } finally {
       if (timer) clearTimeout(timer);
       this.running.delete(k);
+      this.stepBefore.delete(k);
     }
   }
 
@@ -1689,7 +2576,9 @@ export class Loop {
           if (!consumed && outcome.kind === 'returned') return { kind: 'worker', outcome, terminal: true, reason: `worker did not consume approval ${mode.requestId}` };
           return { kind: 'worker', outcome };
         }
-        const assembled = assembleStepContext(ctx.goal, ctx.plan, ctx.step, this.beliefs, { budgetTokens: this.p.manifest.memory.contextBudgetTokens });
+        const dependencies = this.dependencyOutputs(ctx.intention.id, ctx.plan, ctx.step);
+        const failure = ctx.intention.attempt > 1 ? await this.failureContext(ctx.intention, ctx.goal) : undefined;
+        const assembled = assembleStepContext(ctx.goal, ctx.plan, ctx.step, this.beliefs, { budgetTokens: this.p.manifest.memory.contextBudgetTokens, ...(Object.keys(dependencies).length ? { dependencies } : {}), ...(failure ? { failureContext: failure as unknown as Json } : {}) });
         const fencingToken = this.p.fencingToken?.();
         const outcome = await this.p.worker.run(
           {
@@ -1734,9 +2623,15 @@ export class Loop {
           failure = 'human';
           reason = noProgress;
         }
+        const passed = r.exitCode === 0 && !terminal;
+        this.lastVerify.set(ctx.intention.id, { exitCode: r.exitCode, passed, attempt: ctx.intention.attempt });
+        // Under a contract: the command-criterion proofs of this candidate (settle uses the latest passed ones).
+        const criteria = passed && Array.isArray(r.criteria) ? r.criteria : undefined;
+        if (passed && fingerprint !== undefined) this.criterionProofs.set(ctx.intention.id, { fingerprint, proofs: criteria ?? [] });
+        else this.criterionProofs.delete(ctx.intention.id);
         await this.emit(
-          r.exitCode === 0 && !terminal ? 'verify.passed' : 'verify.failed',
-          { exitCode: r.exitCode, evidenceKey: r.evidenceKey, fingerprint: fingerprint ?? null, attempt: ctx.intention.attempt, workerExec: exec, terminal, reason: reason ?? null, ...(failure ? { failure } : {}), ...(noProgress ? { noProgress: true } : {}) },
+          passed ? 'verify.passed' : 'verify.failed',
+          { exitCode: r.exitCode, evidenceKey: r.evidenceKey, fingerprint: fingerprint ?? null, attempt: ctx.intention.attempt, workerExec: exec, terminal, reason: reason ?? null, ...(failure ? { failure } : {}), ...(noProgress ? { noProgress: true } : {}), ...(criteria ? { criteria: criteria as unknown as Json } : {}), ...(r.failedCriteria?.length ? { failedCriteria: r.failedCriteria } : {}) },
           trace,
         );
         return { kind: 'gate.verify', exitCode: r.exitCode, evidenceKey: r.evidenceKey, terminal, ...(reason ? { reason } : {}), ...(failure ? { failure } : {}) };
@@ -1811,7 +2706,7 @@ export class Loop {
       state = 'unknown';
     }
     if (state !== 'consumed') return false;
-    await this.emit('approval.consumed', { requestId, by }, trace);
+    await this.emit('approval.consumed', { requestId, by }, trace, { actor: this.system });
     return true;
   }
 
@@ -1836,7 +2731,12 @@ export class Loop {
     // facts → beliefs
     if (result.kind === 'worker' && result.outcome.kind === 'returned') {
       const facts = (result.outcome.value as { facts?: Array<{ key: string; value: Json }> } | null)?.facts ?? [];
-      if (Array.isArray(facts)) for (const f of facts) if (f && typeof f.key === 'string') await this.emit('belief.added', { key: f.key, value: f.value ?? null, provenance: { src: `worker:${step.id}`, trust: 'untrusted' } }, this.traceFor(intentionId, step.id));
+      // D11: a step whose invoke tree used a stand-in (the worker marks the outcome `simulated`) may have
+      // returned facts resting on simulated data; they are recorded as simulated, never as the step's own.
+      const sim = (result.outcome as { simulated?: { capabilities?: unknown; mockIds?: unknown } }).simulated;
+      const mocked = sim && Array.isArray(sim.mockIds) && sim.mockIds.length > 0 ? (Array.isArray(sim.capabilities) ? sim.capabilities.filter((c): c is string => typeof c === 'string') : []) : null;
+      const provenance: JsonObject = mocked ? (simulatedProvenance(mocked.length ? mocked.join(',') : step.id, this.p.runId) as unknown as JsonObject) : { src: `worker:${step.id}`, trust: 'untrusted' };
+      if (Array.isArray(facts)) for (const f of facts) if (f && typeof f.key === 'string') await this.emit('belief.added', { key: f.key, value: f.value ?? null, provenance }, this.traceFor(intentionId, step.id));
     }
     if (result.kind === 'worker' && result.outcome.kind === 'suspended' && !result.terminal) {
       // The worker hit an approval-gated tool: hold the step with the worker's request and resume token.
@@ -1869,12 +2769,193 @@ export class Loop {
       await this.failStep(i, plan, step, result.reason ?? describeFailure(result), { terminal: true, ...(result.failure ? { failure: result.failure } : {}) });
       return;
     }
-    const closeOut = await this.ask('closeOut', { state: closeOutState(step, result) });
+    // L5-F2: a worker step that can edit (editsFiles) must have changed the worktree; one that may only read
+    // or run the check (runVerify) may return no change. Its checkpoint is taken before closeOut so
+    // the rule can compare it with the one the step started from (its baseline; null only when a resumed
+    // execution has none recorded), and the question carries what a decider needs to judge the step.
+    let checkpoint: string | undefined;
+    let changed: boolean | null | undefined;
+    let change: JsonObject | undefined;
+    if (result.kind === 'worker' && result.outcome.kind === 'returned' && this.p.worktreeCheckpoint) {
+      const taken = await this.takeCheckpoint(intentionId, plan, step);
+      if (taken === null) return;
+      checkpoint = taken;
+      const before = this.stepBefore.get(heldKey(intentionId, step.id));
+      changed = typeof before === 'string' ? before !== checkpoint : null;
+      if (typeof before === 'string') change = await this.changeSummary(intentionId, step, before, checkpoint, changed === true);
+    }
+    const expectsChange = editsFiles(plan, step);
+    const evidence = step.kind === 'worker' ? this.closeOutEvidence(intentionId, step, result, change) : {};
+    const closeOut = await this.ask('closeOut', { state: { ...(closeOutState(step, result, { expectsChange, ...(changed !== undefined ? { changed } : {}) }) as JsonObject), ...evidence } });
     if (!closeOut.answer.achieved) {
-      await this.failStep(i, plan, step, describeFailure(result), {});
+      const noChange = result.kind === 'worker' && result.outcome.kind === 'returned' && expectsChange && changed === false && !reportsError(result.outcome.value);
+      await this.failStep(i, plan, step, refusalReason(result, expectsChange, changed), noChange ? { noChange: true } : {});
       return;
     }
-    await this.completeStep(intentionId, plan, step, result);
+    await this.completeStep(intentionId, plan, step, result, checkpoint);
+  }
+
+  /**
+   * closeOut evidence for a worker step: its instruction, the output-schema verdict, the change summary, the
+   * worker's own `summary` and the intention's latest verify result. Paths and counts only, never file
+   * contents; everything is bounded. The rule decides on the facts above it; this is for a model decider.
+   */
+  private closeOutEvidence(intentionId: string, step: Step, result: StepResult, change: JsonObject | undefined): JsonObject {
+    const out: JsonObject = {};
+    if (typeof step.instruction === 'string' && step.instruction) out.instruction = clip(step.instruction, MAX_EVIDENCE_TEXT);
+    if (result.kind === 'worker') {
+      // A returned value already passed the step's output schema (the worker validates it before returning).
+      out.outputSchema = result.outcome.kind === 'returned' ? (step.output ? 'satisfied' : 'none declared') : `no return (${result.outcome.kind})`;
+      if (result.outcome.kind === 'returned') {
+        const v = result.outcome.value;
+        const summary = v && typeof v === 'object' && !Array.isArray(v) ? (v as JsonObject).summary : undefined;
+        if (typeof summary === 'string' && summary) out.workerSummary = clip(summary, MAX_EVIDENCE_TEXT);
+      }
+    }
+    if (change) out.change = change;
+    const v = this.lastVerify.get(intentionId);
+    if (v) out.verify = { exitCode: v.exitCode, passed: v.passed, attempt: v.attempt };
+    return out;
+  }
+
+  /**
+   * Why the intention's last candidate was refused, for the worker steps its retry re-runs (D-H): the gate
+   * outcome that caused the retry into the current attempt (the intention.advanced for this attempt names
+   * that gate), when it is a non-terminal verify.failed or a review.rejected. A retry caused by anything
+   * else (a failed worker step) carries no context, never an older attempt's gate failure. A verify
+   * failure names the failed criteria (statement and command from the accepted contract, exit code and
+   * output tail from their evidence) or the goal check; a rejection carries the reviewer's findings. Built
+   * from the ledger (a restart rebuilds the same), redacted, bounded, and handed over as untrusted data.
+   */
+  private async failureContext(i: Intention, goal: AchievementGoal): Promise<FailureContext | undefined> {
+    let gate: TeceraEvent | undefined;
+    let last: TeceraEvent | undefined;
+    const seen: TeceraEvent[] = [];
+    for await (const e of this.p.ledger.events({ runId: this.p.runId, kinds: ['verify.passed', 'verify.failed', 'review.passed', 'review.rejected', 'intention.advanced'] })) seen.push(e);
+    for (const e of ledgerOrder(seen, this.p.runId)) {
+      if (e.trace.intentionId !== i.id) continue;
+      if (e.kind === 'verify.passed' || e.kind === 'verify.failed' || e.kind === 'review.passed' || e.kind === 'review.rejected') gate = e;
+      else if (e.kind === 'intention.advanced') {
+        const a = e.payload as JsonObject;
+        if (a.attempt === i.attempt && a.sameAttempt !== true && typeof a.retry === 'string') last = gate && gate.trace.stepId === a.retry ? gate : undefined;
+      }
+    }
+    if (!last || (last.kind !== 'verify.failed' && last.kind !== 'review.rejected')) return undefined;
+    const p = last.payload as JsonObject;
+    if (p.terminal === true) return undefined;
+    const red = (v: Json): Json => (this.p.redact ? this.p.redact(v) : v);
+    // Every text is redacted whole before it is clipped: a cut never leaves half a secret behind.
+    const text = (s: string, n: number): string => {
+      const r = red(s);
+      return clip(typeof r === 'string' ? r : '', n);
+    };
+    // Redact the whole text first, then keep its end: a cut never leaves half a secret behind.
+    const tailOf = (...parts: unknown[]): string => {
+      const whole = red(parts.filter((x): x is string => typeof x === 'string' && x.length > 0).join('\n'));
+      const t = typeof whole === 'string' ? whole : '';
+      return t.length > MAX_FAILURE_TAIL ? t.slice(t.length - MAX_FAILURE_TAIL) : t;
+    };
+    const evidence = async (key: unknown): Promise<JsonObject | null> => {
+      if (typeof key !== 'string' || !key) return null;
+      try {
+        const rec = await this.p.ledger.getEvidence(key);
+        return rec && rec.runId === this.p.runId && rec.body && typeof rec.body === 'object' && !Array.isArray(rec.body) ? (rec.body as JsonObject) : null;
+      } catch {
+        return null;
+      }
+    };
+    const attempt = typeof p.attempt === 'number' ? p.attempt : Math.max(1, i.attempt - 1);
+    const reason = typeof p.reason === 'string' && p.reason ? text(p.reason, MAX_EVIDENCE_TEXT) : undefined;
+    let out: FailureContext;
+    if (last.kind === 'verify.failed') {
+      const failed = Array.isArray(p.failedCriteria) ? p.failedCriteria.filter((x): x is string => typeof x === 'string').slice(0, MAX_FAILURE_ITEMS) : [];
+      const criteria: FailedCriterionContext[] = [];
+      if (failed.length) {
+        const contract = this.contractual.has(i.goalId) ? (await this.acceptance(i.goalId)).view.accepted?.contract : undefined;
+        let records: EvidenceRecord[] = [];
+        if (typeof this.p.ledger.listEvidence === 'function') {
+          try {
+            records = await this.p.ledger.listEvidence(this.p.runId, 'gate.verify');
+          } catch {
+            records = [];
+          }
+        }
+        for (const id of failed) {
+          const k = contract?.criteria.find((c) => c.id === id);
+          const rec = [...records].reverse().find((r) => {
+            const b = r.body as JsonObject | null;
+            return !!b && typeof b === 'object' && b.criterionId === id && b.verifyKey === p.evidenceKey;
+          });
+          const b = (rec?.body ?? null) as JsonObject | null;
+          const exit = b ? (typeof b.runnerExitCode === 'number' ? b.runnerExitCode : typeof b.exitCode === 'number' ? b.exitCode : null) : undefined;
+          criteria.push({
+            id: text(id, 200),
+            ...(k ? { statement: text(k.statement, MAX_EVIDENCE_TEXT) } : {}),
+            ...(k && k.check.kind === 'command' ? { command: text(k.check.command, MAX_EVIDENCE_TEXT) } : {}),
+            ...(exit !== undefined ? { exitCode: exit } : {}),
+            ...(b ? { outputTail: tailOf(b.stdoutTail, b.stderrTail) } : {}),
+          });
+        }
+      } else {
+        const b = await evidence(p.evidenceKey);
+        const exit = b ? (typeof b.runnerExitCode === 'number' ? b.runnerExitCode : typeof b.exitCode === 'number' ? b.exitCode : null) : typeof p.exitCode === 'number' ? p.exitCode : null;
+        criteria.push({ id: 'check', statement: 'the goal check', command: text(goal.check.command, MAX_EVIDENCE_TEXT), exitCode: exit, ...(b ? { outputTail: tailOf(b.stdoutTail, b.stderrTail) } : {}) });
+      }
+      out = { kind: 'verify', attempt, criteria, ...(reason ? { reason } : {}), instruction: 'The previous attempt failed verification. Change the code so that every criterion listed here passes; do not return before you have addressed them.', untrusted: true };
+    } else {
+      const b = await evidence(p.evidenceKey);
+      const raw = b && Array.isArray(b.findings) ? b.findings : [];
+      const findings: ReviewFindingContext[] = [];
+      for (const f of raw.slice(0, MAX_FAILURE_ITEMS)) {
+        if (!f || typeof f !== 'object' || Array.isArray(f)) continue;
+        const o = f as JsonObject;
+        const said = [o.title, o.detail, o.text].filter((x): x is string => typeof x === 'string' && x.length > 0).join(': ');
+        if (!said) continue;
+        const file = typeof o.path === 'string' ? o.path : typeof o.file === 'string' ? o.file : undefined;
+        findings.push({ text: text(said, MAX_EVIDENCE_TEXT), ...(file ? { file: text(file, 300) } : {}), ...(typeof o.line === 'number' && Number.isInteger(o.line) ? { line: o.line } : {}), ...(typeof o.severity === 'string' ? { severity: text(o.severity, 40) } : {}) });
+      }
+      out = { kind: 'review', attempt, findings, ...(reason ? { reason } : {}), instruction: 'The previous attempt was rejected by the reviewer. Change the code so that every finding listed here is resolved; do not return before you have addressed them.', untrusted: true };
+    }
+    const cleaned = red(normalizeJson(out as unknown as JsonObject));
+    return cleaned && typeof cleaned === 'object' && !Array.isArray(cleaned) ? ({ ...(cleaned as unknown as FailureContext), untrusted: true } as FailureContext) : undefined;
+  }
+
+  /** Files changed between two checkpoints (bounded): counts always, the port's per-file lines when it has them. */
+  private async changeSummary(intentionId: string, step: Step, from: string, to: string, changed: boolean): Promise<JsonObject> {
+    if (!changed) return { files: 0, added: 0, removed: 0, paths: [] };
+    if (!this.p.worktreeChanges) return { files: null };
+    let files: WorktreeChange[];
+    try {
+      files = await this.p.worktreeChanges({ runId: this.p.runId, intentionId, stepId: step.id, from, to });
+    } catch (err) {
+      return { files: null, error: clip(msgOf(err), 200) };
+    }
+    const ok = Array.isArray(files) ? files.filter((f) => f && typeof f.path === 'string') : [];
+    const n = (x: unknown): number => (typeof x === 'number' && Number.isFinite(x) && x > 0 ? Math.floor(x) : 0);
+    return {
+      files: ok.length,
+      added: ok.reduce((a, f) => a + n(f.added), 0),
+      removed: ok.reduce((a, f) => a + n(f.removed), 0),
+      paths: ok.slice(0, MAX_EVIDENCE_PATHS).map((f) => ({ path: clip(f.path, 300), added: n(f.added), removed: n(f.removed) })),
+      ...(ok.length > MAX_EVIDENCE_PATHS ? { truncated: true } : {}),
+    };
+  }
+
+  /** Checkpoint the worktree after a worker step; null when that failed (the step then failed terminally: 'human'). */
+  private async takeCheckpoint(intentionId: string, plan: Plan, step: Step): Promise<string | null> {
+    const i = this.intentions.get(intentionId)!;
+    let id: string;
+    try {
+      id = await this.p.worktreeCheckpoint!({ runId: this.p.runId, intentionId, stepId: step.id, attempt: i.attempt, reason: 'completed' });
+    } catch (err) {
+      await this.failStep(i, plan, step, `worktree checkpoint failed after ${step.id}: ${msgOf(err)}`, { terminal: true, failure: 'human' });
+      return null;
+    }
+    if (typeof id !== 'string' || !id) {
+      await this.failStep(i, plan, step, `worktree checkpoint after ${step.id} returned no id`, { terminal: true, failure: 'human' });
+      return null;
+    }
+    return id;
   }
 
   /**
@@ -1889,22 +2970,21 @@ export class Loop {
   }
 
   /** Mark a step done, then advance the intention or close it (and settle its goal). */
-  private async completeStep(intentionId: string, plan: Plan, step: Step, result: StepResult): Promise<void> {
+  private async completeStep(intentionId: string, plan: Plan, step: Step, result: StepResult, taken?: string): Promise<void> {
     let i = this.intentions.get(intentionId)!;
     let worktreeCheckpoint: string | undefined;
+    let output: Json | undefined;
     if (step.kind === 'worker' && result.kind === 'worker') {
       // A worker execution produced (or kept) the candidate: count it, and checkpoint the worktree after it.
       if (this.p.worktreeCheckpoint) {
-        try {
-          worktreeCheckpoint = await this.p.worktreeCheckpoint({ runId: this.p.runId, intentionId, stepId: step.id, attempt: i.attempt, reason: 'completed' });
-        } catch (err) {
-          await this.failStep(i, plan, step, `worktree checkpoint failed after ${step.id}: ${msgOf(err)}`, { terminal: true, failure: 'human' });
-          return;
-        }
-        if (typeof worktreeCheckpoint !== 'string' || !worktreeCheckpoint) {
-          await this.failStep(i, plan, step, `worktree checkpoint after ${step.id} returned no id`, { terminal: true, failure: 'human' });
-          return;
-        }
+        const id = taken ?? (await this.takeCheckpoint(intentionId, plan, step));
+        if (id === null) return;
+        worktreeCheckpoint = id;
+      }
+      if (result.outcome.kind === 'returned') {
+        // Its return value is handed to the worker steps that depend on it (L5-F2), here and after a restart.
+        output = this.p.redact ? this.p.redact(result.outcome.value) : result.outcome.value;
+        this.stepOutputs.set(heldKey(intentionId, step.id), output);
       }
       this.workerExecs.set(intentionId, (this.workerExecs.get(intentionId) ?? 0) + 1);
       const cp = this.cpState.get(intentionId) ?? { uncheckpointed: new Set<string>() };
@@ -1919,7 +2999,7 @@ export class Loop {
     i = i.stepStatus[step.id] === 'running' ? transitionStep(i, step.id, 'done') : { ...i, stepStatus: { ...i.stepStatus, [step.id]: 'done' } };
     if (i.status === 'held' || i.status === 'committed') i = clearHold({ ...i, status: 'running' });
     this.intentions.update(i);
-    await this.emit('step.completed', { step: step.id, result: summarize(result), ...(worktreeCheckpoint ? { worktreeCheckpoint } : {}) }, this.traceFor(intentionId, step.id));
+    await this.emit('step.completed', { step: step.id, result: summarize(result), ...(worktreeCheckpoint ? { worktreeCheckpoint } : {}), ...(output !== undefined ? { output } : {}) }, this.traceFor(intentionId, step.id));
     if (this.intentions.allStepsDone(i)) await this.closeIntention(intentionId, plan);
     else await this.emit('intention.advanced', { intention: i as unknown as Json, completed: step.id }, this.traceFor(intentionId));
   }
@@ -1943,14 +3023,51 @@ export class Loop {
   private async settleGoal(i: Intention, plan: Plan): Promise<void> {
     const goal = this.goals.get(i.goalId)!;
     if (goal.status !== 'open') return;
+    const stays = (why: string) => this.emit('intention.advanced', { intention: i as unknown as Json, note: `goal stays open: ${why}` }, this.traceFor(i.id));
     const r = await this.achievementProof(i, plan, goal);
     if ('why' in r) {
-      await this.emit('intention.advanced', { intention: i as unknown as Json, note: `goal stays open: ${r.why}` }, this.traceFor(i.id));
+      await stays(r.why);
       return;
     }
-    const achieved = transitionGoal(goal, 'achieved', [r.verifyEventId, r.proof.evidenceKey], r.proof);
+    let proof = r.proof;
+    let mocked: string[] = [];
+    if (this.contractual.has(goal.id)) {
+      const c = await this.criteriaProof(i, goal, proof);
+      if ('denied' in c) {
+        await this.dropGoal(goal, c.denied, undefined, { terminal: true, failure: 'human' });
+        return;
+      }
+      if ('why' in c) {
+        await stays(c.why);
+        return;
+      }
+      proof = c.proof;
+      mocked = c.mocked;
+    }
+    if (mocked.length) {
+      // D11: every criterion is proven, at least one only against a stand-in: provisional, never achieved.
+      let provisional: AchievementGoal;
+      try {
+        provisional = markProvisional(goal, proof);
+      } catch (err) {
+        await stays(msgOf(err));
+        return;
+      }
+      this.goals.set(goal.id, provisional);
+      await this.emit('goal.provisional', payloadOf('goal.provisional', { goal: provisional, proof, mocked, reason: `criteria ${mocked.join(', ')} rest on a mocked capability` }), { goalId: goal.id });
+      return;
+    }
+    const evidence = [r.verifyEventId, proof.evidenceKey];
+    const achieved = transitionGoal(goal, 'achieved', evidence, proof);
+    const payload: JsonObject = { goal: achieved as unknown as Json, evidence, proof: proof as unknown as Json };
+    // One decision for "achieved": the event about to be appended must stand on this ledger (provenAchievement).
+    const verdict = await this.proven(goal.id, payload, proof);
+    if (!verdict.achieved) {
+      await stays(verdict.why ?? 'not proven');
+      return;
+    }
     this.goals.set(goal.id, achieved);
-    await this.emit('goal.achieved', { goal: achieved as unknown as Json, evidence: [r.verifyEventId, r.proof.evidenceKey], proof: r.proof as unknown as Json }, { goalId: goal.id });
+    await this.emit('goal.achieved', payload, { goalId: goal.id });
   }
 
   private async achievementProof(i: Intention, plan: Plan, goal: AchievementGoal): Promise<{ proof: AchievementProof; verifyEventId: string } | { why: string }> {
@@ -2046,6 +3163,8 @@ export class Loop {
         ...(r.branch ? { branch: r.branch } : {}),
         ...(r.base ? { base: r.base } : {}),
         ...(r.pushed !== undefined ? { pushed: r.pushed } : {}),
+        // D11: the ledger's own record of the delivery says when a criterion rests on a mock.
+        ...(r.provisional ? { provisional: true } : {}),
       };
       if (typeof r.url === 'string' && r.url) await this.emit('pr.opened', { ...payload, url: r.url }, trace);
       else await this.emit('pr.requested', { ...payload, ...(r.bundle ? { bundle: r.bundle } : {}) }, trace);
@@ -2061,7 +3180,19 @@ export class Loop {
    * dropped. `failure` classifies a terminal end ('budget' | 'human' | 'policy') on every event it emits.
    * `recorded`: the step.failed event already exists (restore finishing a cut-off failure).
    */
-  private async failStep(stale: Intention, plan: Plan, step: Step, reason: string, opts: { blocked?: boolean; terminal?: boolean; failure?: TerminalFailure; recorded?: boolean }): Promise<void> {
+  /**
+   * Fail a step, then retry it or fail the intention.
+   *
+   * Attempt accounting (loop-safety): a failure retries with attempt + 1 while attempt < maxAttempts, else the
+   * intention fails. A failed verify and a review rejection each consume one attempt for the whole re-run
+   * (the writing step(s), the verify and the review again): a reject → rework → verify → review cycle is one
+   * attempt, so a plan sees at most maxAttempts candidates reviewed. One exception, `noChange` (closeOut refused a writing worker step only because the
+   * worktree did not change): the step runs once more within the SAME attempt, at most once per (step,
+   * attempt), and only then does a further no-change refusal consume an attempt. A step therefore runs at
+   * most 2 × maxAttempts times; each run is one worker execution under its own maxIterations / maxDepth /
+   * timeout limits, and the run deadline and budgets bound them all.
+   */
+  private async failStep(stale: Intention, plan: Plan, step: Step, reason: string, opts: { blocked?: boolean; terminal?: boolean; failure?: TerminalFailure; recorded?: boolean; noChange?: boolean }): Promise<void> {
     let i = this.intentions.get(stale.id)!;
     const blocked = opts.blocked === true;
     const terminal = opts.terminal === true || opts.failure !== undefined;
@@ -2074,13 +3205,28 @@ export class Loop {
     else i = { ...i, stepStatus: { ...i.stepStatus, [step.id]: 'failed' } };
     this.held.delete(heldKey(i.id, step.id));
     this.intentions.update(i);
-    if (!opts.recorded) await this.emit('step.failed', { step: step.id, reason, blocked, terminal, ...failure }, this.traceFor(i.id, step.id));
-    const canRetry = !blocked && !terminal && i.attempt < this.p.manifest.budgets.maxAttempts;
+    if (!opts.recorded) await this.emit('step.failed', { step: step.id, reason, blocked, terminal, ...failure, ...(opts.noChange ? { noChange: true } : {}) }, this.traceFor(i.id, step.id));
+    const sameAttemptKey = `${heldKey(i.id, step.id)}#${i.attempt}`;
+    if (opts.noChange && !blocked && !terminal && step.kind === 'worker' && !this.noChangeRetried.has(sameAttemptKey)) {
+      this.noChangeRetried.add(sameAttemptKey);
+      i = clearHold({ ...i, status: i.status === 'held' || i.status === 'committed' ? 'running' : i.status, stepStatus: { ...i.stepStatus, [step.id]: 'pending' } });
+      this.intentions.update(i);
+      await this.emit('intention.advanced', { intention: i as unknown as Json, retry: step.id, attempt: i.attempt, sameAttempt: true }, this.traceFor(i.id));
+      return;
+    }
+    // A failed verify or a review rejection re-runs the worker step(s) that produced its candidate (and
+    // everything between): re-verifying or re-reviewing the same tree is not a new attempt (the review gate
+    // would only return its recorded verdict for that candidate), and progressCheck compares worker
+    // executions (ADV-8). A review with no file-editing worker upstream has nothing that could rework it:
+    // re-running it (or only read-only workers) would hand it the same candidate and its recorded verdict.
+    const rerun = step.kind === 'gate.verify' || step.kind === 'gate.review' ? retrySet(plan, step) : [step.id];
+    const reworkable = step.kind !== 'gate.review' || rerun.some((id) => {
+      const s = plan.steps.find((x) => x.id === id);
+      return !!s && editsFiles(plan, s);
+    });
+    const canRetry = !blocked && !terminal && reworkable && i.attempt < this.p.manifest.budgets.maxAttempts;
     if (canRetry) {
-      // A retry keeps the intention running with attempt + 1 and the failed step pending again. A failed
-      // verify re-runs the worker step(s) that produced its candidate (and everything between): re-verifying
-      // the same tree is not a new attempt, and progressCheck compares worker executions (ADV-8).
-      const rerun = step.kind === 'gate.verify' ? retrySet(plan, step) : [step.id];
+      // A retry keeps the intention running with attempt + 1 and the re-run steps pending again.
       const stepStatus = { ...i.stepStatus };
       for (const id of rerun) stepStatus[id] = 'pending';
       i = clearHold({ ...i, status: i.status === 'held' || i.status === 'committed' ? 'running' : i.status, attempt: i.attempt + 1, stepStatus });
@@ -2131,14 +3277,14 @@ export class Loop {
    * failure to build or append it stops the loop: no transition happens without its event on the log. A
    * duplicate is a fault unless the caller declared an idempotency key it expects to collide on.
    */
-  private async emit(kind: TeceraEvent['kind'], payload: JsonObject, trace: TeceraEvent['trace'], opts: { idemKey?: string; allowDuplicate?: boolean } = {}): Promise<{ duplicate: boolean }> {
+  private async emit(kind: TeceraEvent['kind'], payload: JsonObject, trace: TeceraEvent['trace'], opts: { idemKey?: string; allowDuplicate?: boolean; actor?: Principal } = {}): Promise<{ duplicate: boolean }> {
     this.throwIfStopped();
     let e: TeceraEvent;
     try {
       const redacted = this.p.redact ? this.p.redact(payload) : payload;
       if (redacted === null || typeof redacted !== 'object' || Array.isArray(redacted)) throw new Error('redactor did not return an object');
       const cleanTrace = Object.fromEntries(Object.entries(trace).filter(([, v]) => v !== undefined)) as TeceraEvent['trace'];
-      e = event(kind, { id: this.ids(), at: this.now(), actor: this.actor, payload: normalizeJson(redacted as JsonObject), trace: cleanTrace, runId: this.p.runId, ...(opts.idemKey ? { idemKey: opts.idemKey } : {}) });
+      e = event(kind, { id: this.ids(), at: this.now(), actor: opts.actor ?? this.actor, payload: normalizeJson(redacted as JsonObject), trace: cleanTrace, runId: this.p.runId, ...(opts.idemKey ? { idemKey: opts.idemKey } : {}) });
     } catch (err) {
       this.stop(`could not build ${kind} event: ${msgOf(err)}`);
       throw new LoopStopped(this.stopped!.reason);
@@ -2251,29 +3397,57 @@ function stepsBetween(plan: Plan, from: Step, to: Step): string[] {
 }
 
 /**
- * What a failed verify re-runs: the verify, the closest worker steps upstream of it (whose execution produced
- * the candidate) and every step between them. A verify with no worker upstream re-runs alone.
+ * What a failed verify (or a rejected review) re-runs: the gate, the worker steps that wrote its candidate
+ * and every step between them (for a review: the verify that passed the rejected candidate). Walking
+ * upstream it passes the steps before the candidate's workers (for a review: the verify that checked this
+ * same candidate) and the workers that cannot edit (re-running only those would hand the gate the same tree
+ * again), and takes the closest file-editing worker on each branch. An editing worker further upstream is
+ * not re-run: it is done, and re-running it with nothing of its own to change would be refused as a
+ * no-change return. With no editing worker upstream, the closest
+ * workers are taken (a review then has nothing that could rework it: failStep does not retry it); a gate
+ * with no worker upstream re-runs alone.
  */
-function retrySet(plan: Plan, verify: Step): string[] {
+function retrySet(plan: Plan, gate: Step): string[] {
   const byId = new Map(plan.steps.map((s) => [s.id, s]));
-  const workers: Step[] = [];
+  const closest: Step[] = [];
+  const writers: Step[] = [];
   const seen = new Set<string>();
-  let frontier = [...verify.dependsOn];
+  // [step id, whether a worker was already met on this branch]
+  let frontier: Array<[string, boolean]> = gate.dependsOn.map((d) => [d, false]);
   while (frontier.length) {
-    const next: string[] = [];
-    for (const id of frontier) {
-      if (seen.has(id)) continue;
-      seen.add(id);
+    const next: Array<[string, boolean]> = [];
+    for (const [id, inWorkers] of frontier) {
+      const key = `${id}#${inWorkers}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
       const s = byId.get(id);
       if (!s) continue;
-      if (s.kind === 'worker') workers.push(s);
-      else next.push(...s.dependsOn);
+      if (s.kind === 'worker') {
+        if (!inWorkers) closest.push(s);
+        if (editsFiles(plan, s)) writers.push(s);
+        else next.push(...s.dependsOn.map((d): [string, boolean] => [d, true]));
+      } else if (!inWorkers) {
+        next.push(...s.dependsOn.map((d): [string, boolean] => [d, false]));
+      }
     }
     frontier = next;
   }
-  const out = new Set<string>([verify.id]);
-  for (const w of workers) for (const id of stepsBetween(plan, w, verify)) out.add(id);
+  const from = writers.length ? writers : closest;
+  const out = new Set<string>([gate.id]);
+  for (const w of from) for (const id of stepsBetween(plan, w, gate)) out.add(id);
   return plan.steps.filter((s) => out.has(s.id)).map((s) => s.id);
+}
+
+/**
+ * Tools that run or read but are not meant to edit. runVerify runs repository code in the worktree, so it
+ * keeps a step's risk class 'write' (riskOf, fail closed: baseline, checkpoints, the gate reflex); it does
+ * not make the step one that must change files. A step whose tools are all here may return no change.
+ */
+const NON_EDITING_TOOLS: ReadonlySet<string> = new Set([...READ_ONLY_TOOLS, 'runVerify']);
+
+/** A worker step meant to change files: an effective tool that can edit (the planner's notion too). */
+function editsFiles(plan: Plan, step: Step): boolean {
+  return step.kind === 'worker' && effectiveStepTools(plan, step).some((t) => !NON_EDITING_TOOLS.has(t));
 }
 
 /** A non-budget accounting failure anywhere in the error chain (the loop's or the planner's own). */
@@ -2336,10 +3510,57 @@ function errorsOf(err: unknown): string[] {
   return [msgOf(err) || 'planner failed'];
 }
 
-function closeOutState(step: Step, r: StepResult): Json {
+/** A worker return reporting an error: a non-empty `error` field, or an `error` fact (L5-F2: `{facts: [{key: 'error', ...}]}`). */
+function reportsError(v: unknown): boolean {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  const set = (x: unknown): boolean => x !== undefined && x !== null && x !== false && x !== '';
+  if (set(o.error)) return true;
+  return Array.isArray(o.facts) && o.facts.some((f) => !!f && typeof f === 'object' && /(^|[._-])error$/i.test(String((f as { key?: unknown }).key ?? '')) && set((f as { value?: unknown }).value));
+}
+
+/** The latest gap-ladder rung recorded for capability `id` in the run (capability.missing), if any. */
+function lastResolution(events: Iterable<TeceraEvent>, id: string): GapResolution | undefined {
+  let out: GapResolution | undefined;
+  for (const e of ledgerOrder(events)) {
+    const p = e.payload as { capability?: { id?: unknown }; resolution?: unknown };
+    if (e.kind === 'capability.missing' && p.capability?.id === id && typeof p.resolution === 'string') out = p.resolution as GapResolution;
+  }
+  return out;
+}
+
+/** Why closeOut refused a step (the worker cases say what was wrong with the return). */
+/** Bounds on the closeOut evidence a decider receives. */
+const MAX_EVIDENCE_TEXT = 1000;
+/** Failure context bounds (D-H): output tail per criterion (chars, after redaction), criteria / findings kept. */
+const MAX_FAILURE_TAIL = 2000;
+const MAX_FAILURE_ITEMS = 20;
+const MAX_EVIDENCE_PATHS = 20;
+
+function clip(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
+function refusalReason(r: StepResult, expectsChange: boolean, changed: boolean | null | undefined): string {
+  if (r.kind === 'worker' && r.outcome.kind === 'returned') {
+    if (reportsError(r.outcome.value)) return 'worker returned an error report; not accepted as done';
+    if (expectsChange && changed === false) return 'worker returned without changing the worktree; the step was meant to change files';
+    return 'worker return refused by closeOut';
+  }
+  return describeFailure(r);
+}
+
+function closeOutState(step: Step, r: StepResult, worker: { expectsChange?: boolean; changed?: boolean | null } = {}): Json {
   switch (r.kind) {
     case 'worker':
-      return { stepKind: 'worker', returnValid: r.outcome.kind === 'returned', policyAborts: r.outcome.kind === 'aborted' ? r.outcome.reasons.length : 0 };
+      return {
+        stepKind: 'worker',
+        returnValid: r.outcome.kind === 'returned',
+        policyAborts: r.outcome.kind === 'aborted' ? r.outcome.reasons.length : 0,
+        reportsError: r.outcome.kind === 'returned' && reportsError(r.outcome.value),
+        expectsChange: worker.expectsChange === true,
+        ...(worker.changed !== undefined ? { changed: worker.changed } : {}),
+      };
     case 'gate.verify':
     case 'gate.commit':
     case 'gate.pr':

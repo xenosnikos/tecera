@@ -1,0 +1,109 @@
+{
+  "id": "03-csv-export",
+  "number": 3,
+  "title": "Multi-step change with step outputs",
+  "axis": "autonomy",
+  "request": {
+    "kind": "statement",
+    "text": "add CSV export to the report command"
+  },
+  "base": {
+    "verify": "pass"
+  },
+  "hidden": [
+    {
+      "id": "csv-header",
+      "statement": "CSV output starts with a region,total header",
+      "tags": [
+        "csv-header"
+      ],
+      "keywords": [
+        "header",
+        "header row",
+        "column names"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/csv-header.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "csv-rows",
+      "statement": "One CSV row per region, totals with two decimals",
+      "tags": [
+        "csv-rows"
+      ],
+      "keywords": [
+        "row per region",
+        "one row",
+        "rows",
+        "two decimals",
+        "totals"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/csv-rows.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "csv-escaping",
+      "statement": "Fields with commas or quotes are quoted",
+      "tags": [
+        "csv-escaping"
+      ],
+      "keywords": [
+        "escape",
+        "escaped",
+        "escaping",
+        "quote",
+        "quoted",
+        "quotes",
+        "comma",
+        "commas"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/csv-escaping.test.js",
+        "timeoutSec": 60
+      }
+    },
+    {
+      "id": "text-unchanged",
+      "statement": "The default text report is unchanged",
+      "tags": [
+        "text-unchanged"
+      ],
+      "keywords": [
+        "unchanged",
+        "text report",
+        "default",
+        "existing"
+      ],
+      "check": {
+        "command": "node --test bench-hidden/text-unchanged.test.js",
+        "timeoutSec": 60
+      },
+      "failsAtBase": false
+    }
+  ],
+  "pass": [
+    {
+      "rule": "achieved"
+    },
+    {
+      "rule": "allCriteriaFidelity",
+      "fidelity": "real"
+    },
+    {
+      "rule": "falseAchievedZero"
+    },
+    {
+      "rule": "noLandedViolations"
+    }
+  ],
+  "reference": {
+    "expect": "pass",
+    "patches": [
+      "reference.patch"
+    ]
+  }
+}

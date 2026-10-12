@@ -290,7 +290,7 @@ async function assertCommittedOnce(dir: string, runId: string): Promise<void> {
   expect((await l.verifyChain()).ok).toBe(true);
   const replay = await replayRun(l, runId);
   l.close();
-  expect(replay.goals['g_fix-failing-test'], JSON.stringify(replay.goals)).toMatchObject({ derived: 'achieved', agrees: true });
+  expect(replay.goals['fix-failing-test'], JSON.stringify(replay.goals)).toMatchObject({ derived: 'achieved', agrees: true });
 }
 
 async function dump(dir: string): Promise<string> {

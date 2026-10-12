@@ -122,20 +122,60 @@ describe('D6: push / PR / merge are host gates; a worker program is refused, nev
 });
 
 describe('D6: a Suspend that names a write is refused (per-write approvals were removed)', () => {
-  it('a hook holding a write with SuspendRequest.write: E_DENIED, no suspension, nothing written', async () => {
+  it('a hook holding a non-write tool with SuspendRequest.write: E_DENIED, no suspension, the tool never runs', async () => {
+    const t = spyTool('externalWrite');
     const perWrite = hook('legacyPerWrite', (e) => {
       if (e.stage !== 'Send') return [];
-      const i = e.input as { tool: string; actionHash: string; path?: string };
-      return i.tool === 'edit' ? [{ type: 'Suspend', request: { requestId: 'wr_legacy', action: `write ${i.path}`, actionHash: i.actionHash, reason: 'isolation is degraded', requester: 'worker', write: { path: String(i.path), contentDigest: 'd' } } }] : [];
+      const i = e.input as { tool: string; actionHash: string };
+      return [{ type: 'Suspend', request: { requestId: 'wr_legacy', action: `write ${i.tool}`, actionHash: i.actionHash, reason: 'isolation is degraded', requester: 'worker', write: { path: 'src/a.ts', contentDigest: 'd' } } }];
     });
-    const { broker, session, ledger } = setup([createReadTool(), createEditTool()], [perWrite]);
+    const { broker, session, ledger } = setup([t], [perWrite]);
     const b = broker.beginExec(session(1));
-    const r = await call(broker.bridge, b.writeFile, ['src/a.ts', 'held?']);
+    const r = await call(broker.bridge, b.externalWrite, ['x']);
     expect(r.error?.name).toBe('E_DENIED');
     expect(r.error?.message).toMatch(/names a write: per-write approvals were removed/);
     const rep = await broker.endExec();
     expect(rep.suspension).toBeUndefined();
     expect(ledger.approvals.size).toBe(0);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(t.ran).toEqual([]);
+  });
+});
+
+describe('D6: tool risk is authoritative: a write-risk tool is never held, whatever the Suspend request carries (sprint 5 worker finding 1)', () => {
+  const variants: Array<[string, (i: { actionHash: string; path?: string }) => Record<string, unknown>]> = [
+    ['with SuspendRequest.write', (i) => ({ write: { path: String(i.path), contentDigest: 'd' } })],
+    ['WITHOUT SuspendRequest.write (correct actionHash, no write metadata)', () => ({})],
+  ];
+  for (const [label, extra] of variants) {
+    it(`a hook holding edit ${label}: E_DENIED (policy), no suspension, nothing written`, async () => {
+      const gate = hook('approvalGate', (e) => {
+        if (e.stage !== 'Send') return [];
+        const i = e.input as { tool: string; actionHash: string; path?: string };
+        return i.tool === 'edit' ? [{ type: 'Suspend', request: { requestId: 'ap_edit', action: 'edit', actionHash: i.actionHash, reason: 'edit requires approval', requester: 'worker', ...extra(i) } as never }] : [];
+      });
+      const { broker, session, ledger } = setup([createReadTool(), createEditTool()], [gate]);
+      const b = broker.beginExec(session(1));
+      const r = await call(broker.bridge, b.writeFile, ['src/a.ts', 'held?']);
+      expect(r.error?.name).toBe('E_DENIED');
+      expect(r.error?.message).toMatch(/policy: edit is a write-risk tool: a hook may not hold it for approval/);
+      // the exec is not stopped by the refusal: a later read still runs
+      expect((await call(broker.bridge, b.readFile, ['src/a.ts'])).ok).toBe(true);
+      const rep = await broker.endExec();
+      expect(rep.suspension).toBeUndefined();
+      expect(rep.denied.map((d) => d.tool)).toEqual(['edit']);
+      expect(ledger.approvals.size).toBe(0);
+      expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    });
+  }
+
+  it('any write-risk tool (not only edit): a Suspend without write metadata is refused and the tool never runs', async () => {
+    const t = spyTool('customWriter', ['call'], 'write');
+    const { broker, session, ledger } = setup([t], [holdAll([])]);
+    const b = broker.beginExec(session(1));
+    expect((await call(broker.bridge, b.customWriter, ['x'])).error?.name).toBe('E_DENIED');
+    const rep = await broker.endExec();
+    expect(rep.suspension).toBeUndefined();
+    expect(ledger.approvals.size).toBe(0);
+    expect(t.ran).toEqual([]);
   });
 });

@@ -1,0 +1,41 @@
+[
+  {
+    "when": "welcome",
+    "criteria": [
+      {
+        "id": "welcome-sent",
+        "statement": "Signing up sends one welcome email to the new user through the mail connection",
+        "check": {
+          "kind": "command",
+          "command": "node --input-type=module -e 'import assert from \"node:assert/strict\"; import { signup } from \"./src/signup.js\"; const sent = []; const mailer = { send: async (m) => void sent.push(m) }; await signup({ email: \"ada@example.com\", name: \"Ada\" }, { mailer }); assert.equal(sent.length, 1); assert.equal(sent[0].to, \"ada@example.com\"); assert.match(sent[0].subject, /welcome/i);'",
+          "timeoutSec": 60
+        },
+        "requires": [
+          "mail"
+        ]
+      },
+      {
+        "id": "signup-validates",
+        "statement": "An invalid address is refused, as before",
+        "check": {
+          "kind": "command",
+          "command": "node --test",
+          "timeoutSec": 60
+        }
+      }
+    ],
+    "outOfScope": [
+      "mail templates"
+    ],
+    "assumptions": [
+      "deps.mailer is the mail connection"
+    ],
+    "needs": [
+      {
+        "id": "mail",
+        "kind": "smtp",
+        "mockable": true
+      }
+    ]
+  }
+]

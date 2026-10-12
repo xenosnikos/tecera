@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { AccountingFailure, digest, meteredCall, type Json, type LLMEffort, type Ledger, type LLM, type LLMMessage, type LLMResponse, type LLMUsage, type Redactor, type SecretInput } from '@tecera/contracts';
 import { parseVerdict, type Verdict } from '@tecera/policy';
 import { buildCandidateTree, fileManifest, snapshotCandidate, type Candidate } from './candidate.js';
-import { claim, defaultIds, errMsg, GateMemo, ignoredBaseline, latestVerify, obj, redactorFrom, safeText, writeEvidence } from './evidence.js';
+import { claim, defaultIds, errMsg, GateMemo, ignoredBaseline, keyPart, latestVerify, obj, redactorFrom, safeText, writeEvidence } from './evidence.js';
 import { hostGit, UnsafeRepo } from './gitx.js';
 import type { GateFailure, ReviewReason, ReviewResult, StepContext } from './types.js';
 import { gateWorktree } from './verifyGate.js';
@@ -198,7 +198,7 @@ export class ReviewGate {
     const signal = ctx.signal;
     const meta: Record<string, Json> = { intentionId: ctx.intention.id, stepId: ctx.step.id, attempt: ctx.intention.attempt, recovered: ctx.recovered === true };
     const refuse = async (reason: ReviewReason, detail: Json, d1 = '', d2 = ''): Promise<ReviewResult> => {
-      const key = `review-refused:${ctx.runId}:${ctx.intention.id}:${ctx.step.id}:${this.ids()}`;
+      const key = `review-refused:${keyPart(this.redactor, `${ctx.runId}:${ctx.intention.id}:${ctx.step.id}`)}:${this.ids()}`;
       await writeEvidence(ledger, this.redactor, { key, kind: 'gate.review', runId: ctx.runId, body: { ...meta, verdict: 'reject', reason, detail, fingerprintBefore: d1, fingerprintAfter: d2, terminal: TERMINAL.has(reason), humanNeeded: TERMINAL.has(reason) } });
       this.memo.review.set(memoKey, { evidenceKey: key, d1, d2, verdict: 'reject', files: undefined });
       const failure = failureOf(reason);

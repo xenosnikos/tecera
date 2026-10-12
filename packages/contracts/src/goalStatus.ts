@@ -3,6 +3,7 @@ import { achievementProofProblem, type AchievementGoal, type AchievementProof, t
 import type { TeceraEvent } from './events.js';
 import { eventsChainProblem } from './chain.js';
 import { approvalAuditProblem, prActionHash, verifyCommandDigest, type ApprovalView, type ChainVerdict, type EvidenceRecord } from './ports.js';
+import { provenAchievement } from './proven.js';
 
 /**
  * Offline goal derivation for replay (pure: no ledger, no worktree, no model). A goal is derived
@@ -24,9 +25,12 @@ import { approvalAuditProblem, prActionHash, verifyCommandDigest, type ApprovalV
  *    and an approval.consumed — each request used by one PR only; when approval rows are supplied, the row
  *    must be 'consumed' and match the request;
  * 4. the run recorded goal.achieved for the goal with a proof (D4) that names exactly that verify: the
- *    goal's check command, exit 0, the verified fingerprint, the verify evidence key and a verification time.
+ *    goal's check command, exit 0, the verified fingerprint, the verify evidence key and a verification time;
+ *    and provenAchievement (the single-source decision: evidence, contract, criteria, fidelity, nothing
+ *    after it) accepts that goal.achieved.
  *
  * Anything missing or contradictory derives `dropped` (when the goal was dropped) or `open`, with reasons.
+ * goal.provisional is recorded as 'open' with `provisional: true`: a goal resting on a mock is never achieved.
  */
 
 export interface DeriveGoalOptions {
@@ -44,15 +48,19 @@ export interface DeriveGoalOptions {
   requireCommitApproval?: boolean;
   /** The run's goal.achieved must carry a matching proof (default true, D4). */
   requireProof?: boolean;
+  /** Manifest acceptance.signoff 'always': a goal-file acceptance of criteria does not count. */
+  requireSignoff?: boolean;
 }
 
 export interface DerivedGoal {
   goalId: string;
   runId: string;
   status: 'achieved' | 'dropped' | 'open';
-  /** Status the loop recorded last (goal.* event): open | achieved | dropped | demoted. */
+  /** Status the loop recorded last (goal.* event): open | achieved | dropped | demoted (goal.provisional records open). */
   recorded: string;
   agrees: boolean;
+  /** The latest goal outcome is goal.provisional: every criterion proven, one on a mock. Status stays open. */
+  provisional?: true;
   /** Why it is not achieved (per intention), or what proved it. */
   reasons: string[];
   proof?: {
@@ -133,7 +141,8 @@ export function deriveGoalStatus(events: ReadonlyArray<Ev>, evidence: ReadonlyAr
       if (!cur) goals.set(gid, { goal: g, runId: e.runId });
       else if (cur.runId !== e.runId || cur.goal.check?.command !== g.check?.command || cur.goal.check?.timeoutSec !== g.check?.timeoutSec) cur.conflict = 'the goal was adopted twice with different checks or runs';
       recorded.set(gid, 'open');
-    } else if (e.kind.startsWith('goal.')) recorded.set(gid, e.kind.slice(5));
+    } else if (e.kind === 'goal.provisional') recorded.set(gid, 'open');
+    else if (e.kind.startsWith('goal.')) recorded.set(gid, e.kind.slice(5));
   }
 
   const out: Record<string, DerivedGoal> = {};
@@ -153,7 +162,7 @@ export function deriveGoalStatus(events: ReadonlyArray<Ev>, evidence: ReadonlyAr
       for (const iid of intentionIds) {
         const planId = runEvents.find((e) => e.trace.intentionId === iid && e.trace.planId)?.trace.planId;
         const plan = planId ? plans.get(`${runId}:${planId}`) : undefined;
-        const r = proveIntention(runEvents, ev, goal, runId, iid, { requireCommit, requirePr, requireApproval, requireProof, approvals: opts.approvals, plan });
+        const r = proveIntention(runEvents, ev, goal, runId, iid, { requireCommit, requirePr, requireApproval, requireProof, requireSignoff: opts.requireSignoff === true, approvals: opts.approvals, plan });
         if (r.ok) {
           proof = r.proof;
           break;
@@ -162,7 +171,8 @@ export function deriveGoalStatus(events: ReadonlyArray<Ev>, evidence: ReadonlyAr
       }
     }
     const status: DerivedGoal['status'] = proof ? 'achieved' : dropped ? 'dropped' : 'open';
-    out[gid] = { goalId: gid, runId, status, recorded: rec, agrees: status === rec, reasons: proof ? [`achieved by ${proof.intentionId}`] : reasons, ...(proof ? { proof } : {}) };
+    const provisional = !proof && provenAchievement(runEvents, ev, { runId, goalId: gid }).provisional;
+    out[gid] = { goalId: gid, runId, status, recorded: rec, agrees: status === rec, reasons: proof ? [`achieved by ${proof.intentionId}`] : reasons, ...(proof ? { proof } : {}), ...(provisional ? { provisional: true as const } : {}) };
   }
   return { chainValid, problems, goals: out };
 }
@@ -173,7 +183,7 @@ function proveIntention(
   goal: AchievementGoal,
   runId: string,
   iid: string,
-  o: { requireCommit: boolean; requirePr: boolean; requireApproval: boolean; requireProof: boolean; approvals?: ReadonlyArray<ApprovalView>; plan?: Plan },
+  o: { requireCommit: boolean; requirePr: boolean; requireApproval: boolean; requireProof: boolean; requireSignoff: boolean; approvals?: ReadonlyArray<ApprovalView>; plan?: Plan },
 ): { ok: true; proof: NonNullable<DerivedGoal['proof']> } | { ok: false; why: string } {
   const mine = evs.filter((e) => e.trace.intentionId === iid && e.trace.goalId === goal.id);
   const done = mine.find((e) => e.kind === 'intention.done');
@@ -225,6 +235,12 @@ function proveIntention(
       }
       if (pr!.evidenceKey !== v.key || pr!.fingerprint !== v.fingerprint) {
         why = `goal.achieved proof names verify ${pr!.evidenceKey} / ${pr!.fingerprint}, not the final verify ${v.key} / ${v.fingerprint}`;
+        continue;
+      }
+      const proven = provenAchievement(evs, evidence, { runId, goalId: goal.id, ...(o.requireSignoff ? { requireApproval: true } : {}) });
+      if (!proven.achieved) return { ok: false, why: `goal.achieved is not proven: ${proven.why}` };
+      if (proven.achievedEventId !== a.id) {
+        why = 'a later goal.achieved supersedes this proof';
         continue;
       }
       return { ok: true, proof: pr! };
@@ -380,8 +396,9 @@ export function activeRunOf(events: Iterable<TeceraEvent>): { runId: string; goa
 
 /**
  * The proof of the latest goal.achieved of `runId` (optionally of one goal) that is well formed and not
- * followed by a demotion or drop of that goal in the run; null when there is none, or when any goal the run
- * adopted (in scope) has no such proof.
+ * followed by a demotion, drop, re-adoption, goal.provisional or criteria.amended of that goal in the run.
+ * Null when there is none, or when any goal the run adopted (in scope) has no such proof. Shape only:
+ * callers that decide anything (Stop, exit status) use provenRun / provenAchievement instead.
  */
 export function achievedProofOf(events: Iterable<TeceraEvent>, runId: string, goalId?: string): AchievementProof | null {
   const proofs = new Map<string, AchievementProof | null>();
@@ -391,7 +408,7 @@ export function achievedProofOf(events: Iterable<TeceraEvent>, runId: string, go
       const p = obj(e.payload).proof as unknown;
       const goal = obj(e.payload).goal as unknown as Partial<AchievementGoal> | undefined;
       proofs.set(e.trace.goalId, achievementProofProblem(p, goal?.check) === null ? (p as AchievementProof) : null);
-    } else if (e.kind === 'goal.demoted' || e.kind === 'goal.dropped' || e.kind === 'goal.adopted') proofs.set(e.trace.goalId, null);
+    } else if (e.kind === 'goal.demoted' || e.kind === 'goal.dropped' || e.kind === 'goal.adopted' || e.kind === 'goal.provisional' || e.kind === 'criteria.amended') proofs.set(e.trace.goalId, null);
   }
   let out: AchievementProof | null = null;
   for (const p of proofs.values()) {

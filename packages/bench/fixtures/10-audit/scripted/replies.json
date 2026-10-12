@@ -1,0 +1,30 @@
+{
+  "worker": [
+    {
+      "expect": "Read the failing test and the implementation under test",
+      "text": "```js\nconst f0 = await readFile('test/split.test.js');\nconst f1 = await readFile('src/split.js');\nconsole.log('test/split.test.js', f0.bytes, 'src/split.js', f1.bytes);\nreturn { facts: [{ key: 'rootCause', value: 'splitBill floors every share and drops the remainder' }, { key: 'targetFiles', value: ['src/split.js'] }] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 200
+      }
+    },
+    {
+      "expect": "Fix the root cause",
+      "text": "```js\nawait writeFile({ path: 'src/split.js', oldText: '  return Array.from({ length: people }, () => share);', newText: '  const extra = totalCents - share * people;\\n  return Array.from({ length: people }, (_, i) => share + (i < extra ? 1 : 0));' });\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/split.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2400,
+        "output": 200
+      }
+    }
+  ],
+  "reviewer": [
+    {
+      "expect": "src/split.js",
+      "text": "{\"verdict\": \"approve\", \"findings\": []}",
+      "usage": {
+        "input": 1800,
+        "output": 40
+      }
+    }
+  ]
+}

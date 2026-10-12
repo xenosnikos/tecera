@@ -121,16 +121,25 @@ function looksBinary(buf: Buffer): boolean {
   return false;
 }
 
-/** Added lines per file from a unified diff. */
+/** Added and removed lines per file from a unified diff (a deleted file under its old path). */
 export function parseHunks(diff: string): Hunk[] {
   const hunks: Hunk[] = [];
   let current: Hunk | undefined;
-  for (const line of diff.split('\n')) {
-    if (line.startsWith('+++ ')) {
+  let from = '';
+  const lines = diff.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    // A file header is a '--- ' line followed by a '+++ ' line; a removed "-- x" content line is not one.
+    if (line.startsWith('--- ') && lines[i + 1]?.startsWith('+++ ')) {
+      const p = line.slice(4).replace(/^a\//, '');
+      from = p === '/dev/null' ? '' : p;
+    } else if (line.startsWith('+++ ')) {
       const p = line.slice(4).replace(/^b\//, '');
-      current = { path: p === '/dev/null' ? '' : p, added: [] };
+      // A deleted file's lines are all removed: keep them under its old path.
+      current = { path: p === '/dev/null' ? from : p, added: [], removed: [] };
       hunks.push(current);
-    } else if (current && line.startsWith('+') && !line.startsWith('+++')) current.added.push(line.slice(1));
+    } else if (current && line.startsWith('+')) current.added.push(line.slice(1));
+    else if (current && line.startsWith('-')) current.removed!.push(line.slice(1));
   }
   return hunks.filter((h) => h.path);
 }

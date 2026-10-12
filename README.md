@@ -17,7 +17,13 @@ returns the result, the record of how it got there, and what it cost.
 Tecera's control structure is the BDI cycle (beliefs, desires, intentions) over an append-only event log.
 
 ```
-goal + check ──► plan (frontier model writes one if none matches; staged until a human promotes it)
+request ──► acceptance contract (criteria, each with its own check; the requestor signs it off)
+                  │
+                  ▼
+goal + criteria ──► capability inventory (declared connections probed; a missing one is provisioned
+                  │                       locally, mocked behind the broker, or asked for)
+                  ▼
+              plan (frontier model writes one if none matches; staged until a human promotes it)
                   │
                   ▼
         worker steps ──► gate.verify ──► gate.review ──► gate.verify ──► gate.commit ──► gate.pr
@@ -28,6 +34,14 @@ goal + check ──► plan (frontier model writes one if none matches; staged u
 
 - **Beliefs** are a projection of the log. Nothing is remembered that cannot be traced to an event.
 - **Goals** carry an environmental check. A worker returning is never completion; the check passing is.
+- **Acceptance contracts** turn a request into criteria, each proven by a command or a named human
+  judgment. A free-text request holds until the requestor accepts the contract; a goal file that carries
+  criteria is already accepted. Every proof records how the criterion was met: `real`, `provisioned`
+  or `mocked`. A goal that rests on a mock is `provisional`, never achieved.
+- **Provisioned resources are debts.** When a criterion needs a capability the project lacks, Tecera can
+  create a local stand-in (a temporary directory, a bare git remote, a SQLite file, a loopback HTTP stub)
+  inside a declared allowance. Each is logged with its teardown and listed in the PR until a human
+  transfers or releases it. Tecera never widens its own access in your systems.
 - **Intentions** are committed plans. Independent steps run concurrently; dependencies impose order.
 - **Reflexes** make the small decisions between steps (which plan, which model, allow or hold, interrupt,
   did it work). They are rules by default and escalate to the frontier model when unsure.
@@ -59,6 +73,7 @@ TECERA=/path/to/tecera/packages/tecera/bin/tecera.js
 node $TECERA init
 node $TECERA run fix-failing-test --scripted /path/to/tecera/packages/runtime/test-fixtures/fix-failing-test
 # exit 4: held at the PR gate. The output names the approval request and the run id.
+# (A free-text request holds first for the acceptance contract: `tecera criteria show|accept <runId>`.)
 node $TECERA approve <request> --as you
 node $TECERA run --resume <runId> --scripted /path/to/tecera/packages/runtime/test-fixtures/fix-failing-test
 node $TECERA why <commit event id>      # action → step → intention → goal → event
@@ -85,7 +100,8 @@ that user can read.
 - A commit on `tecera/<goal>` and either an opened pull request (when the repository has a remote and `gh`
   is authenticated) or a patch bundle under `.tecera/runs/<run>/pr/`. Tecera never merges.
 - `goal.achieved` with a proof: the check command, exit code 0, the candidate fingerprint and the evidence
-  key of the passing verification.
+  key of the passing verification, plus one proof per acceptance criterion with its fidelity. The PR
+  body lists every criterion, how it was proven, and any provisioned resource awaiting transfer.
 - A hash-chained ledger of every event, decision and model call, with cost per step and per model.
 - A generated plan staged as a candidate. It joins the plan library only when a human graduates it with a
   written rationale (`tecera plans graduate`).
@@ -96,23 +112,26 @@ that user can read.
 tecera init | validate | doctor | preflight <goal>
 tecera run <goal|statement> [--dry-run --scripted <dir>]      tecera run --resume <runId>
 tecera approve|deny <request> [--as <you>]
+tecera criteria show|accept|amend <run> [--as <you>]      tecera resources list|release|transfer <id>
 tecera status | evidence <run> | why <event> | gate <goal>
 tecera plans|memory candidates|graduate|reject|retract <id> --rationale <text>
 tecera adapters install|doctor <host>        tecera hook pre-tool|stop
 ```
 
 Exit codes: 0 ok · 2 invalid · 3 not ready · 4 held for approval · 5 verify failed · 6 review rejected ·
-7 budget (only when `budgets.enforce` is true) · 8 policy · 9 ledger or human needed · 130 interrupted.
+7 budget (only when `budgets.enforce` is true) · 8 policy · 9 ledger or human needed · 10 provisional
+(every criterion proven, at least one on a mock) · 130 interrupted.
 
 ## Configuration
 
 A project is a *business case*: a `tecera.json` manifest plus a `.tecera/` folder.
 
 - **`tecera.json`**: seats (planner, workers, reviewer), reflex settings, commitment policy, budgets,
-  sandbox, protected paths, the verify command, and the mandatory hooks. Secrets are references
-  (`env:NAME`), never values; unknown fields are rejected.
-- **`.tecera/`**: goals (what, plus the check), graduated plans, skills, permissions, and memory. The
-  ledger and run folders live here too and are git-ignored.
+  sandbox, protected paths, the verify command, declared `connections` (each with a probe command and
+  whether a stand-in may serve it), the local `provisioning` allowance, and the mandatory hooks. Secrets
+  are references (`env:NAME`), never values; unknown fields are rejected.
+- **`.tecera/`**: goals (what, the check, and optionally the acceptance criteria), graduated plans,
+  skills, permissions, and memory. The ledger and run folders live here too and are git-ignored.
 
 Tecera mounts into Claude Code and Codex through `tecera adapters install`: a managed block in
 `CLAUDE.md` / `AGENTS.md`, a deny list, a pre-tool hook that blocks edits to protected paths, and a stop
@@ -134,6 +153,7 @@ hook that refuses to let a session end while a run has no proof of achievement.
 | `@tecera/gates` | Verify, foreign review, commit and pull-request gates |
 | `@tecera/runtime`, `tecera` | Composition root and the CLI |
 | `@tecera/adversarial` | The named attack cases from the security design, run against the real components |
+| `@tecera/bench` | Ten benchmark scenarios for autonomy, control and compliance; a runner that drives the real CLI; a scorer that reads only the ledger |
 
 ## Lineage
 

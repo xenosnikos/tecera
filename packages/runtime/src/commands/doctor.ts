@@ -1,6 +1,9 @@
 import { mkdirSync } from 'node:fs';
 import { seatVendor, type Json } from '@tecera/contracts';
 import { checkAdapter, enabledHosts } from '../adapters/install.js';
+import { buildInventory } from '../capabilities/inventory.js';
+import { ConnectionProbe, storeAuthResolver } from '../capabilities/probe.js';
+import { LOCAL_KINDS } from '../capabilities/provisioner.js';
 import type { CommandContext, Command } from '../cli/context.js';
 import { pad } from '../cli/io.js';
 import { EXIT, NotWired } from '../errors.js';
@@ -25,6 +28,10 @@ import type { SeatRef } from '../wiring.js';
  * model; the probes are reported as not run instead.
  * A repository whose local git config can run programs (filters, textconv, includes) is reported missing
  * and `git status` is not run on it.
+ * Capability inventory (D9, D10): every connection declared in the manifest is probed for real (its probe
+ * command through the contained verify runner, or its auth reference resolved without printing it) and listed
+ * with the rung of the gap ladder a missing one resolves to (provision / mock / ask), next to the provisioning
+ * allowance. A missing connection is a note: a run asks for it only when a criterion requires it.
  */
 
 export type CheckStatus = 'ok' | 'note' | 'missing';
@@ -177,6 +184,9 @@ export async function doctorChecks(c: CommandContext, opts: { skipLive: boolean;
       add('lock', 'missing', (e as Error).message);
     }
 
+    // D9/D10: the capability inventory (probed for real) and the provisioning allowance.
+    for (const k of await capabilityChecks(rt, c.opts.signal)) add(k.name, k.status, k.detail);
+
     // D6: commits land on the work branch without approval; the PR is the approval point (D1: local principal).
     add('policy', 'note', `approvals: ${rt.manifest.policy.approvals.required.join(', ')} — the PR gate holds (exit 4) until \`tecera approve <request> [--as <you>]\` (default $USER, never the requester); Tecera never merges`);
 
@@ -185,6 +195,31 @@ export async function doctorChecks(c: CommandContext, opts: { skipLive: boolean;
     else await liveSeatChecks(c, rt, checks);
   }
   return { checks, rt };
+}
+
+/**
+ * The capability inventory of a business case: one check per declared connection (probed for real, never
+ * printing a credential) with how a missing one would be resolved, and the provisioning allowance.
+ */
+export async function capabilityChecks(rt: Runtime, signal?: AbortSignal): Promise<Check[]> {
+  const out: Check[] = [];
+  const m = rt.manifest;
+  const a = m.provisioning;
+  out.push({ name: 'provision', status: 'note', detail: a.scope === 'local' ? `local: ${a.kinds.filter((k) => (LOCAL_KINDS as readonly string[]).includes(k)).join(', ') || 'no supported kind'} · at most ${a.maxResources} per run · ${a.ttlSec}s lifetime · debts until transferred or released (tecera resources)` : 'scope none: nothing is provisioned; a missing capability is mocked (when mockable) or asked for' });
+  const ids = Object.keys(m.connections).sort();
+  if (!ids.length) {
+    out.push({ name: 'capability', status: 'note', detail: 'no connections declared in tecera.json' });
+    return out;
+  }
+  const probe = new ConnectionProbe({ connections: m.connections, runner: rt.verifyRunner, cwd: rt.root, envAllowlist: [...m.sandbox.envAllowlist], authResolves: storeAuthResolver(rt.env, rt.root), redactor: rt.redactor, ...(signal ? { signal } : {}) });
+  const details = await probe.probeAll();
+  const inv = buildInventory({ connections: m.connections, allowance: a, required: ids, probes: details.map((d) => d.record), provisionable: LOCAL_KINDS });
+  for (const d of inv.decisions) {
+    const probed = details.find((x) => x.record.id === d.id);
+    const detail = d.resolution === 'use' ? `${d.kind} available (${d.reason})` : `${d.kind} missing (${probed?.reason ?? d.reason}) → a run would ${d.resolution === 'provision' ? `provision a local ${d.kind}` : d.resolution === 'mock' ? 'serve a stand-in (fidelity mocked, goal provisional)' : 'ask the requestor'}`;
+    out.push({ name: `cap:${d.id}`, status: d.resolution === 'use' ? 'ok' : 'note', detail: rt.redact(detail) });
+  }
+  return out;
 }
 
 /** Ceiling on what one doctor's live probes may spend before the remaining seats are skipped. */

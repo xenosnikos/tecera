@@ -203,7 +203,8 @@ export function decideBash(cmdRaw: unknown, ctx: HookContext): HookDecision {
   }
   if (bin === 'tecera') {
     const sub = args.find((a) => !a.startsWith('-'));
-    if (!sub || !TECERA_READ.has(sub)) return deny(`${BASH_HELP} (\`tecera ${sub ?? ''}\` is not available to agents; approvals and learning are human decisions)`);
+    if (!sub || !TECERA_READ.has(sub))
+    return deny(`${BASH_HELP} (\`tecera ${sub ?? ''}\` is not available to agents; approvals and learning are human decisions)`);
     if (args.some((a) => /^--(manifest|fix|export)(=|$)/.test(a))) return deny(`${BASH_HELP} (tecera flag refused)`);
   }
   return { allow: true };

@@ -5,11 +5,15 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CapabilitySet, Effect, Hook, Inputs, Json, JsonObject, Ledger, SpanEvent, SpanKind, Tool } from '@tecera/contracts';
 import { Broker } from '../broker/broker.js';
 import { scope } from '../scope.js';
-import { createEditTool } from '../tools/edit.js';
+import { createEditTool as writeRiskEditTool, type EditToolOptions } from '../tools/edit.js';
+import { irreversibleDouble } from './fakes.js';
 import { createReadTool } from '../tools/read.js';
 import { FakeLedger, FakeLLM, FakeRepl, liveWriteGuard } from './fakes.js';
 import { invoke, resume, type InvokeOptions, type ResumeDeps } from './invoke.js';
 import type { TraceEntry } from './span.js';
+
+/** D6: a write-risk tool is never held for approval; the approval tests here hold an irreversible double of edit. */
+const createEditTool = (o?: EditToolOptions) => irreversibleDouble(writeRiskEditTool(o));
 
 const caps = (tools = ['read', 'edit']): CapabilitySet => ({
   tools,

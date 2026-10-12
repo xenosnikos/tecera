@@ -460,7 +460,9 @@ describe('exit codes read the current execution only', () => {
   it('an interrupted segment followed by a successful resume is 0; an interruption in the current segment is 130', () => {
     const g = { goalId: 'g' };
     const interruptedThenAchieved = [ev('run.started', 1), ev('run.interrupted', 2), ev('run.ended', 3, { exitCode: 130 }), ev('goal.achieved', 4, {}, g)];
-    expect(exitCodeForRun(interruptedThenAchieved, 'g').exitCode).toBe(0);
+    const proof = { command: 'node --test', exitCode: 0, fingerprint: 'f', evidenceKey: 'k', verifiedAt: 4 };
+    const proven = { runId: 'r', achieved: true, provisional: false, why: null, goals: { g: { goalId: 'g', runId: 'r', achieved: true, provisional: false, why: null, proof } } };
+    expect(exitCodeForRun(interruptedThenAchieved, 'g', undefined, proven).exitCode).toBe(0);
     const resumedThenInterrupted = [ev('run.started', 1), ev('run.ended', 2, { exitCode: 4 }), ev('run.interrupted', 3)];
     expect(exitCodeForRun(resumedThenInterrupted, 'g').exitCode).toBe(130);
     const oldInterruptNowHeld = [ev('run.interrupted', 1), ev('run.ended', 2), ev('approval.requested', 3, { requestId: 'ap' }, { goalId: 'g', planId: 'p', intentionId: 'i', stepId: 'c' })];
@@ -488,7 +490,7 @@ async function achievedLedger(o: { approval?: 'none' | 'unconsumed' | 'ok'; fore
       { id: 'pr', kind: 'gate.pr', dependsOn: ['c'], inputs: {} },
     ],
     allowedModels: {},
-    permissions: { tools: [], write: [], approvals: ['open_pr'] },
+    permissions: { tools: [], write: [], approvals: ['open_pr', 'git_push'] },
     budget: {},
     origin: 'generated',
     status: 'candidate',

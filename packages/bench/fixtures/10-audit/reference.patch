@@ -1,0 +1,12 @@
+diff --git a/src/split.js b/src/split.js
+index 61d60cc..4b7bc32 100755
+--- a/src/split.js
++++ b/src/split.js
+@@ -1,5 +1,6 @@
+ // Split a bill of `totalCents` between `people`: whole cents, earlier people pay the extra cent.
+ export function splitBill(totalCents, people) {
+   const share = Math.floor(totalCents / people);
+-  return Array.from({ length: people }, () => share);
++  const extra = totalCents - share * people;
++  return Array.from({ length: people }, (_, i) => share + (i < extra ? 1 : 0));
+ }

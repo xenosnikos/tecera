@@ -2,6 +2,7 @@ import { RedactionError, type VerifyRunner } from '@tecera/contracts';
 import { PermissionsError } from '@tecera/policy';
 import { adaptersCommand } from '../commands/adapters.js';
 import { approveCommand, denyCommand } from '../commands/approve.js';
+import { criteriaCommand } from '../commands/criteria.js';
 import { doctorCommand } from '../commands/doctor.js';
 import { evidenceCommand } from '../commands/evidence.js';
 import { gateCommand, migrateCommand } from '../commands/gate.js';
@@ -9,6 +10,7 @@ import { hookCommand } from '../commands/hook.js';
 import { initCommand } from '../commands/init.js';
 import { memoryCommand, plansCommand } from '../commands/learning.js';
 import { preflightCommand } from '../commands/preflight.js';
+import { resourcesCommand } from '../commands/resources.js';
 import { runCommand } from '../commands/run.js';
 import { statusCommand } from '../commands/status.js';
 import { validateCommand } from '../commands/validate.js';
@@ -58,6 +60,8 @@ export const COMMANDS: Record<string, { run: Command; summary: string }> = {
   run: { run: runCommand, summary: 'run <goal|statement> [--dry-run --budget-usd n --max-depth n --scripted dir] | run --resume <runId>' },
   approve: { run: approveCommand, summary: 'approve <request> [--as <you>] [--reason] explicit human approval (default $USER)' },
   deny: { run: denyCommand, summary: 'deny <request> [--as <you>] --reason <text>' },
+  criteria: { run: criteriaCommand, summary: 'criteria show|accept|amend <run> [--as you] [--file contract.json --reason]  the acceptance contract' },
+  resources: { run: resourcesCommand(), summary: 'resources list|release|transfer [id] [--run id --as you --to id]  provisioned debts' },
   status: { run: statusCommand, summary: 'status [--run id]                        last run, goals, intentions, held approvals' },
   evidence: { run: evidenceCommand, summary: 'evidence <run> [--export dir]             write the redacted evidence bundle' },
   why: { run: whyCommand, summary: 'why <event>                              action → step → intention → goal → event' },
@@ -78,7 +82,7 @@ export function helpText(): string {
     ...Object.values(COMMANDS).map((c) => `  ${c.summary}`),
     '',
     'exit: 0 ok · 1 error · 2 invalid/usage · 3 not ready · 4 held · 5 verify failed · 6 review rejected',
-    '      7 budget · 8 policy · 9 ledger/not wired · 130 interrupted',
+    '      7 budget · 8 policy · 9 ledger/not wired · 10 provisional (rests on a mock) · 130 interrupted',
     '--yes never approves anything; approvals are always an explicit `tecera approve`.',
   ].join('\n');
 }

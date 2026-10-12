@@ -1,6 +1,7 @@
-import { MANDATORY_HOOKS, SECRET_PATTERNS, stringLeaves, type AttemptFingerprint, type Effect, type Hook, type HookDescriptor, type Json, type Manifest, type SpanEvent } from '@tecera/contracts';
+import { MANDATORY_HOOKS, SECRET_PATTERNS, stringLeaves, type AcceptanceContract, type AttemptFingerprint, type Effect, type Hook, type HookDescriptor, type Json, type Manifest, type SpanEvent } from '@tecera/contracts';
 import { matchesAny, pathProblem } from '../glob.js';
-import { MERGE_ACTIONS, PR_GATE_ACTIONS, classify, type PermissionsDoc } from '../permissions.js';
+import { APPROVAL_ONLY_ACTIONS, MERGE_ACTIONS, PR_GATE_ACTIONS, classify, type PermissionsDoc } from '../permissions.js';
+import { contractTouch, criterionTargets, packageScriptWriteProblem } from '../contractTamper.js';
 import { BudgetPool, IterationLimit, RecursionLimit } from './limits.js';
 import { ProgressCheck } from './progress.js';
 
@@ -8,7 +9,8 @@ import { ProgressCheck } from './progress.js';
  * The fourteen mandatory hooks. A manifest that does not list exactly these does not parse; a worker
  * started without all of them refuses to run. Several gate-level hooks (diffBoundary, foreignReview,
  * verifyGate, tamperCheck, progressCheck) act at the Commit step in the loop; their hook form records
- * their presence at Invoke/Enter so the governance record is complete.
+ * their presence at Invoke/Enter so the governance record is complete. Under an acceptance contract
+ * tamperCheck also refuses, at ToolCall/Enter, a worker write to the contract or to what its criteria run.
  */
 
 export class MissingMandatoryHooks extends Error {
@@ -45,6 +47,14 @@ export interface MandatoryDeps {
   progressHistory?: () => AttemptFingerprint[];
   fingerprintOf?: (attempt: number) => string | null | undefined;
   attempt?: () => number;
+  /**
+   * The accepted acceptance contract of the goal the worker serves (null/absent = none, nothing extra is
+   * checked). With one, the tamperCheck hook aborts a worker write to the file holding it (`contractPaths`,
+   * default DEFAULT_CONTRACT_GLOBS), to a file a criterion's check command runs, or to a package.json in a
+   * way that may change a script it runs (packageScriptWriteProblem).
+   */
+  contract?: () => AcceptanceContract | null | undefined;
+  contractPaths?: readonly string[];
 }
 
 export function mandatoryHooks(m: Manifest, deps: MandatoryDeps): Hook[] {
@@ -93,6 +103,10 @@ export function mandatoryHooks(m: Manifest, deps: MandatoryDeps): Hook[] {
       const names = [action, method ?? '', tool ?? ''].filter((a) => a !== '');
       // D6: merging is never done; pushing and opening a PR happen only at the gate.pr step, on the human
       // approval it consumes — a worker can neither do them nor hold an approval for them.
+      // D8: accepting criteria and answering a human criterion are a human's approvals; a worker can neither
+      // perform them nor suspend to request one (it would choose the action hash the human grants).
+      const own = names.find((a) => APPROVAL_ONLY_ACTIONS.has(a));
+      if (own) return [{ type: 'Abort', code: 'policy', reason: `${own} is a human approval: no worker performs or requests it` }];
       const merge = names.find((a) => MERGE_ACTIONS.has(a));
       if (merge) return [{ type: 'Abort', code: 'policy', reason: `${merge}: Tecera never merges` }];
       const pr = names.find((a) => PR_GATE_ACTIONS.has(a));
@@ -111,7 +125,18 @@ export function mandatoryHooks(m: Manifest, deps: MandatoryDeps): Hook[] {
 
     simple('foreignReview', ['Invoke'], () => [], { reviewer: m.seats.reviewer.provider, foreign: true }),
     simple('verifyGate', ['Invoke'], () => [], { command: m.verify.command }),
-    simple('tamperCheck', ['Invoke'], () => [], {}),
+    simple('tamperCheck', ['Invoke', 'ToolCall'], (e) => {
+      if (e.span !== 'ToolCall' || e.stage !== 'Enter' || !deps.contract) return [];
+      const { tool, method, path } = toolCallInput(e);
+      const writes = method === 'write' || method === 'edit' || method === 'delete' || tool === 'edit';
+      if (!writes || !path) return [];
+      const contract = deps.contract();
+      if (!contract) return [];
+      const targets = criterionTargets(contract);
+      const hit = contractTouch(path, { contract, ...(deps.contractPaths ? { contractPaths: deps.contractPaths } : {}) }, targets);
+      const why = hit?.detail ?? packageScriptWriteProblem(toolCallInput(e), targets);
+      return why ? [{ type: 'Abort', code: 'policy', reason: `tampering: ${why}; the contract and its checks are the requestor's` }] : [];
+    }, {}),
     new ProgressCheck({ ...(deps.progressHistory ? { history: deps.progressHistory } : {}), ...(deps.fingerprintOf ? { fingerprintOf: deps.fingerprintOf } : {}), ...(deps.attempt ? { attempt: deps.attempt } : {}) }),
 
     simple('secretCanary', ['Invoke', 'LLMQuery', 'ToolCall'], (e) => {

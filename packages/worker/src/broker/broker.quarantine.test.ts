@@ -8,11 +8,15 @@ import { Dispatcher } from '../hooks/dispatcher.js';
 import { FakeLedger, liveWriteGuard } from '../invoke/fakes.js';
 import { History } from '../invoke/history.js';
 import { SpanRunner, type TraceEntry } from '../invoke/span.js';
-import { createEditTool } from '../tools/edit.js';
+import { createEditTool as writeRiskEditTool, type EditToolOptions } from '../tools/edit.js';
+import { irreversibleDouble } from '../invoke/fakes.js';
 import { createReadTool } from '../tools/read.js';
 import { createRunVerifyTool } from '../tools/runVerify.js';
 import { worktreeTaint } from '../tools/paths.js';
 import { Broker, type ExecSession, type SubInvokeResult } from './broker.js';
+
+/** D6: a write-risk tool is never held for approval; the approval tests here hold an irreversible double of edit. */
+const createEditTool = (o?: EditToolOptions) => irreversibleDouble(writeRiskEditTool(o));
 
 /**
  * Quarantine of unresolved writers and redaction at every broker boundary (Codex sprint-2 invoke New

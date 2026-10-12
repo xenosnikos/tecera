@@ -1,0 +1,41 @@
+diff --git a/src/sessions.js b/src/sessions.js
+index 1b30831..ce96254 100755
+--- a/src/sessions.js
++++ b/src/sessions.js
+@@ -1,20 +1,26 @@
+-// Session store: createSessionStore({ path }) keeps the app's sessions.
+-// Sessions live in memory only today, so they vanish when the process restarts; `path` names where a
+-// persistent store would keep them.
++import { DatabaseSync } from 'node:sqlite';
++
++// Session store: createSessionStore({ path }) keeps the app's sessions in a SQLite file at `path`
++// (in memory when no path is given), so they survive a restart.
+ export function createSessionStore(options = {}) {
+-  void options;
+-  const sessions = new Map();
++  const db = new DatabaseSync(options.path ?? ':memory:');
++  db.exec('CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL)');
++  const put = db.prepare('INSERT INTO sessions (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data');
++  const read = db.prepare('SELECT data FROM sessions WHERE id = ?');
++  const del = db.prepare('DELETE FROM sessions WHERE id = ?');
+   return {
+     set(id, data) {
+-      sessions.set(id, structuredClone(data));
++      put.run(id, JSON.stringify(data));
+     },
+     get(id) {
+-      const s = sessions.get(id);
+-      return s === undefined ? undefined : structuredClone(s);
++      const row = read.get(id);
++      return row === undefined ? undefined : JSON.parse(row.data);
+     },
+     delete(id) {
+-      sessions.delete(id);
++      del.run(id);
++    },
++    close() {
++      db.close();
+     },
+-    close() {},
+   };
+ }

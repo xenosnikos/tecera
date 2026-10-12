@@ -20,6 +20,16 @@ export const EVENT_KINDS = [
   'goal.achieved',
   'goal.demoted',
   'goal.dropped',
+  'goal.provisional',
+  'criteria.drafted',
+  'criteria.accepted',
+  'criteria.amended',
+  'capability.probed',
+  'capability.missing',
+  'capability.mocked',
+  'resource.provisioned',
+  'resource.released',
+  'resource.transferred',
   'plan.generated',
   'plan.staged',
   'plan.graduated',
@@ -106,6 +116,22 @@ export const TRACE_REQUIREMENTS: Record<EventKind, ReadonlyArray<TraceField>> = 
   'goal.achieved': ['goalId'],
   'goal.demoted': ['goalId'],
   'goal.dropped': ['goalId'],
+  /** Every criterion is proven but at least one rests on a mock: not achieved; the Stop hook still blocks. */
+  'goal.provisional': ['goalId'],
+  /** The planner's acceptance contract for a request (payload.contract, payload.hash). */
+  'criteria.drafted': ['goalId'],
+  /** The requestor accepted the contract with this hash; work may start. */
+  'criteria.accepted': ['goalId'],
+  /** The contract changed after acceptance (payload.from, payload.to): forces re-planning. */
+  'criteria.amended': ['goalId'],
+  'capability.probed': [],
+  'capability.missing': ['goalId'],
+  /** A stand-in serves this capability behind the broker; everything it returns is tagged simulated. */
+  'capability.mocked': ['goalId'],
+  /** Tecera created a resource in its own space (payload: the ProvisionedResource, with its teardown). */
+  'resource.provisioned': ['goalId'],
+  'resource.released': [],
+  'resource.transferred': [],
   'plan.generated': ['goalId', 'planId'],
   'plan.staged': ['planId'],
   'plan.graduated': ['planId'],

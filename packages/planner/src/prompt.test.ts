@@ -22,7 +22,7 @@ describe('buildPlannerPrompt', () => {
     for (const k of ['`worker`', '`gate.verify`', '`gate.review`', '`gate.commit`', '`gate.pr`', '`subgoal`']) expect(system).toContain(k);
     expect(system).toMatch(/MUST end with gate.verify → gate.review → gate.verify → gate.commit → gate.pr, in that order/);
     expect(system).toMatch(/the PR step is the single last step/);
-    expect(system).toMatch(/MUST list `open_pr` in `permissions.approvals`/);
+    expect(system).toMatch(/MUST list both `open_pr` and `git_push` in `permissions.approvals`/);
     expect(system).toMatch(/`gate.commit`: host-run\. Commits .* to the work branch .* No approval/);
     expect(system).toMatch(/Tecera never merges/);
     // runVerify is not a read-only tool (contracts READ_ONLY_TOOLS): the prompt never calls it one.

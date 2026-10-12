@@ -41,7 +41,6 @@ export interface CreateGatesOptions {
   ids?: () => string;
   /** Diff base; defaults to manifest.repo.base. */
   base?: string;
-  requireVerify?: boolean;
   /** Only tightens the derived read-only-tests rule. */
   testsReadOnly?: boolean;
   reviewModel?: string;
@@ -114,7 +113,6 @@ export function createGates(o: CreateGatesOptions): Gates {
     worktree: o.worktree,
     base,
     sessionId: o.sessionId,
-    requireVerify: o.requireVerify,
     testsReadOnly: o.testsReadOnly,
     identity: o.identity,
     redactor,
@@ -161,8 +159,8 @@ export { CommitGate, testsReadOnlyFor } from './commitGate.js';
 export type { CommitGateOptions, CommitTestHooks } from './commitGate.js';
 export { PrGate, findOnPath } from './prGate.js';
 export type { PrGateOptions } from './prGate.js';
-export { actionHash, commitActionHash, prActionHash } from './actionHash.js';
-export type { ActionDescriptor, CommitActionInput } from './actionHash.js';
+export { actionHash, prActionHash } from './actionHash.js';
+export type { ActionDescriptor } from './actionHash.js';
 export { snapshotCandidate, buildCandidateTree, fileManifest, manifestMismatch, gitOid, isBinary, ignoredPathKey, ignoredStamp } from './candidate.js';
 export type { Candidate, FileRecord, CandidateStatus, BuiltTree, SnapshotOptions, IgnoredBaseline, IgnoredMeta } from './candidate.js';
 export { GateMemo, latestVerify, latestReview, claim, writeEvidence, ignoredBaseline, ignoredBaselineKey, ignoredBaselineOf, commandDigest, safeText, IGNORED_BASELINE_VERSION } from './evidence.js';

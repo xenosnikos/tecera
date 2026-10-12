@@ -219,7 +219,9 @@ export async function snapshotCandidate(dir: string, base: string, o: SnapshotOp
     const oid = gitOid(safety.objectFormat, bytes);
     const sha = sha256(bytes);
     if (basename(p) === '.gitattributes' || p === '.gitmodules') attrTexts.push({ path: p, text: bytes.toString('utf8') });
-    if (b && b.mode === mode && b.oid === oid) continue;
+    // An unchanged tracked file is exempt only while it is no second name of another inode: the same bytes
+    // hard-linked to a file outside the tree are recorded (nlink) so the commit gate refuses the link.
+    if (b && b.mode === mode && b.oid === oid && st.nlink <= 1) continue;
     let stamp: string | undefined;
     if (ign) {
       // The metadata is stamped BEFORE the baseline exemption: same bytes with another type, mode or link

@@ -78,6 +78,24 @@ describe('the write guard is required and checked at every mutation (contracts W
     });
   }
 
+  it('a fence lost inside the synchronous commit window (beforeCommit, after the pre-commit verification): FenceLost, the target and a new file stay untouched', async () => {
+    const g = new FakeWriteGuard();
+    const edit = createEditTool({ beforeCommit: () => g.revoke('lease taken over in the commit window') });
+    const r = await edit.call(req('src/a.ts', 'after revocation'), ctx, g.guard);
+    expect(r.ok).toBe(false);
+    expect(r.error?.name).toBe('FenceLost');
+    expect(r.error?.message).toMatch(/lease taken over in the commit window/);
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await strays(join(root, 'src'))).toEqual([]);
+
+    const g2 = new FakeWriteGuard();
+    const r2 = await createEditTool({ beforeCommit: () => g2.revoke('gone') }).call(req('src/d/new.ts', 'planted'), ctx, g2.guard);
+    expect(r2.error?.name).toBe('FenceLost');
+    await expect(stat(join(root, 'src/d/new.ts'))).rejects.toThrow();
+    expect(await strays(join(root, 'src/d'))).toEqual([]);
+    expect(worktreeTaint(root)).toBeNull();
+  });
+
   it('D6: with the loop guard (always allowed after the fence) every write proceeds without a hold, each authorized with its exact bytes', async () => {
     const g = new FakeWriteGuard();
     expect((await createEditTool().call(req('src/a.ts', 'one'), ctx, g.guard)).ok).toBe(true);

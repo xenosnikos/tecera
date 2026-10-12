@@ -160,6 +160,42 @@ export const ManifestSchema = z
       })
       .strict(),
     verify: z.object({ command: z.string().min(1), timeoutSec: z.number().int().positive() }).strict(),
+    /**
+     * Acceptance criteria sign-off before work starts. 'statement' (the default): a free-text request holds
+     * until the requestor accepts the drafted contract; a goal file that carries criteria is already accepted.
+     * 'always': every run holds.
+     */
+    acceptance: z.object({ signoff: z.enum(['statement', 'always']).default('statement') }).strict().default({}),
+    /**
+     * Declared capabilities beyond the repository (a database, a mail sender, a tracker). `probe` is a
+     * command that exits 0 when the connection really works; `mockable` says a stand-in may serve it.
+     */
+    connections: z
+      .record(
+        z.string().regex(/^[a-z0-9][a-z0-9_-]*$/),
+        z
+          .object({
+            kind: z.string().min(1),
+            probe: z.string().min(1).optional(),
+            auth: z.string().regex(SECRET_REF, 'auth must be a secret reference (env:/file:/keychain:)').optional(),
+            mockable: z.boolean().default(true),
+          })
+          .strict(),
+      )
+      .default({}),
+    /**
+     * What Tecera may create in its own space without asking, when a capability is missing. Local only:
+     * nothing here costs money or leaves the machine. Every resource is recorded with its teardown.
+     */
+    provisioning: z
+      .object({
+        scope: z.enum(['none', 'local']).default('local'),
+        kinds: z.array(z.string().min(1)).default(['tmpdir', 'git-remote', 'sqlite', 'http-stub']),
+        maxResources: z.number().int().min(0).max(16).default(4),
+        ttlSec: z.number().int().positive().default(3600),
+      })
+      .strict()
+      .default({}),
     review: z
       .object({
         // D5: review is always foreign; false is refused (a same-vendor review is not a review).

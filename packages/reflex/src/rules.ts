@@ -34,6 +34,11 @@ export interface ReconsiderState {
   invalidatesContext: boolean;
   /** The goal of the running intention changed or was dropped. */
   goalChanged: boolean;
+  /**
+   * The goal's acceptance contract was amended: the running plan was written for a contract that no longer
+   * stands, so it cannot prove the goal under any commitment.
+   */
+  contractChanged?: boolean;
 }
 
 export interface CloseOutState {
@@ -42,7 +47,32 @@ export interface CloseOutState {
   returnValid?: boolean;
   policyAborts?: number;
   verdict?: 'approve' | 'reject';
+  /** Worker: the return value reports an error (an `error` field or an `error` fact). Never accepted. */
+  reportsError?: boolean;
+  /** Worker: the step may change files (a writing step). */
+  expectsChange?: boolean;
+  /**
+   * Worker: whether the worktree changed during the step. true / false when the loop compared the snapshot
+   * after it with the step's baseline (taken before every writing step); null only when a resumed execution
+   * has no recorded baseline; absent when the loop does not snapshot at all.
+   */
+  changed?: boolean | null;
+  /**
+   * Evidence for a model decider (an escalation or a seam set to model / frontier). The rule never reads it:
+   * a worker's own summary is a claim, and a change summary only restates `changed`.
+   */
+  instruction?: string;
+  outputSchema?: string;
+  workerSummary?: string;
+  change?: { files: number | null; added?: number; removed?: number; paths?: Array<{ path: string; added: number; removed: number }>; truncated?: boolean; error?: string };
+  verify?: { exitCode: number; passed: boolean; attempt: number };
 }
+
+/**
+ * Confidence of a closeOut that accepts a writing step whose change could not be checked: below the default
+ * threshold, so the answer escalates (with the step's evidence) to the frontier, which may only refuse it.
+ */
+export const UNCHECKED_CHANGE_CONFIDENCE = 0.5;
 
 function answer<S extends ReflexSeam>(seam: S, a: ReflexResult<S>['answer'], confidence = 1, probabilities?: Record<string, number>): ReflexResult<S> {
   return { seam, answer: a, confidence, probabilities, provider: 'rules', abstained: false };
@@ -121,19 +151,27 @@ export class RulesReflex implements Reflex {
     return answer('gate', { decision: d });
   }
 
-  /** Apply the commitment policy. */
+  /** Apply the commitment policy. An amended contract interrupts under every commitment. */
   reconsider(q: ReflexQuestions['reconsider']): ReflexResult<'reconsider'> {
     const s = q.state as unknown as ReconsiderState;
     let interrupt = false;
-    if (s.commitment === 'single-minded') interrupt = s.invalidatesContext;
+    if (s.contractChanged === true) interrupt = true;
+    else if (s.commitment === 'single-minded') interrupt = s.invalidatesContext;
     else if (s.commitment === 'open-minded') interrupt = s.invalidatesContext || s.goalChanged;
     return answer('reconsider', { interrupt });
   }
 
-  /** Gates: exit code or verdict. Worker steps: schema-valid return and no policy aborts. Never a model's opinion. */
+  /**
+   * Gates: exit code or verdict. Worker steps: schema-valid return, no policy aborts, no reported error and,
+   * for a writing step, a changed worktree: changed true → achieved with full confidence, changed false → not
+   * achieved. A writing step whose change could not be checked (null) is accepted below threshold
+   * (UNCHECKED_CHANGE_CONFIDENCE) so it escalates with its evidence. Never a model's opinion, and never the
+   * evidence fields (a worker summary is the worker's claim).
+   */
   closeOut(q: ReflexQuestions['closeOut']): ReflexResult<'closeOut'> {
     const s = q.state as unknown as CloseOutState;
     let achieved: boolean;
+    let confidence = 1;
     switch (s.stepKind) {
       case 'gate.verify':
       case 'gate.commit':
@@ -145,12 +183,16 @@ export class RulesReflex implements Reflex {
         break;
       case 'worker':
       case 'subgoal':
-        achieved = s.returnValid === true && (s.policyAborts ?? 0) === 0;
+        achieved = s.returnValid === true && (s.policyAborts ?? 0) === 0 && s.reportsError !== true;
+        if (achieved && s.expectsChange === true) {
+          if (s.changed === false) achieved = false;
+          else if (s.changed === null) confidence = UNCHECKED_CHANGE_CONFIDENCE;
+        }
         break;
       default:
         achieved = false;
     }
-    return answer('closeOut', { achieved });
+    return answer('closeOut', { achieved }, confidence);
   }
 }
 

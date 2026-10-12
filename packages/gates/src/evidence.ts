@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { LedgerError, makeRedactor, sha256, type EventKind, type Json, type Ledger, type Redactor, type SecretInput } from '@tecera/contracts';
+import { LedgerError, makeRedactor, sha256, type EventKind, type Json, type Ledger, type Redactor, type SecretInput, type WriteGuard } from '@tecera/contracts';
 import { ignoredPathKey, type IgnoredBaseline } from './candidate.js';
 
 /**
@@ -41,6 +41,26 @@ export class GateMemo {
 
 export function redactorFrom(o: { redactor?: Redactor; secrets?: readonly SecretInput[] }): Redactor {
   return o.redactor ?? makeRedactor(o.secrets ?? []);
+}
+
+/**
+ * An identifier as it may appear inside an evidence key: unchanged, unless it carries a registered secret (an
+ * id built from untrusted text); then a digest of it, so keys (which are never redacted: they are looked up)
+ * and the results that return them never hold the raw value. Deterministic, so every gate derives the same key.
+ */
+export function keyPart(redactor: Redactor, id: string): string {
+  let clean = false;
+  try {
+    clean = redactor.redactText(id) === id;
+  } catch {
+    clean = false;
+  }
+  return clean ? id : `h_${sha256(id).slice(0, 24)}`;
+}
+
+/** The deterministic key of the gate.commit record of a step (CommitGate writes it, PrGate checks it). */
+export function commitEvidenceKey(redactor: Redactor, runId: string, intentionId: string, stepId: string, attempt: number): string {
+  return `commit:${keyPart(redactor, `${runId}:${intentionId}:${stepId}:${attempt}`)}`;
 }
 
 /** Keep the last `cap` characters of an already-redacted text. */
@@ -180,6 +200,11 @@ export async function ignoredBaseline(ledger: Ledger, memo: GateMemo, runId: str
   const out: IgnoredBaseline = { entries, names };
   memo.ignoredBaseline.set(runId, out);
   return out;
+}
+
+/** A usable guard, or null (a guard without check() or signal is no guard). */
+export function usableGuard(g: WriteGuard | undefined): WriteGuard | null {
+  return g && typeof g.check === 'function' && g.signal ? g : null;
 }
 
 export function defaultIds(): () => string {

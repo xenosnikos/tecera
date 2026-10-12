@@ -7,7 +7,6 @@ import { DEFAULT_CONFIG_GLOBS, DEFAULT_TEST_GLOBS, snapshotWorktree, tamperFindi
 import { dump, Flow, sampleRepo } from './harness/e2e.js';
 import { createGates } from '@tecera/gates';
 import { branchExists, driveToCommit, gateRig, manifest, NOW, plan, StubReviewer, StubRunner, WRITERS, type GateRig, type Repo } from './harness/gates.js';
-import { expectGap } from './harness/gap.js';
 import { cleanupTemps, onDrvFs, tmp } from './harness/tmp.js';
 
 /**
@@ -168,7 +167,7 @@ describe('tamper (security.md §6)', () => {
     }
   });
 
-  it.skipIf(TMP_ON_DRVFS)('tamper.symlink_hardlink [unchanged tracked file] GAP (owner: gates candidate.ts): a tracked file the candidate does not change is replaced by a hard link to an outside file with the SAME bytes → the commit gate must still refuse the link', async () => {
+  it.skipIf(TMP_ON_DRVFS)('tamper.symlink_hardlink [unchanged tracked file]: a tracked file the candidate does not change is replaced by a hard link to an outside file with the SAME bytes → the commit gate must still refuse the link', async () => {
     const make = (): GateRig => {
       const rig = gateRig({ files: { 'src/b.ts': 'export const b = 1;\n' } });
       rig.repo.write('src/a.ts', 'export const a = 2;\n');
@@ -183,9 +182,8 @@ describe('tamper (security.md §6)', () => {
     expect(probe.repo.g('status', '--porcelain', '--', 'src/b.ts').trim()).toBe('');
     expect(statSync(join(probe.repo.dir, 'src/b.ts')).nlink).toBe(2);
     const { c } = await driveToCommit(make(), { compromisedReview: true });
-    await expectGap('tamper.symlink_hardlink [unchanged tracked file]', 'gates candidate.ts (check link metadata before the unchanged-tracked exemption)', { assertion: 'the commit gate refuses a hard-linked unchanged tracked file' }, () => {
-      expect(c.exitCode, 'the commit gate refuses a hard-linked unchanged tracked file').not.toBe(0);
-    });
+    expect(c.exitCode, 'the commit gate refuses a hard-linked unchanged tracked file').not.toBe(0);
+    expect(c.reason).toBe('tamper');
   });
 
   it('tamper.git_hook', async () => {
