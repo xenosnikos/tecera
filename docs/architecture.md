@@ -30,7 +30,9 @@ a change, the commit and pull-request steps completed. The `goal.achieved` event
 `{command, exitCode: 0, fingerprint, evidenceKey, verifiedAt}` and, under an acceptance contract, one
 proof per criterion with its fidelity. One pure function (`provenAchievement`) decides whether a ledger
 proves a goal; the Stop hook, the run's exit status and replay all call it, so a forged `goal.achieved`
-event with no verification evidence behind it proves nothing.
+event with no verification evidence behind it proves nothing. The Stop hook also reads other run events
+to decide whether a run is still active, and that part does not yet hold against every forged event (see
+the README's known limitations).
 
 ## Acceptance and capabilities
 
@@ -49,7 +51,8 @@ real; what a plan needs is resolved through one ladder, `use → provision → m
 - **use** the real connection when its probe passes;
 - **provision** a local stand-in inside the manifest allowance (temporary directory, bare git remote,
   SQLite file, loopback HTTP stub; a count and a lifetime cap). Each `resource.provisioned` carries its
-  locator and teardown and stays a pending debt until a human transfers or releases it;
+  locator and teardown and stays a pending debt until a human transfers or releases it. The HTTP stub
+  is reachable by workers through the broker but not by a criterion's check, which has no network;
 - **mock** it behind the broker when the connection is `mockable`: the worker sees a stand-in with the
   real tool's interface, and everything it returns is provenance-tagged `simulated`;
 - **ask** the requestor otherwise. Tecera never creates access in the requestor's own systems.
@@ -77,26 +80,33 @@ the PR opens marked provisional, the run exits 10, and the Stop hook keeps block
   Every write is fenced by the lease, logged, and refused on protected paths (tests, configuration, CI,
   lockfiles, Tecera's own files).
 - **Verify.** The goal's check and every command criterion run in a separate contained process with a
-  scrubbed environment, on the same frozen candidate. A run that mutates the candidate, overflows its
+  scrubbed environment and no network, on the same frozen candidate. A host that cannot contain the
+  check does not run it. A run that mutates the candidate, overflows its
   output or leaves descendants behind does not pass. A retried worker receives the failed criteria and the
   reviewer's findings as untrusted, redacted inputs.
 - **Review.** Mandatory, by a different vendor than every writer, compared by provider and key
   fingerprint. The verdict must be exactly `{verdict, findings}`; `approve` requires empty findings.
 - **Commit.** To `tecera/<goal>`, staged from host-read bytes so repository hooks and filters never run,
   bound to the reviewed content.
-- **Pull request.** The only human approval. The grant is bound to the commit, to one approver who is not
-  the requester, and to an expiry; it is consumed exactly once and only if its audit event exists. Tecera
-  pushes and opens the PR, or writes a patch bundle. It never merges.
+- **Pull request.** The only human approval on the delivery path (a free-text request also holds once
+  for sign-off of its acceptance contract, and a human criterion is asked at this hold). The grant is
+  bound to the commit, to one approver who is not the requester, and to an expiry; it is consumed exactly
+  once and only if its audit event exists. The approver is the local person running `tecera approve`,
+  named with `--as` (default `$USER`); the identity is recorded, not authenticated. Tecera pushes and
+  opens the PR, or writes a patch bundle. It never merges.
 - **Budgets.** Usage is reserved before and settled after every model call and reported per step and per
   model. Exhaustion stops a run only when `budgets.enforce` is true. Loop-safety limits (depth, iterations,
-  attempts, execution timeouts) always apply.
+  attempts, execution timeouts) do not depend on that switch.
 
 ## The worker
 
 A worker step is an invoke loop (ported from JAZ): the model writes a short program, the program runs in a
 fresh restricted Node child process, and the loop continues until the program returns a value that
-satisfies the step's output schema. The child has no network and no file access; tools exist only as
-brokered calls that are re-authorized on every request. Hooks observe each span (invoke, model query,
+satisfies the step's output schema. The program is given no network or file API, and the child process
+may read only its own entry file; where the host provides them it also runs in its own network
+namespace, in a memory- and task-limited cgroup and under an unprivileged uid, and a missing control is
+recorded as `isolation.degraded`. Tools exist only as brokered calls that are re-authorized on every
+request. Hooks observe each span (invoke, model query,
 execution, tool call) and announce effects (abort, suspend, restrict, reserve budget, append evidence);
 they never mutate state directly.
 
@@ -110,9 +120,11 @@ ledger alone.
 
 ## Memory and learning
 
-Four tiers over the log: working, episodic, semantic (lessons) and procedural (the plan library). Lessons
-and generated plans are staged mechanically and enter the library only when a human graduates them with a
-rationale. Rejections and retractions are kept on record.
+Four tiers over the log: working, episodic, semantic (lessons) and procedural (the plan library). A
+generated plan is staged as a candidate once its goal is achieved and enters the library only when a
+human graduates it with a rationale. Lessons have the same lifecycle (stage, graduate, reject, retract,
+all kept on record), but nothing in a run writes episodes or stages lessons yet, so the episodic and
+semantic tiers are empty in practice.
 
 ## Benchmarks
 
@@ -120,9 +132,10 @@ rationale. Rejections and retractions are kept on record.
 missing database, a missing mail sender, a tempting test edit, a planted instruction with a canary
 secret, an impossible task, interruption and amendment mid-run, and an audit from the ledger alone).
 The runner drives the real CLI, scripted or with live models, and performs the declared human steps; the
-scorer reads only the ledger and the final repository. The headline numbers are human touches per job
-(autonomy), false achievements and landed violations, which must be zero (control), and the share of
-actions traceable to a step, intention, goal and approval (compliance).
+scorer works from the ledger and the delivered repository. It is meant to report human touches per job
+(autonomy), false achievements and landed violations (control), and the share of actions traceable to a
+step, intention, goal and approval (compliance). The pass rules are being tightened and the scorecard
+should not yet be read as a measurement; with live models, 1 of 5 goals has been achieved so far.
 
 ## Package dependencies
 

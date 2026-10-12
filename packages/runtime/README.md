@@ -5,11 +5,15 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
 
 ## Behaviour
 
-- **no auth package.** `@tecera/auth` is gone from this package and the JWT ingress is deleted. Approvals and
+- **local approvals, no authentication.** There is no auth package and no token ingress. Approvals and
   learning decisions are made by the local human principal (`--as <id>`, default `$USER`; src/principal.ts),
-  recorded in the audited `approval.granted` event and its `approval.identity` evidence. Separation of duty is
-  the ledger's: the requester (the loop) can never approve, a principal never approves its own request (exit 8).
-  Agents cannot reach `tecera approve` (the pre-tool hook refuses it from a mediated shell).
+  recorded in the audited `approval.granted` event and its `approval.identity` evidence with
+  `authenticated: false`. Separation of duty is the ledger's: the requester (the loop) can never approve, a
+  principal never approves its own request, and only a human principal can approve (exit 8). The name is
+  asserted, not verified: any local process that can run `tecera` can approve under any name. Workers
+  have no shell and no such tool. For a host assistant, the Claude Code pre-tool hook is meant to refuse
+  `tecera approve` and the other decision commands; that hook is under repair after a review found a way
+  past it, and the Codex adapter installs no hook at all.
 - **reflexes on.** Seams are `rule` / `model` / `frontier` (the manifest refuses `off`); the planner seat is
   the frontier, wired into the reflex router and as `LoopPorts.frontier` (metered by its own SeatMeter).
 - **budgets off by default.** `openRunPools` opens usd / tokens / calls / wallMs with `budgets.enforce`
@@ -28,7 +32,9 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
   proven, while a run ended provisional (exit 10) and neither it nor a later run of the same goal is
   proven, when the ledger's chain does not verify, or when the business case's `tecera.json` (or the one
   named with `--manifest`) cannot be found, read or validated; exit 0 otherwise (also outside any business
-  case). It never considers budget. Every decision is recorded (`stop.blocked` / `stop.allowed`).
+  case). It never considers budget. Every decision is recorded (`stop.blocked` / `stop.allowed`). Whether a
+  run counts as active is read from run events, and a review found forged events that make the hook allow
+  a held run; that is being fixed. The hook is installed for Claude Code only.
 - **review plugged in.** `review.foreign` must be true; the reviewer seat runs live on its own key and the
   review gate checks provider AND key fingerprint against every writer. `--allow-same-vendor-review` is gone.
 - **PR-level gating.** Writes inside `repo.allowedChanges` on the leased work branch proceed under any
@@ -36,7 +42,8 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
   approval; `gate.pr` is the only approval point (exit 4 while it waits). After `tecera approve` the resume
   pushes the branch to `origin` and opens the PR with `gh pr create` when gh is on PATH and authenticated, or
   records `pr.requested` with a patch bundle under `.tecera/runs/<run>/pr/`. Tecera never merges (`merge` is in
-  `never`; the host settings deny `git push`, `gh pr create`, `git merge` and `gh pr merge`).
+  `never`; the Claude Code settings fragment denies `git push`, `gh pr create`, `git merge` and
+  `gh pr merge`; the Codex adapter installs no deny list).
 - **live keys.** Providers come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`. The shipped
   template and sample seat the planner (`anthropic/claude-sonnet-4.5`) and the worker (`anthropic/claude-haiku-4.5`)
   on OpenRouter and the reviewer (`gpt-5.6-terra`) on OpenAI. `tecera doctor` probes every seat live (under a
@@ -114,7 +121,7 @@ worktree to the loop's required checkpoint before `confirmWorktreeRestored`, and
 (worker restart with attempt + 1; interrupted verify re-run; a lost review stops for a human without another
 reviewer call; the durable PR approval re-held; commit reconciled, never repeated; one commit, one PR).
 
-## Acceptance contracts, capabilities and provisioning (D8–D12)
+## Acceptance contracts, capabilities and provisioning
 
 - **A request is a contract.** `tecera run "<statement>"` adopts the goal with `draftContract`: the planner
   drafts an acceptance contract (criteria, each with its own check; out of scope; assumptions; the
@@ -149,12 +156,16 @@ reviewer call; the durable PR approval re-held; commit reconciled, never repeate
 - **Provisioned resources are debts.** Each `resource.provisioned` carries its locator (an absolute path or
   a loopback URL, never a credential nor another host), teardown (no credential either, in any encoding) and
   expiry. While the run's registry reports a problem or a resource past `maxResources`, no resource is
-  handed to a worker and no provisioned remote is pushed to. A provisioned sqlite or http-stub is a brokered tool named after its capability. A
+  handed to a worker and no provisioned remote is pushed to. A provisioned sqlite or http-stub is a brokered
+  tool named after its capability; an http-stub cannot be reached by a criterion's check, which runs
+  contained with no network, so a criterion that needs it fails verification today. A
   provisioned `git-remote` (its locator an absolute local path) receives the work-branch push when the
   repository has no remote of that name (added to the worktree for the delivery only). The PR lists every pending resource. `tecera resources list`
   shows them; `tecera resources transfer <id> [--to who]` hands one to a human; `tecera resources release <id>`
-  runs its recorded teardown. Expired resources are released at the start of every run. Agents cannot reach
-  `tecera criteria accept|amend` or `tecera resources release|transfer` (the pre-tool hook refuses them).
+  runs its recorded teardown. Expired resources are released at the start of every run. A worker
+  cannot reach `tecera criteria accept|amend` or `tecera resources release|transfer`; for a Claude Code
+  host assistant the pre-tool hook is meant to refuse them (see "local approvals" above for its state).
+  Under Codex nothing refuses them.
 - **Amendments re-plan.** `tecera criteria amend <run> --file contract.json --reason text [--as you]` records
   `criteria.amended` with the human as actor. `accept` and `amend` refuse (exit 9) on a ledger whose hash
   chain does not verify. The acceptance is stale: the next resume drops the running
@@ -163,7 +174,8 @@ reviewer call; the durable PR approval re-held; commit reconciled, never repeate
   for a statement (`{criteria, outOfScope?, assumptions?, needs?}`, or a list with `when` substrings). The
   scripted `plan.json` is stamped with the accepted contract's hash and capabilities, and its `gate.verify`
   steps are bound to the contract's command criteria. `test-fixtures/fix-failing-test` has all three files:
-  `tecera run "make the failing test pass" --scripted test-fixtures/fix-failing-test` runs offline.
+  `tecera run "make the failing test pass" --scripted test-fixtures/fix-failing-test` runs offline (with
+  placeholder provider keys set).
 
 `src/criteria.e2e.test.ts` proves it end to end with scripted models, the real sandbox and real gates: a goal
 file with criteria reaches achievement through the PR hold alone; a statement run holds for sign-off, then
@@ -177,6 +189,10 @@ re-plans for the new hash.
 1. **Scripted mode** (`--scripted <dir>` or `TECERA_SCRIPTED=<dir>`). The directory holds `plan.json`
    (optional), `contract.json` (optional) and `replies.json` (`{seat: [reply...]}`). Only the provider transport is replaced (src/scripted.ts);
    the run records `run.scripted` evidence. A run cannot switch between scripted and live across resume.
+   Everything else is real: readiness still requires the key of every provider a seat uses (placeholder
+   values of at least 8 characters, the reviewer's different from the writers', are enough), and a scripted
+   run that is approved still pushes and opens a pull request when the repository has a remote and `gh` is
+   authenticated. Do not leave `TECERA_SCRIPTED` set in a shell used for real work.
 2. **One provider per seat.** `createProvider` runs over the run's SecretStore, with the shared redactor on top
    (`anthropic`, `openai`, `openrouter`; src/providerSetup.ts maps OpenRouter onto an older providers build).
    Every completed call is recorded as a `cost.call` event (worker and review calls with the step's trace).
@@ -197,13 +213,15 @@ re-plans for the new hash.
    A host without containment refuses the run with exit 3. A root supervisor is refused unless the operator
    names an unprivileged identity (`TECERA_VERIFY_UID` / `TECERA_VERIFY_GID`, which must be able to read the
    worktree and run the check) or explicitly accepts a degraded root verify (`TECERA_VERIFY_ALLOW_ROOT=1`,
-   recorded as `verify.degraded`; the run is then recorded as degraded — never a hold, D6).
+   recorded as `verify.degraded`; the run is then recorded as degraded, never held). A non-root supervisor
+   runs the check under its own uid.
    These switches are read from the operator's environment, never from the manifest.
 5. **Worker.** `StepWorker` runs a `ChildProcessRepl` per exec, built from the manifest's sandbox profile, plus:
    - the fourteen mandatory hooks (`assertMandatory`);
    - the tools read/edit/listFiles, and runVerify bound to the goal check;
    - every known secret, for redaction and the canary;
-   - Brain context (lessons, episodes) added to each step's inputs.
+   - Brain context (lessons, episodes) added to each step's inputs. No run writes episodes or stages
+     lessons yet, so this context is empty in practice.
 
    The tool kinds `tool.denied`, `sandbox.*` become `evidence.appended` events that carry the step trace.
    Provisioned sqlite / http-stub resources join the tools under their capability's name; a step whose plan
@@ -242,12 +260,14 @@ dispatchable.
 `defaultProbe` (doctor) is a real completion per seat through the provider adapters and
 `@tecera/providers` `doctorProbe`; doctor and preflight run it last, only when every offline check passed.
 
-## Exit codes (dx.md §4)
+## Exit codes
 
 | Code | Meaning |
 |---|---|
 | 0 | goal achieved (proven by `ledgerProvenRun`) |
-| 3 | not ready / wiring refused |
+| 1 | error (for example an unknown, expired or already-decided approval request) |
+| 2 | invalid input or usage |
+| 3 | not ready (validation, lock, ledger chain, a missing provider key, also in scripted mode) / wiring refused / verify containment unavailable |
 | 4 | held: criteria sign-off (`tecera criteria accept`), a capability ask, a human criterion or the PR (`tecera approve`), then `tecera run --resume` |
 | 5 | verify failed |
 | 6 | review rejected |
