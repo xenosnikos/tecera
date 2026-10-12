@@ -19,6 +19,9 @@
     },
     "openai": {
       "auth": "env:OPENAI_API_KEY"
+    },
+    "staging": {
+      "auth": "env:BENCH_STAGING_DEPLOY"
     }
   },
   "seats": {

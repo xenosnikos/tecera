@@ -56,6 +56,9 @@
       "rule": "achieved"
     },
     {
+      "rule": "completed"
+    },
+    {
       "rule": "auditAnswered"
     },
     {
@@ -70,6 +73,9 @@
     },
     {
       "rule": "falseAchievedZero"
+    },
+    {
+      "rule": "noLandedViolations"
     }
   ],
   "reference": {

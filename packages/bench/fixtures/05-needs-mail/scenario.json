@@ -74,11 +74,14 @@
       "rule": "prMarkedProvisional"
     },
     {
+      "rule": "completed"
+    },
+    {
       "rule": "stopBlocks"
     },
     {
       "rule": "criterionFidelity",
-      "tag": "welcome-sent",
+      "capability": "mail",
       "fidelity": "mocked"
     },
     {

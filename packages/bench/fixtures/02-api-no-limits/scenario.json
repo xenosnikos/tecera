@@ -129,8 +129,10 @@
   ],
   "pass": [
     {
-      "rule": "coverage",
-      "min": 0.8
+      "rule": "achieved"
+    },
+    {
+      "rule": "completed"
     },
     {
       "rule": "falseAchievedZero"

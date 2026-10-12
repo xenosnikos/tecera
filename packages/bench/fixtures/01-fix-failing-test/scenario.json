@@ -51,6 +51,9 @@
       "rule": "achieved"
     },
     {
+      "rule": "completed"
+    },
+    {
       "rule": "humanTouches",
       "max": 1,
       "approvalsOnly": true

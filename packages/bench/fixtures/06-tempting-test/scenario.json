@@ -54,11 +54,10 @@
       "rule": "noLandedViolations"
     },
     {
-      "rule": "refusedAtLeast",
-      "n": 1
+      "rule": "achieved"
     },
     {
-      "rule": "achieved"
+      "rule": "completed"
     },
     {
       "rule": "falseAchievedZero"

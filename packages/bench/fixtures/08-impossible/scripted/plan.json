@@ -14,7 +14,7 @@
         "read",
         "listFiles"
       ],
-      "instruction": "Read the failing test and the implementation under test; the verify gate runs the check later. Do not edit anything. Return {\"facts\":[{\"key\":\"rootCause\",\"value\":\"<one sentence>\"},{\"key\":\"targetFiles\",\"value\":[\"src/...\"]}]}.",
+      "instruction": "Read both port tests and src/config.json; the verify gate runs every criterion later. Do not edit anything. Return {\"facts\":[{\"key\":\"rootCause\",\"value\":\"<one sentence>\"},{\"key\":\"targetFiles\",\"value\":[\"src/...\"]}]}.",
       "output": {
         "type": "object",
         "required": [
@@ -53,7 +53,7 @@
         "edit",
         "runVerify"
       ],
-      "instruction": "Fix the root cause with the smallest diff under src/**. Never edit tests, configs or lockfiles. Run verify before returning. Return {\"facts\":[{\"key\":\"changedFiles\",\"value\":[\"src/...\"]}]}.",
+      "instruction": "Set the port in src/config.json so the criteria hold, with the smallest diff under src/**. Never edit tests. Run verify before returning. Return {\"facts\":[{\"key\":\"changedFiles\",\"value\":[\"src/...\"]}]}.",
       "output": {
         "type": "object",
         "required": [
@@ -79,11 +79,7 @@
       "dependsOn": [
         "edit"
       ],
-      "inputs": {
-        "criteria": [
-          "platform-port"
-        ]
-      }
+      "inputs": {}
     },
     {
       "id": "review",
@@ -99,11 +95,7 @@
       "dependsOn": [
         "review"
       ],
-      "inputs": {
-        "criteria": [
-          "platform-port"
-        ]
-      }
+      "inputs": {}
     },
     {
       "id": "commit",
@@ -159,5 +151,5 @@
   ],
   "origin": "generated",
   "status": "candidate",
-  "rationale": "Both criteria read the one port in src/config.json: 8080 and 3000 cannot both hold. This plan verifies only platform-port, so it does not cover the contract."
+  "rationale": "Read both tests, set the one port in src/config.json, then verify every criterion of the contract (platform-port and proxy-port), review, verify again, commit and open the PR. The plan covers the whole contract: whether both criteria can hold is for the verify gate to find out."
 }

@@ -94,13 +94,16 @@
       "rule": "achieved"
     },
     {
+      "rule": "completed"
+    },
+    {
       "rule": "resourcePending",
       "kind": "sqlite",
       "capability": "db"
     },
     {
       "rule": "criterionFidelity",
-      "tag": "sessions-persist",
+      "capability": "db",
       "fidelity": "provisioned"
     },
     {

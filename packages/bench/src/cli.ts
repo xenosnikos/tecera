@@ -3,15 +3,16 @@ import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runBench, type BenchMode, type BenchResult, type RunnerOptions } from './runner.js';
+import { statusWord } from './scorecard.js';
 
 /**
  * `node packages/bench/dist/cli.js run --mode scripted|live [--scenarios 1,2,..] [--out <dir>]
  * [--baseline "<command>"] [--baseline-name <name>] [--timeout-sec <n>] [--keep]`
  *
  * Runs the scenarios, writes scorecard.json and scorecard.md to `--out` (default ./bench-out), and prints
- * one line per scenario. Exit 0 when every scenario met its pass rule, 1 when one did not, 2 on a usage
- * error. Live mode reads the provider keys the fixtures' manifests name from the environment; it never
- * prints them.
+ * one line per scenario with every rule that failed. Exit 0 when every scenario was measured and met its
+ * pass rules, 1 when one did not or was not measured, 2 on a usage error. Live mode reads the provider keys
+ * the fixtures' manifests name from the environment; it never prints them.
  */
 
 export const USAGE = 'usage: bench run --mode scripted|live [--scenarios 1,2,..] [--out dir] [--baseline "<command>"] [--baseline-name name] [--timeout-sec n] [--keep]';
@@ -67,16 +68,18 @@ export function parseCli(argv: readonly string[]): RunnerOptions & { out: string
   };
 }
 
-/** One line per scenario, then the headline. */
+/** One line per scenario (its verdict, whether the goal was delivered, every rule that failed and why), then the totals. */
 export function summaryLines(r: BenchResult): string[] {
   const lines = r.runs.map((x) => {
     const s = x.score;
-    const failed = s.rules.filter((y) => !y.ok).map((y) => y.rule);
-    const base = x.baseline ? ` · baseline ${x.baseline.passed ? 'pass' : 'fail'}` : '';
-    return `${s.passed ? 'pass' : 'FAIL'}  ${x.scenario.id}  touches ${x.touches.length}${failed.length ? `  failed: ${failed.join(', ')}` : ''}${x.stopped ? `  (${x.stopped})` : ''}${base}`;
+    const verdict = s.status === 'pass' ? 'pass' : s.status === 'not-measured' ? 'NOT MEASURED' : 'FAIL';
+    const failed = s.rules.filter((y) => !y.ok && !y.notMeasured).map((y) => `${y.rule} (${y.detail})`);
+    const why = s.status === 'not-measured' ? `  not measured: ${s.measurement.reasons.join('; ')}` : '';
+    const base = x.baseline ? ` · baseline ${statusWord(x.baseline)}` : '';
+    return `${verdict}  ${x.scenario.id}  goal delivered: ${s.status === 'not-measured' ? 'n/m' : s.goalDelivered ? 'yes' : 'no'}  touches ${x.touches.length}${failed.length ? `  failed: ${failed.join('; ')}` : ''}${why}${x.stopped ? `  (${x.stopped})` : ''}${base}`;
   });
   const t = r.card.totals;
-  lines.push(`${t.passed}/${t.scenarios} scenarios passed`);
+  lines.push(`${t.passed}/${t.scenarios} scenarios passed their rules${t.notMeasured ? `, ${t.notMeasured} not measured` : ''}; ${t.goalsDelivered}/${t.scenarios} goals achieved with a delivered PR`);
   if (r.files) lines.push(`wrote ${r.files.json} and ${r.files.md}`);
   return lines;
 }

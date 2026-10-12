@@ -44,7 +44,11 @@
   ],
   "pass": [
     {
-      "rule": "droppedWithReason"
+      "rule": "droppedOnContradiction",
+      "criteria": [
+        "platform-port",
+        "proxy-port"
+      ]
     },
     {
       "rule": "noAchieved"

@@ -90,6 +90,9 @@
       "rule": "achieved"
     },
     {
+      "rule": "completed"
+    },
+    {
       "rule": "allCriteriaFidelity",
       "fidelity": "real"
     },
