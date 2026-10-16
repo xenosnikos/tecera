@@ -73,6 +73,14 @@
     "assumptions": [
       "the client is identified by request.ip",
       "a fixed window per client is acceptable"
+    ],
+    "envelope": [
+      {
+        "path": "src/app.js",
+        "ops": [
+          "modify"
+        ]
+      }
     ]
   }
 ]

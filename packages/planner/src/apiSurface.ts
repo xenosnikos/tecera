@@ -28,6 +28,10 @@ export interface NameUse {
   methods: string[];
   /** True when the text calls what a call returns as a function (`const app = createApp(); app(req)`). */
   resultCalled: boolean;
+  /** The keys of the object literal passed to that returned function, per call (`app({ ip, path })` → ip, path). */
+  resultArgKeys?: string[][];
+  /** Properties read on what that returned function returns (`app(req).status` → status). */
+  resultProps?: string[];
 }
 
 /** One declared parameter of an exported function. */
@@ -285,6 +289,9 @@ export function nameUses(text: string, resolve: (spec: string) => string | null)
         out.push(e.use);
       }
       const { use, methods } = e;
+      const argKeys = new Map<string, string[]>();
+      const props = new Set<string>(use.resultProps ?? []);
+      for (const k of use.resultArgKeys ?? []) argKeys.set(k.join(','), k);
       // name(…), and name.call(this, …) with the receiver dropped.
       for (const m of text.matchAll(new RegExp(`${c.pattern}\\s*(\\.\\s*call\\s*)?\\(`, 'g'))) {
         const open = m.index! + m[0].length - 1;
@@ -301,15 +308,154 @@ export function nameUses(text: string, resolve: (spec: string) => string | null)
         if (v && !/^(?:const|let|var)$/.test(v[1]!)) {
           const x = rx(v[1]!);
           for (const k of text.matchAll(new RegExp(`(?<![\\w$.])${x}\\s*\\??\\.\\s*([A-Za-z_$][\\w$]*)\\s*\\(`, 'g'))) methods.add(k[1]!);
-          if (new RegExp(`(?<![\\w$.])(?<!function\\s+)${x}\\s*\\(`).test(text)) use.resultCalled = true;
+          if (new RegExp(`(?<![\\w$.])(?<!function\\s+)${x}\\s*\\(`).test(text)) {
+            use.resultCalled = true;
+            const r = resultShape(text, v[1]!);
+            for (const k of r.keys) argKeys.set(k.join(','), k);
+            for (const p of r.props) props.add(p);
+          }
         }
       }
+      if (argKeys.size) use.resultArgKeys = [...argKeys.values()].slice(0, MAX_SHAPES);
+      if (props.size) use.resultProps = [...props].sort().slice(0, MAX_MEMBERS);
     }
     for (const e of by.values()) e.use.methods = [...e.methods].sort();
+    return out;
   } catch {
     // Unreadable text calls nothing.
   }
   return out;
+}
+
+const MAX_SHAPES = 6;
+
+/** The keys of an object literal's text (`{ ip: 'a', path }` → ip, path); spreads and computed keys are skipped. */
+export function objectKeys(literal: string): string[] {
+  const t = literal.trim();
+  if (!t.startsWith('{')) return [];
+  const end = closing(t, 0);
+  if (end < 0) return [];
+  return splitArgs(t.slice(1, end - 1))
+    .map((p) => p.trim())
+    .filter((p) => !p.startsWith('...') && !p.startsWith('['))
+    .map((p) => p.replace(/^(?:async\s+)?(?:get\s+|set\s+)?/, '').split(/\s*[:(=]\s*|\s+/)[0]!.replace(/^["']|["']$/g, ''))
+    .filter((k) => IDENT.test(k));
+}
+
+/**
+ * How `text` calls the function held in variable `fn` (what a factory returned): the keys of the object it is
+ * passed, and the properties read on what it returns (chained `fn(…).p`, or `r = fn(…)` then `r.p`).
+ */
+function resultShape(text: string, fn: string): { keys: string[][]; props: string[] } {
+  const keys: string[][] = [];
+  const props = new Set<string>();
+  const x = rx(fn);
+  for (const m of text.matchAll(new RegExp(`(?<![\\w$.])(?<!function\\s+)${x}\\s*\\(`, 'g'))) {
+    const open = m.index! + m[0].length - 1;
+    const end = closing(text, open);
+    if (end < 0) continue;
+    const first = splitArgs(text.slice(open + 1, end - 1))[0];
+    if (first && keys.length < MAX_SHAPES) {
+      const k = objectKeys(first);
+      if (k.length) keys.push(k);
+    }
+    const chained = /^\s*\??\.\s*([A-Za-z_$][\w$]*)(?!\s*\()/.exec(text.slice(end));
+    if (chained) props.add(chained[1]!);
+    const before = text.slice(Math.max(0, m.index! - 80), m.index!);
+    const v = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?$/.exec(before);
+    if (v) for (const k of text.matchAll(new RegExp(`(?<![\\w$.])${rx(v[1]!)}\\s*\\??\\.\\s*([A-Za-z_$][\\w$]*)(?!\\s*\\()`, 'g'))) props.add(k[1]!);
+  }
+  return { keys, props: [...props].filter((p) => !BUILTIN_MEMBERS.has(p)) };
+}
+
+/** One assertion of an exact value: what is asserted (its text, whitespace removed) and the literal it must equal. */
+export interface AssertedValue {
+  /** The asserted expression without whitespace (`s.get('a')`). */
+  actual: string;
+  /** The expected literal as written (`undefined`, `null`, `200`, `'text'`). */
+  value: string;
+  /** The method or function the expression ends with a call of (`get`), when it does. */
+  callee?: string;
+}
+
+const LITERAL = /^(?:null|undefined|true|false|-?\d[\d_.eE+-]*|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`$]*`)$/;
+const MAX_ASSERTIONS = 64;
+
+/**
+ * The exact values `text` asserts (`assert.equal(x, 1)`, `assert.strictEqual`, `assert.deepEqual`,
+ * `assert.deepStrictEqual`, with or without the `assert.` prefix of a strict import): the expression and the
+ * literal. Only literal expectations count; nothing is evaluated. Never throws.
+ */
+export function assertedValues(text: string): AssertedValue[] {
+  const out: AssertedValue[] = [];
+  try {
+    for (const m of text.matchAll(/(?<![\w$])(?:assert\s*\.\s*)?(?:strictEqual|equal|deepStrictEqual|deepEqual)\s*\(/g)) {
+      if (out.length >= MAX_ASSERTIONS) break;
+      const open = m.index! + m[0].length - 1;
+      const end = closing(text, open);
+      if (end < 0) continue;
+      const [actual, expected] = splitArgs(text.slice(open + 1, end - 1));
+      if (!actual || !expected || !LITERAL.test(expected.trim())) continue;
+      const a = actual.replace(/^await\s+/, '').replace(/\s+/g, '');
+      const callee = /(?:^|\.)([A-Za-z_$][\w$]*)\((?:[^()]|\([^()]*\))*\)$/.exec(a)?.[1];
+      out.push({ actual: a, value: expected.trim(), ...(callee ? { callee } : {}) });
+    }
+  } catch {
+    // Unreadable text asserts nothing.
+  }
+  return out;
+}
+
+/** An object shape a comment documents for a call (`send({ to, subject, text })`): the called name and its keys. */
+export interface DocumentedShape {
+  /** The called name, its last segment (`options.rateLimit ({ … })` → rateLimit). */
+  name: string;
+  keys: string[];
+}
+
+/** The comment text of a module (line and block comments), one entry per line, trimmed. */
+export function commentLines(text: string): string[] {
+  const out: string[] = [];
+  try {
+    for (const m of text.matchAll(/\/\*([\s\S]*?)\*\/|(?<![:"'`\\])\/\/([^\n]*)/g)) {
+      for (const l of (m[1] ?? m[2] ?? '').split('\n')) {
+        const t = l.replace(/^\s*\*?\s?/, '').trim();
+        if (t) out.push(t);
+      }
+    }
+  } catch {
+    // Unreadable text documents nothing.
+  }
+  return out;
+}
+
+/** The call shapes a module's comments document: `name({ a, b })`, `name ({ a, b })`. */
+export function documentedShapes(text: string): DocumentedShape[] {
+  const out: DocumentedShape[] = [];
+  for (const line of commentLines(text)) {
+    for (const m of line.matchAll(/([A-Za-z_$][\w$.]*)\s*\(\s*(\{[^{}]*\})/g)) {
+      const name = m[1]!.split('.').pop()!;
+      const keys = objectKeys(m[2]!);
+      if (IDENT.test(name) && keys.length && !out.some((d) => d.name === name)) out.push({ name, keys });
+    }
+  }
+  return out.slice(0, MAX_SHAPES * 2);
+}
+
+/** The relative modules a text imports or requires (resolved by `resolve`). */
+export function relativeImports(text: string, resolve: (spec: string) => string | null): string[] {
+  const out = new Set<string>();
+  try {
+    for (const m of text.matchAll(/\b(?:import|export)\s[^"'`;]*?\bfrom\s*["'`]([^"'`]+)["'`]|\bimport\s*["'`]([^"'`]+)["'`]|\bimport\s*\(\s*["'`]([^"'`]+)["'`]\s*\)|\brequire\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g)) {
+      const spec = m[1] ?? m[2] ?? m[3] ?? m[4]!;
+      if (!spec.startsWith('./') && !spec.startsWith('../')) continue;
+      const p = resolve(spec);
+      if (p) out.add(p);
+    }
+  } catch {
+    // Unreadable text imports nothing.
+  }
+  return [...out].sort();
 }
 
 /** The index of the first top-level `=` of a parameter (its default), or -1. */

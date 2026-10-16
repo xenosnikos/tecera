@@ -203,9 +203,16 @@ export class ScriptedRunPlanner implements Planner {
   private readonly drafts: ScriptedPlanner;
   constructor(
     private readonly plan: Plan,
-    private readonly o: { contracts?: readonly ScriptedContract[]; connections?: Manifest['connections']; allowedChanges?: readonly string[]; protectedPaths?: readonly string[] } = {},
+    private readonly o: { contracts?: readonly ScriptedContract[]; connections?: Manifest['connections']; allowedChanges?: readonly string[]; protectedPaths?: readonly string[]; fileExists?: (path: string) => boolean } = {},
   ) {
-    this.drafts = new ScriptedPlanner({ plans: [plan], ...(o.contracts ? { contracts: o.contracts } : {}), ...(o.connections ? { connections: o.connections } : {}), ...(o.allowedChanges ? { allowedChanges: o.allowedChanges } : {}), ...(o.protectedPaths ? { protectedPaths: o.protectedPaths } : {}) });
+    this.drafts = new ScriptedPlanner({
+      plans: [plan],
+      ...(o.contracts ? { contracts: o.contracts } : {}),
+      ...(o.connections ? { connections: o.connections } : {}),
+      ...(o.allowedChanges ? { allowedChanges: o.allowedChanges } : {}),
+      ...(o.protectedPaths ? { protectedPaths: o.protectedPaths } : {}),
+      ...(o.fileExists ? { fileExists: o.fileExists } : {}),
+    });
   }
 
   write(e: TeceraEvent, beliefs: BeliefProjection, goal: AchievementGoal, meter?: UsageMeter, ctx?: PlanningContext): Promise<Plan> {

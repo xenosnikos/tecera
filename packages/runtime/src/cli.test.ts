@@ -720,6 +720,34 @@ describe('plans and memory', () => {
     expect((await events(dir)).filter((e) => e.kind.startsWith('plan.')).map((e) => e.kind)).toEqual(['plan.generated', 'plan.staged', 'plan.graduated', 'plan.retracted']);
   });
 
+  it('a run writes its episodes: one per step completion or failure and per segment outcome, exactly once across held, resumed and repeated segments', async () => {
+    const dir = await initialised();
+    const w = fakeWire();
+    const { runId, requestId } = await heldRun(dir, w);
+    const memory = async () => (await events(dir)).filter((e) => (e.kind === 'evidence.appended' || e.kind === 'lesson.staged') && (e.payload as { entry?: unknown }).entry);
+    const sources = async () => (await memory()).map((e) => ((e.payload as { entry: { provenance: { source?: string } } }).entry.provenance.source));
+    const expected = async () => (await events(dir)).filter((e) => e.runId === runId && ['step.completed', 'step.failed', 'run.ended'].includes(e.kind)).map((e) => e.id);
+    expect(await sources()).toEqual(await expected());
+    expect((await cli(dir, ['approve', requestId, '--as', 'bob'], { env: LOCAL })).code).toBe(0);
+    expect((await cli(dir, ['run', '--resume', runId], { wire: w.wire, env: KEYS })).code).toBe(0);
+    expect(await sources()).toEqual(await expected());
+    // a resume with nothing to do, then the projector twice more over the reopened ledger: nothing new
+    const again = await cli(dir, ['run', '--resume', runId], { wire: w.wire, env: KEYS });
+    expect(again.out).toMatch(/nothing to resume/);
+    const count = (await memory()).length;
+    const l = new SqliteLedger(join(dir, '.tecera/ledger.sqlite'));
+    const { recordRunLearning } = await import('./learning.js');
+    const { makeRedactor } = await import('@tecera/contracts');
+    for (let i = 0; i < 2; i++) expect(await recordRunLearning(l, runId, { redactor: makeRedactor([]), now: Date.now })).toMatchObject({ episodes: 0, candidates: 0 });
+    const reloaded = await Brain.load(l, { runId: 'x', budgetTokens: 1000 });
+    l.close();
+    expect((await memory()).length).toBe(count);
+    expect(reloaded.all('episodic')).toHaveLength(count);
+    // the scripted run recovered from nothing, so it staged no lesson; episodes never need graduation
+    expect(reloaded.all('semantic')).toEqual([]);
+    expect((await cli(dir, ['memory', 'candidates'])).out).toMatch(/no memory candidates/);
+  });
+
   it('memory candidates → graduate with a human principal and a rationale', async () => {
     const dir = await initialised();
     const l = new SqliteLedger(join(dir, '.tecera/ledger.sqlite'));

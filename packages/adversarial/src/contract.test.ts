@@ -76,7 +76,7 @@ afterAll(cleanupTemps);
 
 const STATEMENT = 'make the failing test pass';
 /** The planner's draft for the statement run (contract.json in the scripts dir). */
-const DRAFT = { criteria: [{ id: 'tests-pass', statement: 'the whole test suite passes', check: { kind: 'command', command: 'node --test', timeoutSec: 120 } }], assumptions: ['the failing test states the intended behaviour'] };
+const DRAFT = { criteria: [{ id: 'tests-pass', statement: 'the whole test suite passes', check: { kind: 'command', command: 'node --test', timeoutSec: 120 } }], assumptions: ['the failing test states the intended behaviour'], envelope: [{ path: 'src/slugify.js', ops: ['modify'] }] };
 const TESTS_PASS = { id: 'tests-pass', statement: 'the test suite passes', verify: 'node --test' };
 const SLUGIFY_TEST = { id: 'slugify-test', statement: 'the slugify test passes on its own', verify: 'node --test test/slugify.test.js', timeoutSec: 120 };
 

@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { ACCEPTANCE_INDEX, CASE_INDEX, DECISION_INDEX, SECTION6_IDS, type CaseEntry } from './index.js';
+import { ACCEPTANCE_INDEX, CASE_INDEX, DECISION_INDEX, HARDENED_INDEX, SECTION6_IDS, type CaseEntry } from './index.js';
 import { PACKAGES, REPO } from './harness/tmp.js';
 import { expectGap, isKnownFailure, openGaps, STRICT } from './harness/gap.js';
 
@@ -49,7 +49,7 @@ describe('CASE_INDEX', () => {
       // every GAP test asserts through expectGap, and names its owner
       for (const n of gapTests) expect(n, n).toMatch(/GAP \(owner: [^)]+\)/);
     };
-    for (const c of [...CASE_INDEX, ...ACCEPTANCE_INDEX, ...DECISION_INDEX]) check(c);
+    for (const c of [...CASE_INDEX, ...ACCEPTANCE_INDEX, ...DECISION_INDEX, ...HARDENED_INDEX]) check(c);
   });
 
   it('DECISION_INDEX covers every owner decision D1–D7 of 2026-10-05 (src/decisions.test.ts) and D8–D12 of 2026-10-06 (src/contract.test.ts), once per id', () => {
@@ -77,6 +77,11 @@ describe('CASE_INDEX', () => {
       expect(ids).toContain(id);
     // the cases the 2026-10-05 brief names explicitly
     for (const id of ['decision.d4_stop_hook', 'decision.d4_achieved_proof', 'decision.d6_plan_requires_pr', 'decision.d3_budget_soft', 'decision.d5_review_foreign', 'decision.d2_reflex_on', 'decision.d7_openrouter_canary']) expect(ids).toContain(id);
+  });
+
+  it('HARDENED_INDEX names the three attacks hardened mode closes (src/hardened.test.ts), once each, none a gap', () => {
+    expect(HARDENED_INDEX.map((c) => c.id)).toEqual(['hardened.forged_run_ended', 'hardened.agent_approve', 'hardened.truncated_tail']);
+    for (const c of HARDENED_INDEX) expect(c.status, c.id).toBe('passing');
   });
 
   it('no expected-failure wrappers: no it.fails / itFinding anywhere (a swallowed attack setup cannot pass as an expected failure)', () => {

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { GETTER_MARKER, RedactionError, containsSecret, makeRedactor, redactJson, redactText, secretNeedles, sha8 } from './redact.js';
 
 const SECRET = 'sk-test-Zq81_lm/+=Hx"\\é-key';
-const PLAIN = 'Pl41nS3cretValue99';
+const PLAIN = ['Pl41n', 'S3cret', 'Value99'].join('');
 const MARK = `[REDACTED:secret:${sha8(PLAIN)}]`;
 
 describe('redactText', () => {
@@ -54,7 +54,7 @@ describe('redactText', () => {
   });
 
   it('redacts SECRET_PATTERNS and the TECERA_CANARY_ pattern (underscores included) without known secrets', () => {
-    const out = redactText('a TECERA_CANARY_ab_12_Z b ghp_abcdefghijklmnopqrstuvwxyz0123 c', []);
+    const out = redactText('a TECERA_CANARY_ab_12_Z b ' + 'ghp_' + 'abcdefghijklmnopqrstuvwxyz0123 c', []);
     expect(out).not.toMatch(/TECERA_CANARY_/);
     expect(out).not.toMatch(/ab_12_Z/);
     expect(out).toContain(`[REDACTED:canary:${sha8('TECERA_CANARY_ab_12_Z')}]`);

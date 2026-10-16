@@ -38,6 +38,7 @@ const wire = (criteria: Criterion[], needs: Array<{ id: string; kind: string; mo
     criteria: criteria.map((c) => ({ id: c.id, statement: c.statement, kind: 'command', command: c.check.kind === 'command' ? c.check.command : '', timeoutSec: 60, prompt: null, requires: c.requires ?? [], tags: [] })),
     outOfScope: [],
     assumptions: [],
+    envelope: [{ path: 'src/*.js', ops: ['create', 'modify'] }],
     needs,
   });
 const planningFor = (m: Manifest, statement: string, criteria: Criterion[], inventory: PlanningContext['inventory']): PlanningContext => {
@@ -100,6 +101,9 @@ describe('s4 / s5: criteria keep the call shapes the existing tests use', () => 
         names: ['createSessionStore'],
         tests: ['test/sessions.test.js'],
         calls: [{ name: 'createSessionStore', signatures: [[]], methods: ['close', 'delete', 'get', 'set'], params: [{ name: 'options', kind: 'object', optional: true, rest: false, members: [] }] }],
+        // the module's comment documents the options object
+        documented: ["Session store: createSessionStore({ path }) keeps the app's sessions."],
+        shapes: [{ name: 'createSessionStore', keys: ['path'] }],
       },
     ]);
     expect(facts5.testedApi[0]!.calls).toEqual([
@@ -323,7 +327,7 @@ describe('s2: criteria that start a server, reach the network or background the 
     ['requests-over-limit-blocked', fetched('const responses = await Promise.all(Array(200).fill().map(() => fetch(`http://localhost:${3000 + process.pid % 1000}/`, { headers: { "X-Forwarded-For": "192.0.2.2" } }).then(r => r.status))); assert.ok(responses.some(s => s === 429));', '& sleep 2 && kill %1')],
     ['rate-limit-resets', fetched('const ip = "192.0.2.4"; await Promise.all(Array(100).fill().map(() => fetch(`http://localhost:${3000 + process.pid % 1000}/`, { headers: { "X-Forwarded-For": ip } }))); await new Promise(r => setTimeout(r, 61000)); const response = await fetch(`http://localhost:${3000 + process.pid % 1000}/`, { headers: { "X-Forwarded-For": ip } }); assert.equal(response.status, 200);', '& sleep 65 && kill %1')],
   ];
-  const inProcess = cmd('limit-429', inline('import { createApp } from "./src/app.js"; const app = createApp({ rateLimit: { max: 2, windowMs: 1000 }, now: () => 0 }); const hit = () => app({ ip: "127.0.0.1", path: "/items" }).status; assert.deepEqual([hit(), hit(), hit()], [200, 200, 429]);'), 'A client over the limit gets 429');
+  const inProcess = cmd('limit-429', inline('import { createApp } from "./src/app.js"; const app = createApp({ rateLimit: { limit: 2, windowMs: 1000 }, now: () => 0 }); const hit = () => app({ ip: "127.0.0.1", path: "/items" }).status; assert.deepEqual([hit(), hit(), hit()], [200, 200, 429]);'), 'A client over the limit gets 429');
 
   it('each live command is named for what the sandbox cannot run', () => {
     for (const [id, command] of LIVE) expect(commandSandboxProblems(command)).toEqual(['backgrounds a command (&)', 'uses sleep', 'uses kill', ...(id === 'rate-limit-resets' ? ['waits on a timer'] : []), 'names a loopback address', 'calls fetch()']);
@@ -423,6 +427,8 @@ describe('s4: the screen holds on the facts a host reads from the tests alone, a
     for (const api of [full, testsOnly]) {
       expect(issuesOf('const db = new DatabaseSync(process.env.TECERA_RESOURCE_DB); const s = createSessionStore({ db }); assert.ok(s.create({ u: 1 }));', api)).toEqual([
         'criterion persists calls only .create() on what createSessionStore returns; the existing tests call .close(), .delete(), .get(), .set() (src/sessions.js). Keep those methods working and check the behaviour through them; add a method, never replace them',
+        // with the module's text the host also knows the documented options ({ path }), and { db } is not one
+        ...(api === full ? ['criterion persists gives createSessionStore { db }, which src/sessions.js documents as createSessionStore({ path }); use the documented keys'] : []),
       ]);
       expect(issuesOf('const s = createSessionStore({ path: process.env.TECERA_RESOURCE_DB }); await s.save("a", 1); assert.equal(await s.load("a"), 1); s.destroy("a");', api).join('\n')).toMatch(/calls only \.destroy\(\), \.load\(\), \.save\(\) on what createSessionStore returns/);
       // A method added beside the tested ones is new behaviour behind what exists.

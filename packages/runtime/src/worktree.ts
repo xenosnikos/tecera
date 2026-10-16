@@ -299,6 +299,16 @@ export async function leaseWorktree(o: LeaseOptions): Promise<LeasedWorktree> {
     return renewing;
   };
 
+  // Renew from the moment the lease is granted, not from the end of the setup: creating or checking the
+  // worktree runs several git commands, which on a loaded host can take longer than the lease's validity.
+  arm();
+  timer = setInterval(() => {
+    if (!current) return;
+    // A failed renewal revokes (inside renewOnce): no further writes, gates or steps in this process.
+    renewShared().catch(() => undefined);
+  }, Math.max(25, Math.floor(o.ttlMs / 6)));
+  timer.unref();
+
   try {
     const top = await gitTopLevel(rootAbs, o.signal);
     const isGit = top !== null && real(top) === rootAbs;
@@ -337,14 +347,6 @@ export async function leaseWorktree(o: LeaseOptions): Promise<LeasedWorktree> {
       }
       await assertSafeRepo(path, o.signal);
     }
-
-    arm();
-    timer = setInterval(() => {
-      if (!current) return;
-      // A failed renewal revokes (inside renewOnce): no further writes, gates or steps in this process.
-      renewShared().catch(() => undefined);
-    }, Math.max(25, Math.floor(o.ttlMs / 6)));
-    timer.unref();
 
     return {
       path,

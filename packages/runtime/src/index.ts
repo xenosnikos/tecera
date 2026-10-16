@@ -48,6 +48,7 @@ export type { ModelFrontierOptions } from './frontier.js';
 export { replayRun } from './replay.js';
 export type { ReplayReport, ReplayedGoal, ReplayOptions } from './replay.js';
 export { deferStaging, stageAchievedPlans, STAGED_AFTER } from './staging.js';
+export { recordRunLearning, MAX_EPISODE_CHARS, type LearningResult } from './learning.js';
 export { assertLedgerPath } from './runtime.js';
 export {
   executeRun,
@@ -100,3 +101,11 @@ export { PlannedFs } from './vfs.js';
 export type { Env } from './util/proc.js';
 export { DECISION_NONINTERACTIVE_ENV, AGENT_HOST_MARKERS, guardDecision, decisionGuard } from './decisionGuard.js';
 export type { DecisionGuardRecord, DecisionGuardVerdict } from './decisionGuard.js';
+export { HARDENED_CONFIG_ENV, HARDENED_CONFIG_PATH, HardenedError, loadHardenedConfig, parseHardenedConfig, trustProblems } from './hardened/config.js';
+export type { HardenedConfig, HardenedIdentity } from './hardened/config.js';
+export { caseIdOf, resolveHardened, stateProblems, placementProblem } from './hardened/context.js';
+export type { HardenedContext } from './hardened/context.js';
+export { RunRegistry, stateForExit, stopStateOf, HEARTBEAT_STALE_MS } from './hardened/registry.js';
+export { callerIdentity, operatorRefusal, processCredentials } from './hardened/authority.js';
+export { hardenedStopRuns } from './stopHook.js';
+export { openHardenedLedger } from './runtime.js';

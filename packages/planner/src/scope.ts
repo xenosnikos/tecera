@@ -14,7 +14,9 @@ import type { PlanDocument } from './schema.js';
  * Writing steps. A worker step meant to change files (an effective tool outside READ_ONLY_TOOLS and
  * runVerify) returns `{changed: [paths…], summary}` with at least one path: a return that changed nothing
  * fails the step's schema instead of passing as an exploration object. Properties the model asked for (e.g.
- * `facts`) are kept beside them. Read steps keep their own schema.
+ * `facts`) are kept beside them. Read steps keep their own schema. A writing step also gets runVerify (when
+ * the tool catalog has it), added to its tools and the plan's, so the worker can run the tests before it
+ * returns instead of meeting every failure at the verify gate.
  */
 
 /** Tools that never change files on their own (runVerify runs the tests; it is not an edit). */
@@ -83,6 +85,8 @@ export function namedPaths(text: string): string[] {
 
 export interface WriteScopeInput {
   manifest: Manifest;
+  /** The tools the host wires; runVerify is added to writing steps only when it is one. Default: it is. */
+  toolCatalog?: readonly string[];
 }
 
 /**
@@ -90,8 +94,15 @@ export interface WriteScopeInput {
  * and every file-changing worker step's output under WRITING_STEP_OUTPUT. See the module comment.
  */
 export function settlePlanDocument(doc: PlanDocument, i: WriteScopeInput): PlanDocument {
-  const steps = doc.steps.map((s) => (stepChangesFiles(doc, s) ? { ...s, output: writingStepOutput(s.output) } : s));
-  const out: PlanDocument = { ...doc, steps, permissions: { ...doc.permissions, write: [...doc.permissions.write] } };
+  const verify = !i.toolCatalog || i.toolCatalog.includes('runVerify');
+  const writing = doc.steps.filter((s) => stepChangesFiles(doc, s));
+  const steps = doc.steps.map((s) =>
+    writing.includes(s)
+      ? { ...s, output: writingStepOutput(s.output), ...(verify && Array.isArray(s.tools) && !s.tools.includes('runVerify') ? { tools: [...s.tools, 'runVerify'] } : {}) }
+      : s,
+  );
+  const tools = verify && writing.length && Array.isArray(doc.permissions.tools) && !doc.permissions.tools.includes('runVerify') ? [...doc.permissions.tools, 'runVerify'] : doc.permissions.tools;
+  const out: PlanDocument = { ...doc, steps, permissions: { ...doc.permissions, tools, write: [...doc.permissions.write] } };
   const allowed = [...(i.manifest.repo?.allowedChanges ?? [])];
   const own = doc.permissions.write;
   const changes = own.length > 0 || steps.some((s) => stepChangesFiles(doc, s));

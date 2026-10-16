@@ -1,12 +1,15 @@
 import { posix } from 'node:path';
-import { declaredExports, nameUses, resolveFrom, type ArgKind, type DeclaredParam } from './apiSurface.js';
+import { assertedValues, commentLines, declaredExports, documentedShapes, nameUses, relativeImports, resolveFrom, type ArgKind, type AssertedValue, type DeclaredParam, type DocumentedShape } from './apiSurface.js';
 
 /**
  * What the drafting seat may rely on in the repository, read by the host (never by the model): the package
  * names package.json lists (nothing else is installed: a criterion importing any other package can never
  * pass), and the exported names the repository's own tests import from its modules, with the call shapes the
  * tests use and, when the host also read the modules, the parameters each function declares (the API a contract
- * must keep working instead of inventing a replacement). Pure functions over text the caller read; never throws.
+ * must keep working instead of inventing a replacement), what a returned handler is given and gives back, the
+ * interfaces the modules document in comments, the exact values the tests assert (null and undefined kept
+ * apart), and the repository's commands with the modules they import. Pure functions over text the caller
+ * read; never throws.
  */
 
 /** How the tests call one exported name. */
@@ -18,6 +21,10 @@ export interface TestedCall {
   methods: string[];
   /** True when the tests call what it returns as a function. */
   resultCalled?: boolean;
+  /** The keys of the object the tests pass to that returned function (`app({ ip, path })`). */
+  resultArgKeys?: string[][];
+  /** The properties the tests read on what that returned function returns (`.status`, `.body`). */
+  resultProps?: string[];
   /** The parameters the module declares for it (only when the host read the module's text). */
   params?: DeclaredParam[];
 }
@@ -31,6 +38,23 @@ export interface TestedModule {
   tests: string[];
   /** How the tests call the names they call, and what the module declares for them (a name only imported, with no declaration read, is not listed). */
   calls: TestedCall[];
+  /** The module's own comment lines that document an interface (a call or an object shape), when the host read it. */
+  documented?: string[];
+  /** The object shapes those comments document for a call (`send({ to, subject, text })`). */
+  shapes?: DocumentedShape[];
+}
+
+/** An exact value a repository test asserts, and the test file. */
+export interface TestAssertion extends AssertedValue {
+  test: string;
+}
+
+/** A command of the repository (package.json `bin`, a file under bin/, a file a test spawns) and the modules it imports. */
+export interface EntryPoint {
+  path: string;
+  imports: string[];
+  /** Comment lines of the entry point that document its usage. */
+  documented?: string[];
 }
 
 export interface RepoFacts {
@@ -38,6 +62,68 @@ export interface RepoFacts {
   dependencies: readonly string[];
   /** Exported names the repository's tests import, per module. */
   testedApi: readonly TestedModule[];
+  /** Exact values the repository's tests assert (null and undefined kept apart). */
+  assertions?: readonly TestAssertion[];
+  /** The repository's commands and what they import. */
+  entryPoints?: readonly EntryPoint[];
+}
+
+const MAX_DOC_LINES = 6;
+/** A comment line documents an interface when it shows a call or an object shape. */
+const DOCUMENTS = /[A-Za-z_$][\w$.]*\s*\(|\{\s*[A-Za-z_$][\w$]*\s*[,}]|=>|\breturns?\b/;
+
+/** The comment lines of `text` that document an interface, bounded. */
+export function documentedLines(text: string): string[] {
+  return commentLines(text)
+    .filter((l) => DOCUMENTS.test(l))
+    .slice(0, MAX_DOC_LINES)
+    .map((l) => l.slice(0, 240));
+}
+
+/** Every exact value the tests assert, bounded (assertedValues per test file). */
+export function assertionsOf(files: ReadonlyArray<{ path: string; text: string }>): TestAssertion[] {
+  const out: TestAssertion[] = [];
+  for (const f of files) {
+    if (typeof f?.path !== 'string' || typeof f.text !== 'string') continue;
+    for (const a of assertedValues(f.text)) if (out.length < 64 && a.actual.length <= 200 && a.value.length <= 200) out.push({ ...a, test: f.path });
+  }
+  return out;
+}
+
+/** Files the tests spawn by a literal path (`new URL('../bin/report.js', import.meta.url)`, `spawnSync('node', ['bin/x.js'])`). */
+export function spawnedByTests(files: ReadonlyArray<{ path: string; text: string }>): string[] {
+  const out = new Set<string>();
+  for (const f of files) {
+    if (typeof f?.path !== 'string' || typeof f.text !== 'string' || !/\b(?:spawn|exec|execFile|fork)(?:Sync)?\b/.test(f.text)) continue;
+    for (const m of f.text.matchAll(/new\s+URL\(\s*["'`](\.{1,2}\/[^"'`]+\.[cm]?[jt]s)["'`]\s*,\s*import\.meta\.url\s*\)/g)) {
+      const p = resolveFrom(f.path)(m[1]!);
+      if (p) out.add(p);
+    }
+    for (const m of f.text.matchAll(/["'`]((?:\.\/)?(?:bin|scripts|cli)\/[\w./-]+\.[cm]?[jt]s)["'`]/g)) out.add(m[1]!.replace(/^\.\//, ''));
+  }
+  return [...out].sort();
+}
+
+/** Paths package.json lists under `bin` (a string or an object of them). */
+export function packageBins(packageJson: string): string[] {
+  try {
+    const b = (JSON.parse(packageJson) as { bin?: unknown }).bin;
+    const list = typeof b === 'string' ? [b] : b && typeof b === 'object' && !Array.isArray(b) ? Object.values(b as Record<string, unknown>) : [];
+    return list.filter((x): x is string => typeof x === 'string').map((x) => posix.normalize(x).replace(/^\.\//, '')).filter((x) => !x.startsWith('..') && !x.startsWith('/'));
+  } catch {
+    return [];
+  }
+}
+
+/** Each entry point's relative imports and usage comments (files the caller read). Bounded: 8. */
+export function entryPointsOf(files: ReadonlyArray<{ path: string; text: string }>): EntryPoint[] {
+  const out: EntryPoint[] = [];
+  for (const f of files) {
+    if (out.length >= 8 || typeof f?.path !== 'string' || typeof f.text !== 'string') continue;
+    const doc = documentedLines(f.text);
+    out.push({ path: posix.normalize(f.path), imports: relativeImports(f.text, resolveFrom(f.path)).slice(0, 12), ...(doc.length ? { documented: doc } : {}) });
+  }
+  return out;
 }
 
 const NAME = /^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i;
@@ -87,7 +173,9 @@ function names(list: string): string[] {
  * declares as an exported function then carries its declared parameters (apiSurface declaredExports).
  */
 export function testedApiOf(files: ReadonlyArray<{ path: string; text: string }>, sources: ReadonlyArray<{ path: string; text: string }> = []): TestedModule[] {
-  type Use = { signatures: Map<string, ArgKind[]>; methods: Set<string>; resultCalled: boolean; params?: DeclaredParam[] };
+  type Use = { signatures: Map<string, ArgKind[]>; methods: Set<string>; resultCalled: boolean; resultArgKeys: Map<string, string[]>; resultProps: Set<string>; params?: DeclaredParam[] };
+  const fresh = (): Use => ({ signatures: new Map<string, ArgKind[]>(), methods: new Set<string>(), resultCalled: false, resultArgKeys: new Map<string, string[]>(), resultProps: new Set<string>() });
+  const docs = new Map<string, { documented: string[]; shapes: DocumentedShape[] }>();
   const by = new Map<string, { names: Set<string>; tests: Set<string> }>();
   const calls = new Map<string, Map<string, Use>>();
   try {
@@ -108,10 +196,12 @@ export function testedApiOf(files: ReadonlyArray<{ path: string; text: string }>
       for (const u of nameUses(f.text, resolveFrom(f.path))) {
         if (!u.calls.length && !u.methods.length) continue;
         const mod = calls.get(u.module) ?? new Map<string, Use>();
-        const e = mod.get(u.name) ?? { signatures: new Map<string, ArgKind[]>(), methods: new Set<string>(), resultCalled: false };
+        const e = mod.get(u.name) ?? fresh();
         for (const c of u.calls) e.signatures.set(c.join(','), c);
         for (const x of u.methods) e.methods.add(x);
         e.resultCalled ||= u.resultCalled;
+        for (const k of u.resultArgKeys ?? []) e.resultArgKeys.set(k.join(','), k);
+        for (const p of u.resultProps ?? []) e.resultProps.add(p);
         mod.set(u.name, e);
         calls.set(u.module, mod);
       }
@@ -120,10 +210,13 @@ export function testedApiOf(files: ReadonlyArray<{ path: string; text: string }>
       const names = typeof src?.path === 'string' && typeof src.text === 'string' ? by.get(posix.normalize(src.path))?.names : undefined;
       if (!names) continue;
       const module = posix.normalize(src.path);
+      const documented = documentedLines(src.text);
+      const shapes = documentedShapes(src.text);
+      if (documented.length || shapes.length) docs.set(module, { documented, shapes });
       for (const d of declaredExports(src.text)) {
         if (!names.has(d.name)) continue;
         const mod = calls.get(module) ?? new Map<string, Use>();
-        const e = mod.get(d.name) ?? { signatures: new Map<string, ArgKind[]>(), methods: new Set<string>(), resultCalled: false };
+        const e = mod.get(d.name) ?? fresh();
         e.params = d.params.slice(0, MAX_SIGNATURES);
         mod.set(d.name, e);
         calls.set(module, mod);
@@ -147,7 +240,11 @@ export function testedApiOf(files: ReadonlyArray<{ path: string; text: string }>
           signatures: [...c.signatures.values()].slice(0, MAX_SIGNATURES),
           methods: [...c.methods].sort().slice(0, MAX_NAMES),
           ...(c.resultCalled ? { resultCalled: true } : {}),
+          ...(c.resultArgKeys.size ? { resultArgKeys: [...c.resultArgKeys.values()].slice(0, MAX_SIGNATURES) } : {}),
+          ...(c.resultProps.size ? { resultProps: [...c.resultProps].sort().slice(0, MAX_NAMES) } : {}),
           ...(c.params ? { params: c.params } : {}),
         })),
+      ...(docs.get(module)?.documented.length ? { documented: docs.get(module)!.documented } : {}),
+      ...(docs.get(module)?.shapes.length ? { shapes: docs.get(module)!.shapes } : {}),
     }));
 }

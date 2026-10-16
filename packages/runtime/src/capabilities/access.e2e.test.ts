@@ -274,6 +274,8 @@ describe('the planner sees the repository; refused drafts are on the ledger (D-D
       ],
       outOfScope: [],
       assumptions: [],
+      // every drafted contract states its envelope; this one is refused for its import alone
+      envelope: [{ path: 'src/slugify.js', ops: ['modify'] }],
       needs: [],
     });
     const d = tmp('tecera-scripts-');
@@ -346,10 +348,15 @@ describe('capability access helpers', () => {
               params: [{ name: 'options', kind: 'object', optional: true, rest: false, members: [] }],
             },
           ],
+          // the module's comment documents its options; the test asserts get() is undefined after delete
+          documented: ["Session store: createSessionStore({ path }) keeps the app's sessions."],
+          shapes: [{ name: 'createSessionStore', keys: ['path'] }],
         },
       ],
+      assertions: [{ actual: "s.get('a')", value: 'undefined', callee: 'get', test: 'test/sessions.test.js' }],
+      entryPoints: [],
     });
     expect(runtimeEnvironment(facts)).toMatchObject({ builtins: expect.arrayContaining(['node:sqlite', 'node:test']), dependencies: [], notes: expect.stringMatching(/No package is installed/) });
-    expect(repositoryFacts(join(tmp(), 'missing'))).toEqual({ dependencies: [], testedApi: [] });
+    expect(repositoryFacts(join(tmp(), 'missing'))).toEqual({ dependencies: [], testedApi: [], assertions: [], entryPoints: [] });
   });
 });

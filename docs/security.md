@@ -8,7 +8,8 @@ and the commit to that branch need no approval, under any isolation; they are fe
 by the gates. The single approval on the delivery path is at the pull-request gate (`gate.pr`). An
 approval is a local command, `tecera approve <request> --as <name>`, run by a human who is not the
 requester. There is no authentication service, token or login in the codebase; section 4 states what
-that does and does not guarantee.
+that does and does not guarantee. Hardened mode, which is opt-in, runs the host assistant as a separate
+OS identity that cannot write Tecera's state or make a decision (section 4, "Hardened mode").
 
 This document describes the design and the code as it stands. It is not a claim that every control holds
 against every attack: known open defects are summarised in the README under "Status and known
@@ -29,7 +30,8 @@ A host assistant (Claude Code, Codex) working in the same checkout is outside th
 user's file access, including to the ledger file and to the `tecera` binary. The Claude Code adapter
 installs hooks that are meant to keep it from editing protected paths, from running the human decision
 commands and from ending a session over an unproven run; the Codex adapter installs no hooks. Neither is
-a sandbox.
+a sandbox. In hardened mode the assistant runs as an agent identity that can read Tecera's state but not
+write it, and the decision commands check the caller's OS identity themselves (section 4).
 
 **Attacker capabilities.** Hostile model output (arbitrary JS, prompt text); hostile repo content (tests,
 `.husky`, `core.hooksPath`, `.gitattributes` filters, `vitest.config`, `package.json#scripts`, symlinks,
@@ -144,7 +146,7 @@ its REPL.
 
 ### Who approves
 
-There is no authenticated ingress. A decision (`tecera approve`, `tecera deny`, `criteria accept|amend`,
+In the default single-user mode there is no authenticated ingress. A decision (`tecera approve`, `tecera deny`, `criteria accept|amend`,
 `resources release|transfer`, `plans|memory graduate|reject|retract`) is made by the local person running
 the command. The principal is `--as <id>`, else `$USER`, else `$USERNAME`; it must be a plain identifier and
 is recorded as `{kind:'human', id, method:'local', authenticated:false, source}` in the audited decision
@@ -183,7 +185,8 @@ What it does not guarantee: the `human` kind and the name are whatever the calle
 local process that can run `tecera` in the business case can approve under any name. Keeping an agent
 away from these commands is the job of the worker sandbox (a worker has no shell and no such tool) and,
 for a host assistant, of the Claude Code pre-tool hook, which is meant to refuse them. Under Codex no hook
-is installed. Treat a recorded approver name as an audit note, not as proof of identity.
+is installed. Treat a recorded approver name as an audit note, not as proof of identity. Hardened mode
+adds a check that is not a claim: the caller's OS identity (below).
 
 ### Ledger
 
@@ -199,7 +202,8 @@ REPLACE` cannot rewrite a row.
 - `approvals(request_id PK, run_id, session_id, action_hash, requester_kind, requester_id, reason, state pending|granted|denied|consumed|expired, expires_at, approver_kind, approver_id, granted_at, denied_reason, consumed_at, consume_idem UNIQUE, granted_seq)`
 - `checkpoints(id PK, run_id, key, state, digest, at)`
 
-There is no separate `runs` table: a run's state is derived from its events.
+There is no separate `runs` table: a run's state is derived from its events. Hardened mode keeps a run
+registry outside the ledger (below).
 
 `verifyChain` reads events and evidence in one snapshot and requires both to be numbered contiguously from
 1, so a row removed from the middle or a renumbered tail is reported. A lease that expired or was released
@@ -210,7 +214,8 @@ ledger would let anyone else take it.
 The hash chain is unkeyed. It detects a recorded row being rewritten; it does not stop a party with write
 access to the database file from appending well-formed events, or from dropping the triggers and
 truncating the tail. Decisions that matter (achievement, approval, sign-off) are therefore derived from
-evidence and from the `approvals` table as well as from events, not from a single event.
+evidence and from the `approvals` table as well as from events, not from a single event. Hardened mode pins the
+head of both chains in a checkpoint outside the database (below).
 
 Recovery matrix (the step labels S1–S9 are the ones the crash tests use; in today's flow the commit, S8,
 happens before the PR approval hold, S7; restart is `tecera run --resume` and reconciles the worktree by
@@ -249,6 +254,120 @@ commits to the branch the completion record names and refuses a context that nam
 that names a branch without a record. Because the branch is part of the candidate fingerprint, the verify,
 criterion and review evidence of the old intention (keyed by fingerprint) is never reused for the new one,
 even when the two changes are byte-identical.
+### Hardened mode (opt-in)
+
+Single-user mode, the default, is what the rest of this section describes: Tecera, the host assistant and
+the ledger share one OS identity, so the ledger records what happened but nothing in it is authenticated
+against the assistant. Hardened mode moves the trust anchor out of the assistant's identity. It is off unless
+the host is configured for it.
+
+**Configuration.** A host file, `/etc/tecera/hardened.json`, names the state directory, the operator (one
+uid) and the agent identities:
+
+```json
+{ "version": 1, "stateDir": "/var/lib/tecera",
+  "operator": { "uid": 1000, "name": "nick" }, "agents": [{ "uid": 1001, "name": "tecera-agent" }] }
+```
+
+It is not part of the manifest: `tecera.json` lives in the repository the assistant edits, so a switch there
+could be turned off by the assistant. The file and every directory above it must be owned by root or the
+operator and writable by nobody else, otherwise every command refuses (exit 3). When there is no file at
+that path, `TECERA_HARDENED_CONFIG` may name one elsewhere (a host without a writable `/etc`, tests); that is
+only as strong as whatever sets the environment of every command, the Stop hook's included. The operator
+must differ from every agent, and no agent may be root. `tecera hardened init` prints the commands an
+administrator runs to create the agent account, the state directory and the configuration; it changes
+nothing on the host itself.
+
+**Protected state.** One directory per business case, `<stateDir>/cases/<caseId>/` (the id is a hash of the
+real path of the business case root): the ledger (`ledger.sqlite`, with a rollback journal instead of
+write-ahead logging, so an identity that may not write can still read it), its head checkpoint (`head.json`,
+`head.pending.<n>.json`) and the run registry (`runs/<runId>.json`). The manifest's `ledger.path` is not used.
+Before a command does anything, Tecera checks that the state directory, every directory above it and
+everything inside it are owned by root or the operator, are not links and are not writable by group or
+others, that files have one link, and that the state lies outside the business case and outside the
+worktrees directory. Any failure refuses the command (exit 3), whichever identity runs it. Only a process
+whose real and effective uid are the operator's writes the state; any other opens the ledger read-only and
+`tecera run` refuses (exit 8). ACLs, Linux capabilities and mandatory access control are not inspected.
+`tecera doctor` reports these checks; run as root it also tries to create a file in the state as each
+agent uid and expects to be refused. After enrollment the repository's own ledger file, if any, is no
+longer read.
+
+**Checks.** A check (the goal's verify command, a criterion's command, a connection probe) runs repository
+code, and the assistant can write the repository. Run as the operator it could rewrite the state, so in
+hardened mode no check runs as the operator or as root: `TECERA_VERIFY_UID`/`TECERA_VERIFY_GID` must name
+another unprivileged identity that can read the worktrees, otherwise `tecera run` refuses (exit 3) and the
+runtime's verify runner refuses every check (`tecera gate`, `tecera preflight`). Switching to that identity
+needs a root supervisor, so today a deployment that runs checks has root as its operator (the person acts
+through sudo); with a non-root operator the registry, the checkpoint and the decision boundary work, but no
+run can execute a check.
+
+**Run registry.** One file per run, written only by the supervisor (`tecera run` as the operator). A run is
+registered before anything is wired or dispatched and marked running when its work starts. When the segment
+ends, the supervisor records the outcome it computed itself: `held` (exit 4), `interrupted` (130),
+`provisional` (10), or `terminal` with the exit code and reason (anything else). A resume moves the entry to
+`running` with the next generation; a resume that cannot start puts it back as it was; an unexpected
+exception leaves it `interrupted`. A running entry whose heartbeat (every 10 s) is more than 60 s old is
+reported as interrupted, never as finished. A terminal run is not resumed. A provisional run becomes terminal
+when a later run of the same goal ends achieved. `tecera hardened abandon <run> --reason <text>` (operator
+only) is the one other way to make a run terminal; it also records `run.ended` with exit 9.
+
+**Stop hook.** The hook reads the registry. Every entry of the business case that is not terminal is an
+active run whatever the ledger's events say: an appended `run.ended`, a denied approval or an expired one
+removes nothing, and runs the events call active count as well. Such a run lets the assistant stop only
+when `ledgerProvenRun` proves it, as before. A registered run whose ledger is missing, moved or replaced
+blocks. An open entry of any other business case on the host blocks too, as does one whose `tecera.json`
+was removed: leaving the business case does not end the obligation. Run as the agent identity, the hook
+cannot write the ledger, so its decisions are printed and not recorded.
+
+**Head checkpoint.** `{ledgerId, formatVersion, eventCount, eventHeadHash, evidenceCount, evidenceHeadHash,
+generation}` plus the enrollment baseline, kept in the protected state. Every ledger write transaction,
+once it holds the database write lock, compares the database with the checkpoint. A write that changes
+either chain then records `{from, to}` in a journal, moves the checkpoint to `to`, commits, and removes the
+journal. A crash at any of these steps leaves either the acknowledged head or a journalled transition, and
+the next writer accepts exactly that transition (moving the checkpoint back when the commit never happened);
+readers accept the same two states. Anything else fails `verifyChain` and refuses every write: fewer or more
+events or evidence rows than acknowledged, a different last row, a renumbered log, another ledger id, a
+journal that matches neither side, a missing or malformed checkpoint. A ledger is enrolled once with
+`tecera hardened enroll`: created empty (genesis), or an existing ledger whose chain verifies, imported with
+`--import` or already in place, with its current head as a legacy baseline. History before a legacy
+enrollment is accepted as it was found, not authenticated; the runs it shows open are entered in the
+registry. A missing checkpoint for an enrolled ledger is an error, never a reason to enroll again.
+
+**Decisions.** `approve`, `deny`, `criteria accept|amend`, `plans|memory graduate|reject|retract`,
+`resources release|transfer` and `hardened enroll|abandon` proceed only when the process's real and
+effective uid, read from the process credentials, are the operator's and neither is an agent's; otherwise
+they refuse with exit 8 before reading anything. No environment variable, `--as`, terminal or hook takes
+part, so the check is the same under Claude Code, Codex or a plain shell. The accident guard still runs
+after it. `--as` remains the audit label of the person; the principal is recorded with
+`method: "operator-uid"` and the OS identity (`os: {uid, euid, gid, user}`) on the decision's events
+(`approval.granted`, `approval.denied`, `criteria.amended` carry it in `guard.os`) and in the approval's
+identity evidence; plan decisions record the method.
+
+What hardened mode guarantees, against a host assistant that runs as an agent identity on a host set up as
+above: it cannot write the ledger, the run registry or the checkpoint; it cannot make a decision, with or
+without a terminal, whatever name it passes; it cannot hide a registered run from the Stop hook by appending
+to, deleting from or replacing the ledger; and a ledger that was truncated, restored from an older copy,
+renumbered or replaced is detected.
+
+What it does not guarantee:
+
+- Root on the host defeats it, and so does anything that can run code as the operator: a compromised
+  supervisor, an operator shell the assistant can drive, sudo rights for the agent account, a Tecera
+  installation or Node binary the agent can write (`tecera doctor` checks the last two).
+- It shows that a decision came from the operator identity. It does not show which person used that
+  account, or that they read what they approved.
+- It does not protect the Stop hook's own installation. With Claude Code the hooks must come from managed
+  settings the agent cannot edit; a hook in the repository's `.claude/settings.json` can be removed by the
+  assistant. Codex installs no hooks, so nothing enforces stopping there; the decision boundary still holds.
+- The checkpoint lives in the same protected directory as the ledger: whoever can roll back the whole state
+  directory (restoring a backup of it) rolls the checkpoint back with it. An independently administered
+  checkpoint is not implemented.
+- The ledger is still unkeyed. The boundary is file ownership, not signatures, and evidence the supervisor
+  records from an untrusted process (a check's output) is no more trustworthy than that process.
+- The manifest, the permissions document, the goal files and the repository stay writable by the assistant:
+  they are inputs Tecera validates and pins, not authority. State outside the protected directory
+  (worktrees, pull-request bundles under `.tecera/runs/`, provisioned resources, rendered plans and lessons)
+  is not covered.
 
 ## 5. Verify and review gates
 
@@ -318,8 +437,11 @@ runner, and `tecera run` end to end) with scripted models in place of providers.
 layer the case targets, not a directory. Approval cases use the local human principal of section 4.
 
 The suite covers these named cases; it is not exhaustive. It includes forged `run.ended` and forged
-`pr.requested` events against the Stop hook for a run held at its pull request; a forged `run.ended` on a
-run with no open approval is a known gap.
+`pr.requested` events against the Stop hook for a run held at its pull request. In single-user mode a
+forged `run.ended` on a run with no open approval still hides it; `HARDENED_INDEX` lists the cases for
+hardened mode (`src/hardened.test.ts`: a forged `run.ended` after a denied pull request, a decision made by
+the agent identity under a pseudo-terminal, a truncated ledger tail), each shown succeeding in single-user
+mode first.
 
 | Test | Attack | Expected | Lives |
 |---|---|---|---|

@@ -164,16 +164,16 @@ describe('ReviewGate packet completeness', () => {
   });
 
   it('packet and evidence are redacted (known secret, key shapes, canaries); nonce-wrapped; carry verify evidence', async () => {
-    const s = setup(() => `{"verdict":"reject","findings":[{"title":"found ${SECRET}"}]}`, `export const k = "sk-ant-abcdefghijklmnop";\nexport const s = "${SECRET}";\nexport const c = "TECERA_CANARY_review_1";\n`);
+    const s = setup(() => `{"verdict":"reject","findings":[{"title":"found ${SECRET}"}]}`, `export const k = "${'sk-ant-' + 'abcdefghijklmnop'}";\nexport const s = "${SECRET}";\nexport const c = "TECERA_CANARY_review_1";\n`);
     const verify = new VerifyGate({ ledger: s.ledger, manifest: manifest(), runner: new FakeRunner(() => ({ stdout: 'TESTS PASSED 7' })), worktree: s.repo.dir, memo: s.memo });
     await verify.verify(ctx('v', { worktree: s.repo.dir }));
     const r = await s.gate.review(s.c);
     const sent = s.reviewer.calls[0]!.messages.map((m) => m.content).join('\n');
-    for (const leak of ['sk-ant-abcdefghijklmnop', SECRET, 'TECERA_CANARY_review_1']) expect(sent).not.toContain(leak);
+    for (const leak of ['sk-ant-' + 'abcdefghijklmnop', SECRET, 'TECERA_CANARY_review_1']) expect(sent).not.toContain(leak);
     expect(sent).toContain('TESTS PASSED 7');
     expect(sent).toMatch(/<<<UNTRUSTED DIFF [0-9a-f]{24}>>>/);
     const ev = JSON.stringify((await s.ledger.getEvidence(r.evidenceKey))!.body);
-    for (const leak of ['sk-ant-abcdefghijklmnop', SECRET, 'TECERA_CANARY_review_1']) expect(ev).not.toContain(leak);
+    for (const leak of ['sk-ant-' + 'abcdefghijklmnop', SECRET, 'TECERA_CANARY_review_1']) expect(ev).not.toContain(leak);
   });
 
   it('wrapUntrusted cannot be closed from inside the content', () => {

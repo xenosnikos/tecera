@@ -55,13 +55,15 @@ import { PLAN_WIRE_JSON_SCHEMA, toPlan } from './schema.js';
  * (the document's plus every one a criterion requires) and must pass contractPlanIssues: a plan missing a
  * criterion's verify is refused here, before it leaves the planner.
  *
- * The host settles two things in the model's document before it is stamped (settlePlanDocument):
+ * The host settles three things in the model's document before it is stamped (settlePlanDocument):
  * permissions.write is the manifest's allowedChanges (what the request or contract names never narrows it),
- * and every file-changing worker step returns {changed, summary} with at least one changed path.
+ * every file-changing worker step returns {changed, summary} with at least one changed path, and every
+ * file-changing worker step may run the tests (runVerify, when the tool catalog has it).
  *
  * draftContract(): prompt → one completion → strict decode (CONTRACT_WIRE_JSON_SCHEMA) → host-stamped goal
  * id and statement, needs built from the criteria → contractDraftIssues (contractProblem, bounds, secrets, no
- * requestor criterion weakened) → contractQualityIssues (behavioural, focused criteria; the capabilities the
+ * requestor criterion weakened; a change-path envelope stated, inside repo.allowedChanges, off protected paths
+ * and consistent with the repository) → contractQualityIssues (behavioural, focused criteria; the capabilities the
  * statement implies required; nothing the verify sandbox cannot run: a server, the network, a background job;
  * with repoFacts, no import of a package the repository does not install and no call of an existing tested
  * function with another call shape); on any
@@ -567,10 +569,12 @@ export class LLMPlanner implements Planner {
       allowedChanges: this.o.manifest.repo.allowedChanges,
       protectedPaths: this.o.manifest.policy.protectedPaths,
       ...(this.o.repoFiles ? { fileExists: this.o.repoFiles } : {}),
+      // every drafted contract names its paths; a draft without them goes back for repair
+      requireEnvelope: true,
     });
     if (!built.ok) return { ok: false, issues: this.sanitizeIssues(built.issues) };
     // A well-formed draft that proves too little about the request goes back for repair like a malformed one.
-    const weak = contractQualityIssues(built.draft, { statement, goal, verifyCommand: this.o.manifest.verify?.command, connections, inventory: inv, ...(this.o.repoFiles ? { fileExists: this.o.repoFiles } : {}), ...(repo ? { dependencies: repo.dependencies, testedApi: repo.testedApi } : {}) });
+    const weak = contractQualityIssues(built.draft, { statement, goal, verifyCommand: this.o.manifest.verify?.command, connections, inventory: inv, ...(this.o.repoFiles ? { fileExists: this.o.repoFiles } : {}), allowedChanges: this.o.manifest.repo.allowedChanges, ...(repo ? { dependencies: repo.dependencies, testedApi: repo.testedApi, ...(repo.assertions ? { assertions: repo.assertions } : {}), ...(repo.entryPoints ? { entryPoints: repo.entryPoints } : {}) } : {}) });
     return weak.length ? { ok: false, issues: this.sanitizeIssues(weak), draft: built.draft } : { ok: true, draft: withTags(built.draft) };
   }
 
@@ -588,7 +592,7 @@ export class LLMPlanner implements Planner {
     const { budget, issues: budgetIssues } = materializeBudget(parsed.plan.budget, this.o.manifest, goal);
     // The host settles the write scope (the manifest's allowedChanges) and the return schema of every
     // file-changing worker step.
-    const doc = settlePlanDocument(parsed.plan, { manifest: this.o.manifest });
+    const doc = settlePlanDocument(parsed.plan, { manifest: this.o.manifest, toolCatalog: this.catalogFor(goal, ctx) });
     // The host records the contract the plan answers to and adds every capability its criteria require.
     const contractHash = planContractHash(ctx, goal);
     const capabilities = planCapabilities(doc.capabilities, ctx, goal);

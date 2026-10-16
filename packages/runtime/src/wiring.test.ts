@@ -127,6 +127,36 @@ describe('lease loss revokes authority', () => {
     expect(await ledger.lease('worktree:r_1', 'someone', 1000)).toBeNull();
   });
 
+  it('renewals run while the worktree is being set up: a setup slower than the lease validity keeps the lease', async () => {
+    const root = businessCase(true);
+    const ledger = new MemoryLedger();
+    const renewedAt: number[] = [];
+    const renew = ledger.renew.bind(ledger);
+    ledger.renew = (l, t) => {
+      renewedAt.push(Date.now());
+      return renew(l, t);
+    };
+    // the first git command of the setup is held back past the lease's local validity (ttl 600 ms → 525 ms)
+    let elapsed = 0;
+    const path = process.env.PATH ?? '';
+    const shim = tmp('tecera-slowgit-');
+    writeFileSync(join(shim, 'git'), `#!/bin/sh\n[ -f ${join(shim, 'once')} ] || { touch ${join(shim, 'once')}; sleep 1; }\nexec ${execFileSync('sh', ['-c', 'command -v git']).toString().trim()} "$@"\n`, { mode: 0o755 });
+    process.env.PATH = `${shim}:${path}`;
+    let wt;
+    try {
+      const started = Date.now();
+      wt = await leaseWorktree(opts(root, ledger, tmp('tecera-wts-'), { ttlMs: 600 }));
+      elapsed = Date.now() - started;
+    } finally {
+      process.env.PATH = path;
+    }
+    expect(elapsed).toBeGreaterThan(600);
+    expect(renewedAt.length).toBeGreaterThan(0);
+    expect(wt.heldReason()).toBeNull();
+    expect(wt.lost.aborted).toBe(false);
+    await wt.release();
+  });
+
   it('a renewal refused by the ledger revokes with that reason', async () => {
     const root = businessCase(true);
     const ledger = new MemoryLedger();

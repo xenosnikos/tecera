@@ -1,7 +1,8 @@
 import { isBuiltin } from 'node:module';
 import type { AchievementGoal, CapabilityRecord, ContractDraft, Criterion, Manifest } from '@tecera/contracts';
-import { nameUses, renderCall, renderDeclared, resolveFrom, type ArgKind } from './apiSurface.js';
-import type { TestedCall, TestedModule } from './repoFacts.js';
+import { globWithin, matchesAny } from '@tecera/policy';
+import { assertedValues, nameUses, objectKeys, renderCall, renderDeclared, resolveFrom, type ArgKind } from './apiSurface.js';
+import type { EntryPoint, TestAssertion, TestedCall, TestedModule } from './repoFacts.js';
 import { safeSegment } from './schema.js';
 import { namedPaths } from './scope.js';
 import { base, readShell } from './shell.js';
@@ -40,7 +41,18 @@ import { base, readShell } from './shell.js';
  *   does not hold (a second function of the same name), or imports a tested module in a form the host cannot
  *   read the calls from, when the host read the tests: the existing-tests criterion would contradict it. An
  *   added trailing argument or an added method is not a conflict, and a request that says outright that the
- *   function's inputs change ("change signup to accept …") is exempt;
+ *   function's inputs change ("change signup to accept …") is exempt. The same for what a factory returns: a
+ *   handler the tests call with `{ ip, path }` and read `.status` from is not called with keys the tests never
+ *   pass, nor read only through properties the tests never read;
+ * - an inline script that asserts another exact value than an existing test asserts for the same expression,
+ *   or another absent value (`null`, `undefined`, `false`) than the tests assert for a call of the same
+ *   method (`get` after a delete): the existing-tests criterion would contradict it;
+ * - a criterion, a criterion statement or an assumption that gives a call the code documents in a comment
+ *   (`send({ to, subject, text })`, `rateLimit ({ limit, windowMs })`) a key the comment does not name and
+ *   the request does not ask for;
+ * - an envelope that leaves out the command the request is about: when the request names a command (or a
+ *   flag), a repository entry point it names or that imports a module the envelope changes must be in the
+ *   envelope too (inside repo.allowedChanges), or the command can never be changed;
  * - a contract whose command criteria are all generic (the repository's whole test command, or a test
  *   runner nothing narrows to a file or a test name): it cannot fail on a change that breaks nothing old and
  *   adds nothing new;
@@ -779,12 +791,134 @@ function apiIssues(k: Criterion, c: QualityContext): string[] {
         out.push(`criterion ${safeSegment(k.id)} calls ${renderCall(safeSegment(u.name), bad.args)}: ${bad.why}. Existing: ${existingShape(tested, own.module)}. Keep that call shape; add an option or a new function instead`);
         continue;
       }
+      // What the factory returns is called with keys the tests never pass, or read through other properties.
+      if (tested.resultArgKeys?.length) {
+        const known = new Set(tested.resultArgKeys.flat());
+        const foreignKeys = (u.resultArgKeys ?? []).find((keys) => !keys.some((x) => known.has(x)));
+        if (foreignKeys) {
+          out.push(`criterion ${safeSegment(k.id)} calls what ${safeSegment(u.name)} returns with { ${foreignKeys.slice(0, 6).map(safeSegment).join(', ')} }; the existing tests call it with { ${tested.resultArgKeys[0]!.slice(0, 6).map(safeSegment).join(', ')} } (${safePath(own.module)}). Keep that request shape`);
+          continue;
+        }
+      }
+      if (tested.resultProps?.length && u.resultProps?.length && !u.resultProps.some((p) => tested.resultProps!.includes(p))) {
+        out.push(`criterion ${safeSegment(k.id)} reads ${u.resultProps.slice(0, 4).map((p) => `.${safeSegment(p)}`).join(', ')} on what the handler from ${safeSegment(u.name)} returns; the existing tests read ${tested.resultProps.slice(0, 4).map((p) => `.${safeSegment(p)}`).join(', ')} (${safePath(own.module)}). Keep those properties`);
+        continue;
+      }
       // Only methods the tests never call on the result: the returned object was replaced, not extended.
       if (tested.methods.length && u.methods.length && !u.methods.some((m) => tested.methods.includes(m))) {
         const dot = (ms: readonly string[]) => ms.slice(0, 4).map((m) => `.${safeSegment(m)}()`).join(', ');
         out.push(`criterion ${safeSegment(k.id)} calls only ${dot(u.methods)} on what ${safeSegment(u.name)} returns; the existing tests call ${dot(tested.methods)} (${safePath(own.module)}). Keep those methods working and check the behaviour through them; add a method, never replace them`);
       }
     }
+  }
+  return out;
+}
+
+/** A short code fragment for a diagnostic: shown when it is plain code characters, else a placeholder (it may be model output). */
+const fragment = (x: string): string => (/^[A-Za-z0-9_$.()[\]{}:,'" \\/-]{1,80}$/.test(x) ? x : '<expression>');
+
+/** Two expressions' texts (whitespace already removed) alike but for the quote style of their strings. */
+const sameText = (x: string, y: string): boolean => x.replace(/["`]/g, "'") === y.replace(/["`]/g, "'");
+
+/** Values that mean "absent": the tests' choice among them is part of the API. */
+const ABSENT = new Set(['null', 'undefined', 'false']);
+
+/** A literal's value for comparison: a quoted string by its content (quote style aside), anything else as written. */
+function literalValue(v: string): string {
+  const t = v.trim();
+  if (/^(["'`])[\s\S]*\1$/.test(t)) return `s:${t.slice(1, -1).replace(/\\(["'`])/g, '$1')}`;
+  return t.replace(/_/g, '');
+}
+
+/**
+ * Why a criterion's inline script expects another value than the existing tests assert: the same expression
+ * with another literal, or a call of the same method with another absent value (null vs undefined vs false).
+ */
+function assertionIssues(k: Criterion, c: QualityContext): string[] {
+  if (k.check.kind !== 'command' || !c.assertions?.length) return [];
+  const out: string[] = [];
+  for (const w of segments(k.check.command)) {
+    const script = inlineScript(w);
+    if (script === null || !/^(node|bun|deno)$/.test(base(w[0]!))) continue;
+    for (const a of assertedValues(script)) {
+      // quote style aside: an inline script inside a shell string usually writes double quotes
+      const same = c.assertions.find((t) => sameText(t.actual, a.actual) && literalValue(t.value) !== literalValue(a.value));
+      if (same) {
+        out.push(`criterion ${safeSegment(k.id)} expects ${fragment(a.actual)} to be ${fragment(a.value)}; ${safePath(same.test)} asserts ${fragment(same.value)} for the same expression. Derive the expected value from the existing tests`);
+        continue;
+      }
+      if (!a.callee || !ABSENT.has(a.value) || asksToChange(c.statement, a.callee)) continue;
+      const absent = c.assertions.find((t) => t.callee === a.callee && ABSENT.has(t.value) && t.value !== a.value);
+      if (absent) out.push(`criterion ${safeSegment(k.id)} expects .${safeSegment(a.callee)}(…) to give ${a.value}; ${safePath(absent.test)} asserts ${absent.value} for it (${fragment(absent.actual)}). Keep the value the existing tests assert`);
+    }
+  }
+  return out;
+}
+
+/** Object literals given to `name` in `text`: `name({ … })`, `name: { … }`, and in prose `name accepts {to, body}`. */
+function shapesGiven(text: string, name: string, prose: boolean): string[][] {
+  const out: string[][] = [];
+  const n = esc(name);
+  const forms = [new RegExp(`(?<![\\w$])${n}\\s*\\(\\s*(\\{)`, 'g'), new RegExp(`(?<![\\w$])${n}\\s*:\\s*(\\{)`, 'g')];
+  if (prose) forms.push(new RegExp(`(?<![\\w$])${n}\\b[^{}\\n]{0,40}?(\\{)`, 'g'));
+  for (const re of forms) {
+    for (const m of text.matchAll(re)) {
+      const keys = objectKeys(text.slice(m.index! + m[0].length - 1));
+      if (keys.length) out.push(keys);
+    }
+  }
+  return out;
+}
+
+/**
+ * Why the contract gives a call the code documents in a comment a key the comment does not name (criteria
+ * commands and statements, assumptions). A key the request names is new behaviour asked for, not invented.
+ */
+function documentedShapeIssues(draft: ContractDraft, c: QualityContext): string[] {
+  const shapes = (c.testedApi ?? []).flatMap((t) => (t.shapes ?? []).map((s) => ({ ...s, module: t.module })));
+  if (!shapes.length) return [];
+  const agreed = new Set((c.goal.criteria ?? []).map((k) => k.id));
+  const texts: Array<{ where: string; text: string; prose: boolean }> = [];
+  for (const k of draft.contract.criteria) {
+    if (agreed.has(k.id)) continue;
+    if (k.check.kind === 'command') texts.push({ where: `criterion ${safeSegment(k.id)}`, text: k.check.command, prose: false });
+    texts.push({ where: `criterion ${safeSegment(k.id)}`, text: k.statement, prose: true });
+  }
+  draft.contract.assumptions.forEach((a, i) => texts.push({ where: `assumption ${i + 1}`, text: a, prose: true }));
+  const asked = String(c.statement).toLowerCase();
+  const out: string[] = [];
+  for (const s of shapes) {
+    for (const t of texts) {
+      for (const keys of shapesGiven(t.text, s.name, t.prose)) {
+        const invented = keys.filter((x) => !s.keys.includes(x) && !wordIn(asked, x.toLowerCase()));
+        if (invented.length) out.push(`${t.where} gives ${safeSegment(s.name)} { ${invented.slice(0, 4).map(safeSegment).join(', ')} }, which ${safePath(s.module)} documents as ${safeSegment(s.name)}({ ${s.keys.slice(0, 8).map(safeSegment).join(', ')} }); use the documented keys`);
+      }
+    }
+  }
+  return out;
+}
+
+/** The request is about a command: it says command, CLI, entry point or executable, or names a flag. */
+const NAMES_COMMAND = /\b(?:command|cli|entry[- ]?point|executable)\b|(?:^|\s)--[a-z]/i;
+
+/**
+ * Why the envelope leaves out the command the request is about (see the module comment). Needs the
+ * repository's entry points; an entry point outside repo.allowedChanges is not asked for (it cannot be).
+ */
+function entryPointIssues(draft: ContractDraft, c: QualityContext): string[] {
+  const env = draft.contract.envelope;
+  if (!env?.length || !c.entryPoints?.length || !NAMES_COMMAND.test(c.statement)) return [];
+  const covers = (p: string) => env.some((e) => (e.path.includes('*') ? matchesAny(p, [e.path]) !== null : e.path === p) && e.ops.includes('modify'));
+  const changed = new Set(env.filter((e) => e.ops.includes('modify') || e.ops.includes('create')).map((e) => e.path));
+  const words = new Set(String(c.statement).toLowerCase().split(/[^a-z0-9_-]+/).filter(Boolean));
+  const out: string[] = [];
+  for (const e of c.entryPoints) {
+    if (covers(e.path)) continue;
+    if (c.allowedChanges && matchesAny(e.path, c.allowedChanges) === null && !c.allowedChanges.some((a) => globWithin(e.path, a))) continue;
+    const stem = e.path.split('/').pop()!.replace(/\.[cm]?[jt]sx?$/, '').toLowerCase();
+    const named = words.has(stem);
+    const feeds = e.imports.some((m) => changed.has(m));
+    if (named || feeds) out.push(`the request is about a command, but the envelope does not list ${safePath(e.path)} (${named ? 'the command it names' : `it imports ${e.imports.filter((m) => changed.has(m)).slice(0, 3).map(safePath).join(', ')}, which the envelope changes`}); add ${safePath(e.path)} with modify, or the command can never be changed`);
   }
   return out;
 }
@@ -840,6 +974,12 @@ export interface QualityContext {
   dependencies?: readonly string[];
   /** The API the repository's tests use (repoFacts testedApiOf). Absent: call shapes are not checked. */
   testedApi?: readonly TestedModule[];
+  /** Exact values the repository's tests assert (repoFacts assertionsOf). Absent: expected values are not checked. */
+  assertions?: readonly TestAssertion[];
+  /** The repository's commands (repoFacts entryPointsOf). Absent: the envelope is not checked for them. */
+  entryPoints?: readonly EntryPoint[];
+  /** The manifest's repo.allowedChanges: an entry point outside it is never asked for. */
+  allowedChanges?: readonly string[];
 }
 
 /** Whether `p` exists in the repository view; a throwing view counts as absent. */
@@ -895,7 +1035,7 @@ export function contractQualityIssues(draft: ContractDraft, c: QualityContext): 
           if (!exists(c.fileExists, f)) issues.push(`criterion ${safeSegment(k.id)} runs ${safePath(f)}, which is not in the repository; a worker may never write a file a criterion runs, so check new code through an inline assertion that imports it or an existing test`);
         }
       }
-      if (own) issues.push(...importIssues(k, c), ...apiIssues(k, c));
+      if (own) issues.push(...importIssues(k, c), ...apiIssues(k, c), ...assertionIssues(k, c));
       if (focus === 'generic') {
         generic++;
         continue;
@@ -903,6 +1043,7 @@ export function contractQualityIssues(draft: ContractDraft, c: QualityContext): 
       focusedOf.set(k.id, k);
       distinct.add(k.check.command.trim().replace(/\s+/g, ' '));
     }
+    issues.push(...documentedShapeIssues(draft, c), ...entryPointIssues(draft, c));
     const shape = statementBehaviourShape(c.statement);
     if (distinct.size === 0) {
       issues.push('the contract has only generic criteria (the whole test suite, a text search or a human judgment); add one focused, behavioural command criterion per behaviour the request names');

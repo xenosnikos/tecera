@@ -30,7 +30,7 @@ export const ENV: Record<string, string> = { PATH: process.env.PATH ?? '/usr/bin
  * Test-only provider credentials (never the host's live keys: /root/.config/tecera/live.env is never read by
  * this suite). The sample's planner and worker seats are OpenRouter seats (D7), its reviewer an OpenAI seat.
  */
-export const KEYS = { ANTHROPIC_API_KEY: 'test-anthropic-credential-0123456789', OPENAI_API_KEY: 'test-openai-credential-9876543210', OPENROUTER_API_KEY: 'sk-or-v1-test-openrouter-credential-5a5a5a5a' };
+export const KEYS = { ANTHROPIC_API_KEY: 'test-anthropic-credential-0123456789', OPENAI_API_KEY: 'test-openai-credential-9876543210', OPENROUTER_API_KEY: 'sk-or-v1-' + 'test-openrouter-credential-5a5a5a5a' };
 /** The check every adversarial copy must end up with (never npm: this host's global npm is untrusted). */
 export const CHECK = 'node --test';
 /** A verify command that would run npm or npx (refused before anything executes). */

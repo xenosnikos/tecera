@@ -38,17 +38,19 @@ const human = (id: string): Criterion => ({ id, statement: `${id} reads well`, c
 
 /** Three requests the scripted planner (and the bench) answers with a canned contract each. */
 const SCRIPTED: ScriptedContract[] = [
-  { when: 'failing test', criteria: [cmd('tests-pass', 'node --test')], outOfScope: ['refactoring'], assumptions: ['the test is right'] },
+  { when: 'failing test', criteria: [cmd('tests-pass', 'node --test')], outOfScope: ['refactoring'], assumptions: ['the test is right'], envelope: [{ path: 'src/slugify.js', ops: ['modify'] }] },
   {
     when: /rate limit/i,
     criteria: [cmd('limit-enforced', 'node --test test/rate.test.js'), cmd('tests-pass', 'node --test'), human('limits-sensible')],
     outOfScope: ['distributed limiting'],
     assumptions: [],
+    envelope: [{ path: 'src/app.js', ops: ['modify'] }],
   },
   {
     when: 'persist sessions',
     criteria: [cmd('sessions-survive-restart', 'node --test test/session.test.js', ['db']), cmd('tests-pass', 'node --test')],
     needs: [{ id: 'db', kind: 'postgres', mockable: false }],
+    envelope: [{ path: 'src/sessions.js', ops: ['modify'] }],
   },
 ];
 
@@ -58,7 +60,7 @@ function wireCriterion(k: Criterion): Record<string, unknown> {
     : { id: k.id, statement: k.statement, kind: 'human', command: null, timeoutSec: null, prompt: k.check.prompt, requires: k.requires ?? [] };
 }
 const wire = (criteria: Criterion[], needs: Array<{ id: string; kind: string; mockable: boolean | null }> = [], extra: Record<string, unknown> = {}) =>
-  JSON.stringify({ criteria: criteria.map(wireCriterion), outOfScope: ['out'], assumptions: ['assumed'], needs, ...extra });
+  JSON.stringify({ criteria: criteria.map(wireCriterion), outOfScope: ['out'], assumptions: ['assumed'], envelope: [{ path: 'src/*.js', ops: ['create', 'modify'] }], needs, ...extra });
 
 function contractFor(g: AchievementGoal, criteria: Criterion[]): AcceptanceContract {
   return { goalId: g.id, statement: g.statement, criteria, outOfScope: [], assumptions: [] };

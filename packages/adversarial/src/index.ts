@@ -20,7 +20,8 @@
  * the owner decisions of 2026-10-05 (D1–D7, src/decisions.test.ts) and of 2026-10-06 (D8–D12: acceptance
  * contract, capability inventory, gap ladder, fidelity, provisioned resources; src/contract.test.ts).
  * acceptance.no_gaps fails while any entry of any of them is a gap; only TECERA_PHASE1_OPEN=1 (set by CI while
- * Phase 1 is open) tolerates them.
+ * Phase 1 is open) tolerates them. HARDENED_INDEX lists the attacks hardened mode closes (src/hardened.test.ts):
+ * each is shown succeeding in single-user mode first.
  *
  * Authority model under test (owner decisions 2026-10-05): no auth package, a local human principal approves
  * (`tecera approve --as`, default $USER, audited, approver ≠ requester); worker writes inside
@@ -209,4 +210,17 @@ export const DECISION_INDEX: CaseEntry[] = [
     note: 'locators carrying userinfo, a secret-named parameter (also double-encoded) or a canary are refused by the registry; the provisioner\'s own records pass it, and a provisioner whose root lies inside the repository is refused; a forged http-stub resource with a credential in its locator makes the PR gate refuse delivery (step.failed naming resource-registry, the registry names the locator) and the credential appears only in the forged event: in no other event, evidence row or run file. [inside the repository] (closed in wave 6): a git remote recorded with a locator inside the repository (or anywhere outside the resources root) never receives the push: the PR step fails naming it (pushableRemote with the provisioner\'s place)',
   }),
   w('decision.d12_sandbox_reaches_locator', 'passing', { note: 'with a provisioned loopback http-stub and sqlite file, a program in the real sandbox child has no fetch/WebSocket/XMLHttpRequest/process/require, cannot import node:http, node:net, node:fs or node:sqlite: the stub logs no request (positive control: a host request is logged) and the sqlite file is unchanged' }),
+];
+
+const hd = (id: string, note: string): CaseEntry => ({ id, section: 'hardened', lives: 'runtime/e2e', status: 'passing', file: 'src/hardened.test.ts', note });
+
+/**
+ * Hardened mode (operator and agent as separate OS identities, the authoritative state owned by the operator):
+ * the attacks single-user mode documents as open. Run as root only (the agent is a spare uid); elsewhere the
+ * tests report as skipped.
+ */
+export const HARDENED_INDEX: CaseEntry[] = [
+  hd('hardened.forged_run_ended', 'a real scripted run held at its PR, the PR denied, then a chain-valid run.ended(0) appended through the ledger API (checkpoint kept consistent): single-user, the Stop hook allows; hardened, it blocks naming the run as open in the run registry; the agent uid cannot even open the database for writing; the resume that ends the run (exit 8) is what closes it'),
+  hd('hardened.agent_approve', 'the agent uid runs `tecera approve --as <operator name> --yes` under script(1) (a pseudo-terminal), with TECERA_DECISION_NONINTERACTIVE=1 and no agent-host markers: exit 8 naming the agent identity, the approval stays pending and no approval.granted exists; the operator then approves (method operator-uid, uid recorded) and the run delivers'),
+  hd('hardened.truncated_tail', 'a delivered run, then its last event and last evidence row deleted with the triggers dropped: single-user, the chain verifies and the Stop hook allows; hardened, the Stop hook blocks naming the missing acknowledged event and evidence row, and `tecera run` refuses to write on top of it'),
 ];

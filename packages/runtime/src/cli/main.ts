@@ -7,6 +7,8 @@ import { doctorCommand } from '../commands/doctor.js';
 import { evidenceCommand } from '../commands/evidence.js';
 import { gateCommand, migrateCommand } from '../commands/gate.js';
 import { hookCommand } from '../commands/hook.js';
+import { hardenedCommand } from '../hardened/command.js';
+import { HardenedError } from '../hardened/config.js';
 import { initCommand } from '../commands/init.js';
 import { memoryCommand, plansCommand } from '../commands/learning.js';
 import { preflightCommand } from '../commands/preflight.js';
@@ -71,6 +73,7 @@ export const COMMANDS: Record<string, { run: Command; summary: string }> = {
   adapters: { run: adaptersCommand, summary: 'adapters install|upgrade|doctor <host> [--force]' },
   hook: { run: hookCommand, summary: 'hook pre-tool|stop                       host hooks (JSON on stdin)' },
   migrate: { run: migrateCommand, summary: 'migrate [--to v]                         nothing to migrate in v1' },
+  hardened: { run: hardenedCommand, summary: 'hardened init|enroll|status|abandon       operator/agent separation (prints setup; never changes the host)' },
 };
 
 export function helpText(): string {
@@ -176,6 +179,11 @@ function mapError(e: unknown, out: Out, name: string): number {
     out.error(`${name}: ${e.message}`);
     out.set('error', e.message);
     return e instanceof PrincipalError ? e.exitCode : EXIT.policy;
+  }
+  if (e instanceof HardenedError) {
+    out.error(`${name}: ${e.message}`);
+    out.set('error', e.message);
+    return e.exitCode;
   }
   if (e instanceof RedactionError) {
     out.error(`${name}: ${e.message}`);

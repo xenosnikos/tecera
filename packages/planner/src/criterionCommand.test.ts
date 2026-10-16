@@ -392,6 +392,7 @@ describe("a criterion's exit status is the check's own (finding B)", () => {
         ],
         outOfScope: [],
         assumptions: [],
+        envelope: [{ path: 'src/app.js', ops: ['modify'] }],
         needs: [],
       });
     const has = (p: string) => ['src/app.js', 'test/app.test.js', 'package.json'].includes(p);

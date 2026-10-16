@@ -51,8 +51,8 @@ describe('SecretHandle', () => {
 
   it('authorize adds the provider header and redact scrubs the value', () => {
     expect(h.authorize({ a: 'b' })).toEqual({ a: 'b', 'x-api-key': key });
-    const oa = new SecretHandle('openai', 'env:Y', 'openai', 'sk-proj-abcdefghijklmnopqrstuv');
-    expect(oa.authorize()).toEqual({ authorization: 'Bearer sk-proj-abcdefghijklmnopqrstuv' });
+    const oa = new SecretHandle('openai', 'env:Y', 'openai', 'sk-proj-' + 'abcdefghijklmnopqrstuv');
+    expect(oa.authorize()).toEqual({ authorization: 'Bearer sk-proj-' + 'abcdefghijklmnopqrstuv' });
     expect(h.redact(`x ${key} y`)).toBe(`x [REDACTED:anthropic:${sha8(key)}] y`);
     expect(h.fingerprint).toBe(sha256(key).slice(0, 16));
   });
@@ -133,7 +133,7 @@ describe('SecretStore', () => {
     }
     const auth = 'Basic ' + Buffer.from(`user:${key}`).toString('base64');
     expect(s.redact(auth)).toContain('[REDACTED:');
-    expect(s.redact('stray sk-proj-ABCDEFGHIJKLMNOPQRSTUVWX here')).toMatch(/\[REDACTED:openai:[0-9a-f]{8}\]/);
+    expect(s.redact('stray sk-proj-' + 'ABCDEFGHIJKLMNOPQRSTUVWX here')).toMatch(/\[REDACTED:openai:[0-9a-f]{8}\]/);
     s.addSecret('canary', 'TECERA_CANARY_deadbeef01');
     expect(s.redact('x TECERA_CANARY_deadbeef01 y')).toBe(`x [REDACTED:canary:${sha8('TECERA_CANARY_deadbeef01')}] y`);
     expect(s.canaryValues()).toContain('TECERA_CANARY_deadbeef01');

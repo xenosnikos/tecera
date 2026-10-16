@@ -46,8 +46,11 @@ import { stripUndefined, type Runtime } from '../runtime.js';
 import { toolingProblem } from '../verify.js';
 import { SCRIPTED_ENV } from '../scripted.js';
 import { deferStaging, stageAchievedPlans } from '../staging.js';
+import { recordRunLearning } from '../learning.js';
 import { WiringError, type WiredPorts, type WiringContext } from '../wiring.js';
 import { decisionEvent } from './approve.js';
+import { checkIdentityProblem } from '../hardened/context.js';
+import { HEARTBEAT_MS } from '../hardened/registry.js';
 
 /**
  * `tecera run <goal|statement> [--dry-run] [--budget-usd n] [--max-depth n]` and `tecera run --resume <runId>`.
@@ -400,8 +403,79 @@ export const runCommand: Command = async (c) => {
 
   const scriptedArg = c.args.values.scripted ?? rt.env[SCRIPTED_ENV];
   const scripted = scriptedArg !== undefined && scriptedArg !== '' ? scriptedArg : undefined;
+  if (rt.hardened && !rt.hardened.writer) {
+    c.out.error(`run: hardened mode: the supervisor writes the protected state and runs as the operator identity (uid ${rt.hardened.config.operator.uid}); this process cannot write it → exit ${EXIT.policy}`);
+    return EXIT.policy;
+  }
+  const checkAs = rt.hardened ? checkIdentityProblem(rt.hardened.config, rt.env) : null;
+  if (checkAs) {
+    c.out.error(`run: ${checkAs} → exit ${EXIT.notReady}`);
+    return EXIT.notReady;
+  }
   const ledger = rt.ledger();
   if (!runId) runId = rt.ids('r');
+  // Hardened: the run is registered (or, resumed, moved to running) before anything is wired or dispatched.
+  const seg = rt.hardened ? beginSegment(rt, runId, goal.goalId, resume) : null;
+  try {
+    return await runSegment(c, rt, { goal, budget, runId, resume, scripted, ledger, seg });
+  } catch (e) {
+    seg?.unknown();
+    throw e;
+  } finally {
+    seg?.stop();
+  }
+};
+
+/** Hardened: the registry side of one segment (registration, heartbeat, the supervisor's end transition). */
+interface Segment {
+  /** Work started: the registry says running. */
+  started(): void;
+  /** The segment ended with an outcome (terminal unless held, interrupted or provisional). */
+  end(exitCode: number, reason: string): void;
+  /** Nothing was started (wiring failed): a new run is closed as not started, a resumed one put back. */
+  notStarted(exitCode: number, reason: string): void;
+  /** The supervisor threw: the outcome is unknown and the run stays open. */
+  unknown(): void;
+  stop(): void;
+}
+
+function beginSegment(rt: Runtime, runId: string, goalId: string, resume: boolean): Segment {
+  const h = rt.hardened!;
+  const { prior } = h.registry.begin(runId, goalId, { resume });
+  let done = false;
+  const timer = setInterval(() => {
+    try {
+      h.registry.heartbeat(runId);
+    } catch {
+      /* a missed heartbeat reads as interrupted, which is the safe side */
+    }
+  }, HEARTBEAT_MS);
+  timer.unref?.();
+  return {
+    started: () => void h.registry.running(runId),
+    end: (exitCode, reason) => {
+      done = true;
+      h.registry.end(runId, exitCode, reason);
+    },
+    notStarted: (exitCode, reason) => {
+      done = true;
+      h.registry.restore(runId, prior, `exit ${exitCode}: ${reason}`);
+    },
+    unknown: () => {
+      if (!done) h.registry.unknown(runId);
+      done = true;
+    },
+    stop: () => clearInterval(timer),
+  };
+}
+
+async function runSegment(
+  c: CommandContext,
+  rt: Runtime,
+  a: { goal: GoalSpec; budget: Budget; runId: string; resume: boolean; scripted: string | undefined; ledger: ReturnType<Runtime['ledger']>; seg: Segment | null },
+): Promise<number> {
+  const { goal, budget, runId, resume, scripted, ledger, seg } = a;
+  const m = rt.manifest;
   const library = await PlanRegistry.load(ledger);
   const ctx: WiringContext = {
     root: rt.root,
@@ -433,19 +507,23 @@ export const runCommand: Command = async (c) => {
     if (e instanceof NotWired) {
       c.out.error(`run: not wired — ${e.message}`);
       c.out.set('notWired', e.message);
+      seg?.notStarted(EXIT.notWired, e.message);
       return EXIT.notWired;
     }
     if (e instanceof WiringError) {
       c.out.error(`run: ${e.message} → exit ${e.exitCode}`);
       c.out.set('wiringError', e.message);
+      seg?.notStarted(e.exitCode, e.message);
       return e.exitCode;
     }
     if (e instanceof LedgerError) {
       c.out.error(`run: ledger error — ${e.message}`);
+      seg?.notStarted(EXIT.ledger, e.message);
       return EXIT.ledger;
     }
     throw e;
   }
+  seg?.started();
   c.out.say(`run        ${runId}  goal ${goal.goalId}${resume ? '  (resume)' : ''}`);
   for (const n of ports.notes ?? []) c.out.say(n);
 
@@ -459,21 +537,25 @@ export const runCommand: Command = async (c) => {
     c.out.say(`run ${runId}  goal ${goal.goalId}  → ${outcome.reason} → exit ${outcome.exitCode}`);
     c.out.set('runId', runId);
     c.out.set('outcome', { exitCode: outcome.exitCode, reason: outcome.reason });
+    // Hardened: the supervisor's own transition, from the outcome it derived (never from a ledger event).
+    seg?.end(outcome.exitCode, outcome.reason);
     return outcome.exitCode;
   } catch (e) {
     if (e instanceof LedgerError || e instanceof LoopStopped) {
       c.out.error(`run: ${e instanceof LoopStopped ? '' : 'ledger error — '}${e.message}`);
+      seg?.unknown();
       return EXIT.ledger;
     }
     if (e instanceof UnsafeEnvError) {
       c.out.error(`run: ${e.message}`);
+      seg?.unknown();
       return EXIT.invalid;
     }
     throw e;
   } finally {
     await ports.dispose?.();
   }
-};
+}
 
 // ---------- cancellation bridge ----------
 
@@ -657,6 +739,8 @@ async function finish(rt: Runtime, ctx: WiringContext, status: LoopStatus, signa
     runId,
     payload: { exitCode: outcome.exitCode, reason: outcome.reason, goalId: goal.goalId, loopState: status.state, cost: { usd: cost.total.usd, inputTokens: cost.total.inputTokens, outputTokens: cost.total.outputTokens, calls: cost.total.calls, unknownUsage: cost.total.unknown } },
   });
+  // Episodes and candidate lessons of the run so far, its outcome included (idempotent per source event).
+  notes.push(...(await recordRunLearning(ctx.ledger, runId, { redactor: rt.redactor, now: rt.now })).notes);
   return { ...outcome, status, notes, cost };
 }
 
@@ -920,6 +1004,7 @@ export async function resumeRun(rt: Runtime, ctx: WiringContext, ports: WiredPor
   if (!work && failedResumes === 0) {
     // Nothing to do. A crash between goal.achieved and staging is still repaired (idempotent).
     for (const p of await stageAchievedPlans(ctx.ledger, ctx.runId, { ids: ctx.ids, now: rt.now })) notes.push(`plan ${p} staged as a candidate (its goal was achieved)`);
+    notes.push(...(await recordRunLearning(ctx.ledger, ctx.runId, { redactor: rt.redactor, now: rt.now })).notes);
     const events: TeceraEvent[] = [];
     for await (const e of ctx.ledger.events({ runId: ctx.runId })) events.push(e);
     const outcome = exitCodeForRun(events, ctx.goal.goalId, after, await runVerdict(rt, ctx));

@@ -10,7 +10,7 @@ export type { ContractGuard, CriterionTargets, PackageScripts } from './contract
 export { parseVerdict, extractClaudeResult, extractCodexResult } from './verdict.js';
 export type { Verdict } from './verdict.js';
 export { validatePlan, contractPlanProblems, deliveryChainProblems, stepChangesProblems, DELIVERY_CHAIN, PR_APPROVALS } from './validatePlan.js';
-export { stopDecision, stopDecisionForRuns, activeRunsOf, heldByOpenApprovals, evaluateStopEvents, evaluateStopLedger, RESUMABLE_EXIT_CODES } from './stop.js';
+export { stopDecision, stopDecisionForRuns, activeRunsOf, heldByOpenApprovals, evaluateStopEvents, evaluateStopLedger, withRegistry, RESUMABLE_EXIT_CODES } from './stop.js';
 export type { ActiveRunRef, StopRunCheck, StopEvaluation } from './stop.js';
 export type { PlanValidationOptions } from './validatePlan.js';
 export { allowanceOf, provisionRequestProblem, provisionedResourceProblem, mockDeclarationProblem } from './provisioning.js';

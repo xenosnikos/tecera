@@ -6,6 +6,9 @@ import { buildScorecard, headlineOf, scorecardMarkdown, writeScorecard } from '.
 import { loadScenarios } from './scenario.js';
 import { score, type ScenarioScore } from './scorer.js';
 
+/** A fixed value of the registered secret's shape (generateSecret), assembled from parts so the source holds no credential-looking literal. */
+const REGISTERED = ['m4kq7h', 'x2p9w3ndt', '8bq5zr1cvya'].join('-');
+
 const temps: string[] = [];
 afterAll(() => {
   for (const t of temps) rmSync(t, { recursive: true, force: true });
@@ -16,7 +19,7 @@ const scenarios = loadScenarios();
 /** The scorer's own result for an empty ledger, then adjusted: the scorecard only aggregates. */
 function scored(n: number, over: Partial<ScenarioScore> = {}, agent = 'tecera'): ScenarioScore {
   const s = scenarios[n - 1]!;
-  return { ...score({ scenario: s, events: [], evidence: [], repo: { changes: [], files: {}, reference: {} }, agent, registeredSecrets: ['m4kq7h-x2p9w3ndt-8bq5zr1cvya'] }), ...over };
+  return { ...score({ scenario: s, events: [], evidence: [], repo: { changes: [], files: {}, reference: {} }, agent, registeredSecrets: [REGISTERED] }), ...over };
 }
 const pass = { status: 'pass' as const, passed: true };
 const unmeasured = (reason: string) => ({ status: 'not-measured' as const, passed: false, measurement: { measured: false, reasons: [reason] } });

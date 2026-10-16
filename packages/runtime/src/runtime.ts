@@ -1,6 +1,6 @@
 import { existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
-import { event, type Json, type JsonObject, type Ledger, type Manifest, type Principal, type Redactor, type SecretInput, type TeceraEvent, type Trace, type VerifyRunner } from '@tecera/contracts';
+import { event, LedgerError, type Json, type JsonObject, type Ledger, type Manifest, type Principal, type Redactor, type SecretInput, type TeceraEvent, type Trace, type VerifyRunner } from '@tecera/contracts';
 import { MemoryLedger, SqliteLedger } from '@tecera/ledger';
 import type { SecretStore } from '@tecera/providers';
 import type { PermissionsDoc } from '@tecera/policy';
@@ -12,6 +12,8 @@ import { inspectPath, realRoot, safeMkdirp, UnsafePathError } from './util/safef
 import type { Env } from './util/proc.js';
 import { ContainedVerifyRunner } from './containment.js';
 import { defaultProbe, wireRunPorts, type SeatProbe, type WireFn } from './wiring.js';
+import { HardenedError } from './hardened/config.js';
+import { HardenedVerifyRunner, resolveHardened, type HardenedContext } from './hardened/context.js';
 
 /**
  * The composition root's state for one CLI invocation: the loaded business case, the resolved secrets and
@@ -21,6 +23,11 @@ import { defaultProbe, wireRunPorts, type SeatProbe, type WireFn } from './wirin
  * Construction resolves the manifest's credential references through the providers SecretStore, which
  * deletes them from `env` (process.env in the real CLI), and lifts the approver signing key out of `env`.
  * A configured secret too short to redact reliably fails construction (RedactionError → exit 3).
+ *
+ * Hardened mode (hardened/context.ts): when the host configures it, construction checks the protected state
+ * first and refuses (HardenedError, exit 3) when the agent identity could change it. The ledger then lives
+ * in the protected state, not at the manifest's `ledger.path`, is opened against its head checkpoint, and is
+ * opened read-only unless this process runs as the operator.
  */
 
 export interface RuntimeOptions {
@@ -54,6 +61,8 @@ export class Runtime {
   readonly redactor: Redactor;
   /** Text redaction shorthand (redactor.redactText). */
   readonly redact: (text: string) => string;
+  /** Hardened mode's state of this business case; null in single-user mode. */
+  readonly hardened: HardenedContext | null;
   private opened: (Ledger & { close?: () => void }) | null = null;
 
   constructor(opts: RuntimeOptions) {
@@ -75,6 +84,10 @@ export class Runtime {
     this.verifyRunner = opts.verifyRunner ?? new ContainedVerifyRunner(this.env, this.redactor);
     this.probe = opts.probe ?? defaultProbe;
     this.wire = opts.wire ?? wireRunPorts;
+    this.hardened = resolveHardened(this.env, this.root, this.now);
+    if (this.hardened && this.manifest.ledger.driver !== 'sqlite') throw new HardenedError(`the ledger driver must be sqlite (the manifest says ${this.manifest.ledger.driver})`);
+    // Hardened: no check runs as root or as the operator (it runs repository code the agent can write).
+    if (this.hardened && !opts.verifyRunner) this.verifyRunner = new HardenedVerifyRunner(this.verifyRunner, this.hardened.config, this.env);
   }
 
   get secretStore(): SecretStore {
@@ -86,11 +99,14 @@ export class Runtime {
   }
 
   get ledgerPath(): string {
+    if (this.hardened) return this.hardened.ledgerPath;
     const p = this.manifest.ledger.path;
     return isAbsolute(p) ? p : join(this.root, p);
   }
 
   ledgerExists(): boolean {
+    // Hardened: a checkpoint without its database is a ledger that was deleted or moved, not "no ledger yet".
+    if (this.hardened) return existsSync(this.hardened.ledgerPath) || this.hardened.head.exists();
     return this.manifest.ledger.driver === 'memory' || existsSync(this.ledgerPath);
   }
 
@@ -100,7 +116,8 @@ export class Runtime {
    */
   ledger(): Ledger {
     if (!this.opened) {
-      if (this.manifest.ledger.driver === 'memory') this.opened = new RedactingLedger(new MemoryLedger(), this.redactor);
+      if (this.hardened) this.opened = new RedactingLedger(openHardenedLedger(this.hardened), this.redactor);
+      else if (this.manifest.ledger.driver === 'memory') this.opened = new RedactingLedger(new MemoryLedger(), this.redactor);
       else {
         assertLedgerPath(this.root, this.ledgerPath, true);
         const db = new SqliteLedger(this.ledgerPath);
@@ -144,6 +161,23 @@ export async function createRuntime(opts: RuntimeOptions): Promise<Runtime> {
 /** Drop undefined fields so a payload is valid canonical JSON. */
 export function stripUndefined(v: unknown): Json {
   return JSON.parse(JSON.stringify(v ?? null)) as Json;
+}
+
+/**
+ * The hardened ledger: it must exist (it is created and enrolled with `tecera hardened enroll`), it is opened
+ * against its head checkpoint with the rollback journal, and read-only unless this process is the operator.
+ * A checkpoint whose database is gone refuses (a deleted or moved ledger), as does a database with no
+ * checkpoint (not enrolled).
+ */
+export function openHardenedLedger(h: HardenedContext): SqliteLedger {
+  const dbExists = existsSync(h.ledgerPath);
+  if (!dbExists) {
+    if (h.head.exists()) throw new LedgerError(`ledger head checkpoint: the checkpoint in ${h.caseDir} exists but its ledger ${h.ledgerPath} does not (deleted or moved); refusing to open`, 'chain');
+    throw new LedgerError(`hardened mode: no ledger for this business case yet; the operator creates it with \`tecera hardened enroll\``, 'chain');
+  }
+  const st = lstatSync(h.ledgerPath);
+  if (!st.isFile() || st.nlink !== 1) throw new UnsafePathError(`ledger file ${h.ledgerPath} is not a regular file with one link; refusing to open the ledger`, h.ledgerPath);
+  return h.writer ? new SqliteLedger(h.ledgerPath, { head: h.head, journalMode: 'delete' }) : new SqliteLedger(h.ledgerPath, { head: h.head, readonly: true });
 }
 
 const SQLITE_SIDECARS = ['', '-wal', '-shm', '-journal'] as const;

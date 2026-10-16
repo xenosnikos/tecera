@@ -15,3 +15,4 @@ export * from './goalStatus.js';
 export * from './payloads.js';
 export * from './projections.js';
 export * from './proven.js';
+export * from './hardened.js';

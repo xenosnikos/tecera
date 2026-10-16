@@ -15,6 +15,11 @@ import { ledgerOrder, ledgerProvenRun, provenRun, type ApprovalView, type ChainV
  * - any active run without one → block (exit 2): the assistant keeps working or hands back to a human.
  *
  * Budget never blocks stopping (D3), and neither does anything else: only a missing proof does.
+ *
+ * Hardened mode passes `registry`: the runs the host-owned run registry holds open (not terminal). They are
+ * active whatever the events say: a run.ended, an expired or a denied approval never removes one, and a
+ * registered run the ledger does not know (deleted or replaced) cannot be proven, so it blocks. The runs
+ * the events call active are added to them (more blocking, never less).
  */
 
 /** Exit codes after which a run is still open: held for a human (4), interrupted (130). */
@@ -23,13 +28,20 @@ export const RESUMABLE_EXIT_CODES: ReadonlySet<number> = new Set([4, 130]);
 export interface ActiveRunRef {
   runId: string;
   goalId?: string;
-  /** 'running' (no run.ended since its last start), 'held' (last segment exit 4) or 'interrupted' (exit 130 or run.interrupted). */
-  state: 'running' | 'held' | 'interrupted';
+  /**
+   * 'running' (no run.ended since its last start), 'held' (last segment exit 4) or 'interrupted' (exit 130 or
+   * run.interrupted). 'provisional' only from the run registry: the run ended on a mock and is never achieved.
+   */
+  state: 'running' | 'held' | 'interrupted' | 'provisional';
   /**
    * Set when the run's events say it ended but the approvals table still holds these open requests of it
    * (heldByOpenApprovals): the run is held whatever its run.ended says.
    */
   openApprovals?: string[];
+  /** Where the run came from: the run registry (hardened mode) or the ledger's events. */
+  source?: 'registry' | 'events';
+  /** Registry only: what the registry says beyond `state` (a missed heartbeat, the generation). */
+  note?: string;
 }
 
 /** Stop options: the proof options, the clock approvals expire against, and (events variant) the approval rows. */
@@ -38,11 +50,13 @@ export interface StopOptions extends ProvenOptions {
   now?: number;
   /** evaluateStopEvents only: the ledger's approval rows (Ledger.getApproval) of the requests the events name. */
   approvals?: ReadonlyArray<ApprovalView>;
+  /** Hardened mode: the runs the run registry holds open. Each is active whatever the events say. */
+  registry?: ReadonlyArray<ActiveRunRef>;
 }
 
 /** One active run and what the single-source proof said about it. `error`: its verdict could not be computed. */
 export interface StopRunCheck {
-  run: { runId: string; goalId?: string; state?: string; openApprovals?: string[] };
+  run: { runId: string; goalId?: string; state?: string; openApprovals?: string[]; source?: ActiveRunRef['source']; note?: string };
   verdict?: RunVerdict | null;
   error?: string;
 }
@@ -146,6 +160,23 @@ function withHeld(events: readonly TeceraEvent[], active: readonly ActiveRunRef[
   return out;
 }
 
+/**
+ * Hardened mode: the registry's open runs first (in registry order), then the event-derived ones it does not
+ * name. A run in both keeps the registry's state (the registry is the authority) and the open approvals the
+ * events found.
+ */
+export function withRegistry(registry: ReadonlyArray<ActiveRunRef> | undefined, fromEvents: readonly ActiveRunRef[]): ActiveRunRef[] {
+  if (!registry) return [...fromEvents];
+  const byId = new Map(fromEvents.map((r) => [r.runId, r]));
+  const out: ActiveRunRef[] = registry.map((r) => {
+    const ev = byId.get(r.runId);
+    return { ...r, source: 'registry', ...(r.goalId ?? ev?.goalId ? { goalId: r.goalId ?? ev!.goalId } : {}), ...(ev?.openApprovals ? { openApprovals: ev.openApprovals } : {}) };
+  });
+  const named = new Set(registry.map((r) => r.runId));
+  for (const r of fromEvents) if (!named.has(r.runId)) out.push({ ...r, source: 'events' });
+  return out;
+}
+
 /** Why `verdict` does not prove `run` achieved (null when it does). */
 function unproven(run: StopRunCheck['run'], verdict: RunVerdict | null | undefined): string | null {
   if (!verdict || typeof verdict !== 'object') return 'no proven verdict (contracts provenRun) for the run';
@@ -176,7 +207,8 @@ export function stopDecisionForRuns(checks: readonly StopRunCheck[]): StopEvalua
     const open = run.openApprovals?.length
       ? `ended on its events, but approval ${run.openApprovals.join(', ')} is still open in the approvals table (a run.ended event never closes a held run; a human decides it with \`tecera approve\` / \`tecera deny\`, or it expires): the run `
       : '';
-    const what = blocked.provisional ? `is provisional, never achieved: ${blocked.why}` : `${open}is active without a goal.achieved proof (${blocked.why})`;
+    const registry = run.source === 'registry' ? ` according to the run registry${run.note ? ` (${run.note})` : ''}, whatever its events say,` : '';
+    const what = blocked.provisional ? `is provisional, never achieved: ${blocked.why}` : `${open}is active${registry} without a goal.achieved proof (${blocked.why})`;
     return {
       decision: {
         decision: 'block',
@@ -230,10 +262,10 @@ export function evaluateStopEvents(events: Iterable<TeceraEvent>, evidence: Evid
   const broken = chainProblem(opts?.chain);
   if (broken) return ledgerBlock(broken);
   const evs = [...events];
-  const { approvals, now, ...proven } = opts;
+  const { approvals, now, registry, ...proven } = opts;
   const active = activeRunsOf(evs);
   const held = heldByOpenApprovals(evs, active, approvals ?? [], now ?? Date.now());
-  return stopDecisionForRuns(withHeld(evs, active, held).map((run) => ({ run, verdict: provenRun(evs, evidence, run.runId, proven) })));
+  return stopDecisionForRuns(withRegistry(registry, withHeld(evs, active, held)).map((run) => ({ run, verdict: provenRun(evs, evidence, run.runId, proven) })));
 }
 
 /**
@@ -262,7 +294,7 @@ export async function evaluateStopLedger(
   }
   const broken = chainProblem(chain);
   if (broken) return ledgerBlock(broken);
-  const { now, ...proven } = opts;
+  const { now, registry, ...proven } = opts;
   const active = activeRunsOf(events);
   let held: ActiveRunRef[];
   try {
@@ -281,7 +313,7 @@ export async function evaluateStopLedger(
     return ledgerBlock(`the approvals table cannot be read: ${err instanceof Error ? err.message : String(err)}`);
   }
   const checks: StopRunCheck[] = [];
-  for (const run of withHeld(events, active, held)) {
+  for (const run of withRegistry(registry, withHeld(events, active, held))) {
     try {
       checks.push({ run, verdict: await ledgerProvenRun(ledger, run.runId, proven) });
     } catch (err) {

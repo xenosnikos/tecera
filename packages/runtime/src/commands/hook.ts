@@ -7,7 +7,9 @@ import { decidePreTool, parseHookInput, stopReminder, type HookInput } from '../
 import { loadManifest, loadPermissions, locateManifest, ManifestLoadError } from '../manifest/load.js';
 import { Runtime } from '../runtime.js';
 import { provenOptionsOf } from '../proof.js';
-import { evaluateStop } from '../stopHook.js';
+import { evaluateStop, hardenedStopRuns } from '../stopHook.js';
+import { loadHardenedConfig, type HardenedConfig } from '../hardened/config.js';
+import { openRunsElsewhere } from '../hardened/context.js';
 import { hostGitExecHazards } from '../util/proc.js';
 
 /**
@@ -17,6 +19,11 @@ import { hostGitExecHazards } from '../util/proc.js';
  * and not proven achieved (stopHook.ts; a provisional goal always blocks), exit 0 otherwise; budget is never
  * considered. Each decision is recorded as stop.blocked / stop.allowed. A business case whose ledger cannot be
  * read, or whose hash chain does not verify, blocks.
+ *
+ * Hardened mode: the open runs come from the run registry (stopHook.ts hardenedStopRuns), the chain is
+ * compared with the head checkpoint, a registered run whose ledger is missing blocks, and an open run of any
+ * other business case on the host blocks too. The hook usually runs as the agent identity, which cannot
+ * write the ledger: its decisions are then not recorded (they are printed).
  */
 export const hookCommand: Command = async (c) => {
   const which = c.args.positionals[0];
@@ -69,6 +76,25 @@ async function stopHook(c: CommandContext, text: string): Promise<number> {
     return block(`stop hook failed closed: unreadable hook payload (${(e as Error).message})`);
   }
   const from = typeof input.cwd === 'string' && input.cwd ? input.cwd : c.opts.cwd;
+  let hard: HardenedConfig | null;
+  try {
+    hard = loadHardenedConfig(c.opts.env);
+  } catch (e) {
+    return block(`stop hook failed closed: ${(e as Error).message}`);
+  }
+  /** Hardened: an open run of another business case on this host (or of any, outside one) blocks. */
+  const elsewhere = (exceptCaseId: string | null): number | null => {
+    if (!hard) return null;
+    let open: ReturnType<typeof openRunsElsewhere>;
+    try {
+      open = openRunsElsewhere(hard, exceptCaseId, c.opts.now);
+    } catch (e) {
+      return block(`stop hook failed closed: ${(e as Error).message}`);
+    }
+    if (!open.length) return null;
+    const o = open[0]!;
+    return block(`goal not achieved: the run registry holds run ${o.runId} (${o.state}) of the business case at ${o.root ?? `state ${o.caseId}`} open${open.length > 1 ? ` (and ${open.length - 1} more)` : ''}. A Tecera run on this host is not finished: resume it there or hand it back to the operator — do not stop yet.`);
+  };
   try {
     locateManifest(from, c.args.values.manifest);
   } catch (e) {
@@ -77,6 +103,8 @@ async function stopHook(c: CommandContext, text: string): Promise<number> {
     if (e instanceof ManifestLoadError) {
       // Not a Tecera business case (no tecera.json from the payload's cwd upward): there is no run to protect.
       // A manifest that exists but cannot be read or validated blocks below (new Runtime throws).
+      const other = elsewhere(null);
+      if (other !== null) return other;
       c.out.say('tecera: no business case here; nothing to prove');
       c.out.set('decision', 'allow');
       return EXIT.ok;
@@ -90,14 +118,19 @@ async function stopHook(c: CommandContext, text: string): Promise<number> {
     rt = new Runtime({ cwd: from, manifestPath: c.args.values.manifest, env: c.opts.env, now: c.opts.now, ...(c.opts.ids ? { ids: c.opts.ids } : {}), ...(c.opts.envSecrets ? { extraSecrets: c.opts.envSecrets } : {}) });
     c.out.useRedactor(rt.redactor);
     goals = listGoalIds(rt.root);
+    const h = rt.hardened;
+    const other = h ? elsewhere(h.caseId) : null;
+    if (other !== null) return other;
+    const registered = h ? h.registry.open() : [];
     if (!rt.ledgerExists()) {
+      if (registered.length) return block(`goal not achieved: the run registry holds run ${registered[0]!.runId} (${registered[0]!.state}) open but this business case has no ledger: it was deleted or moved. Hand back to the operator — do not stop yet.`);
       c.out.say('tecera: no ledger yet; no run is active');
       c.out.set('decision', 'allow');
       return EXIT.ok;
     }
     const ledger = rt.ledger();
     // The clock approvals expire against is the run's own (injected in tests), never a second one.
-    const ev = await evaluateStop(ledger, { ...provenOptionsOf(rt.manifest, rt.redactor), now: c.opts.now() });
+    const ev = await evaluateStop(ledger, { ...provenOptionsOf(rt.manifest, rt.redactor), now: c.opts.now(), ...(h ? { registry: hardenedStopRuns(registered, c.opts.now()) } : {}) });
     const runId = ev.activeRun?.runId ?? ev.provedRunId;
     const payload: Record<string, Json> = {
       reason: ev.decision.reason,
@@ -108,10 +141,15 @@ async function stopHook(c: CommandContext, text: string): Promise<number> {
       ...(ev.missing ? { missing: ev.missing } : {}),
       ...(ev.provisional ? { provisional: true } : {}),
     };
-    try {
-      await rt.append(ev.decision.decision === 'block' ? 'stop.blocked' : 'stop.allowed', { ...(runId ? { runId } : {}), payload, actor: { kind: 'system', id: 'hook.stop' } });
-    } catch (e) {
-      if (ev.decision.decision === 'allow') return block(`stop hook failed closed: the decision could not be recorded (${(e as Error).message})`);
+    if (h && !h.writer) {
+      // Hardened, as the agent identity: the ledger is read-only to this process. Printed, not recorded.
+      c.out.set('recorded', false);
+    } else {
+      try {
+        await rt.append(ev.decision.decision === 'block' ? 'stop.blocked' : 'stop.allowed', { ...(runId ? { runId } : {}), payload, actor: { kind: 'system', id: 'hook.stop' } });
+      } catch (e) {
+        if (ev.decision.decision === 'allow') return block(`stop hook failed closed: the decision could not be recorded (${(e as Error).message})`);
+      }
     }
     if (ev.decision.decision === 'block') return block(`goal not achieved: ${ev.missing} — ${ev.decision.reason}`);
     c.out.say(`tecera: ${ev.decision.reason}`);

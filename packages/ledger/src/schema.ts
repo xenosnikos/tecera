@@ -110,6 +110,23 @@ CREATE TABLE IF NOT EXISTS approvals (
   granted_seq     INTEGER
 );
 
+-- Hardened mode: the ledger id written once at enrollment, compared with the head checkpoint kept outside.
+CREATE TABLE IF NOT EXISTS ledger_meta (
+  key    TEXT PRIMARY KEY,
+  value  TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS ledger_meta_no_update BEFORE UPDATE ON ledger_meta BEGIN
+  SELECT RAISE(ABORT, 'ledger_meta is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS ledger_meta_no_delete BEFORE DELETE ON ledger_meta BEGIN
+  SELECT RAISE(ABORT, 'ledger_meta is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS ledger_meta_no_replace BEFORE INSERT ON ledger_meta
+WHEN EXISTS (SELECT 1 FROM ledger_meta WHERE key = NEW.key)
+BEGIN
+  SELECT RAISE(ABORT, 'ledger_meta is append-only: key already exists');
+END;
+
 CREATE TABLE IF NOT EXISTS checkpoints (
   id      TEXT PRIMARY KEY,
   run_id  TEXT NOT NULL,

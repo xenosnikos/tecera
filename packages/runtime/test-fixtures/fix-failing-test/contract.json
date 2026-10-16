@@ -9,6 +9,7 @@
       }
     ],
     "outOfScope": ["changes to tests, configs or lockfiles"],
-    "assumptions": ["the failing test states the intended behaviour"]
+    "assumptions": ["the failing test states the intended behaviour"],
+    "envelope": [{ "path": "src/slugify.js", "ops": ["modify"] }]
   }
 ]

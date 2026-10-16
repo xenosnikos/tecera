@@ -76,10 +76,10 @@ export { MAX_PLAN_DEPTH, UNSCANNABLE, MAX_DECODE_LAYERS, MAX_ESCAPE_LAYERS, MAX_
 export type { CandidateValidationOptions, PlannerCheckOptions, PlanValidatorOptions } from './checks.js';
 export { LLMPlanner, PlanRejected, PlannerProviderError, PlannerAccountingError, PlannerCancelled, isBudgetFailure } from './llmPlanner.js';
 export type { LLMPlannerOptions, PlannerUsage, PlannerCallPurpose, DeliberationRecord, RejectedDraft } from './llmPlanner.js';
-export { dependencyNames, testedApiOf, isTestPath } from './repoFacts.js';
-export type { RepoFacts, TestedModule, TestedCall } from './repoFacts.js';
-export { nameUses, importedBindings, declaredExports, renderCall, renderDeclared, resolveFrom } from './apiSurface.js';
-export type { ArgKind, NameUse, DeclaredParam, DeclaredExport } from './apiSurface.js';
+export { dependencyNames, testedApiOf, isTestPath, assertionsOf, entryPointsOf, packageBins, spawnedByTests, documentedLines } from './repoFacts.js';
+export type { RepoFacts, TestedModule, TestedCall, TestAssertion, EntryPoint } from './repoFacts.js';
+export { nameUses, importedBindings, declaredExports, renderCall, renderDeclared, resolveFrom, assertedValues, documentedShapes, commentLines, objectKeys, relativeImports } from './apiSurface.js';
+export type { ArgKind, NameUse, DeclaredParam, DeclaredExport, AssertedValue, DocumentedShape } from './apiSurface.js';
 export { capabilityRoutes, seamsFor, standInInstructionIssues, TOOL_KINDS } from './standIn.js';
 export type { CapabilityRoute, CapabilityRouteInput, CapabilityRung, Seam } from './standIn.js';
 export { ScriptedPlanner, SAMPLE_FIX_FAILING_TEST_PLAN, sampleFixFailingTestPlan } from './scripted.js';

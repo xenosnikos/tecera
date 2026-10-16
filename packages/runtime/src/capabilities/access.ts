@@ -1,7 +1,7 @@
 import { lstatSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import type { Binding, CapabilityRecord, Json, MockToolDeclaration, ProvisionedResource, WorkerStepRequest } from '@tecera/contracts';
-import { dependencyNames, isTestPath, resourceEnvName, testedApiOf, type RepoFacts } from '@tecera/planner';
+import { assertionsOf, dependencyNames, entryPointsOf, isTestPath, packageBins, resourceEnvName, spawnedByTests, testedApiOf, type RepoFacts } from '@tecera/planner';
 
 /**
  * What a worker step is told about the world beyond the repository (D9, D10, D12), and what the drafting seat
@@ -9,9 +9,11 @@ import { dependencyNames, isTestPath, resourceEnvName, testedApiOf, type RepoFac
  * registry and the files of the leased worktree; nothing a model said.
  *
  * - repositoryFacts: package names package.json lists and the API the repository's own tests import, with the
- *   parameters the tested modules declare for it (the planner's prompts and its import and call-shape
- *   screens). Bounded walk, never follows a symlink, skips node_modules / .git / .tecera; a file it cannot
- *   read is skipped.
+ *   parameters the tested modules declare for it and the interfaces their comments document, the exact values
+ *   the tests assert, and the repository's commands (package.json `bin`, files under bin/, files a test
+ *   spawns) with the modules they import (the planner's prompts and its import, call-shape, value and
+ *   envelope screens). Bounded walk, never follows a symlink, skips node_modules / .git / .tecera; a file it
+ *   cannot read is skipped.
  * - capabilityAccess: one entry per capability a step may reach: a stand-in (fidelity mocked, its tool name
  *   and how to call it) or a provisioned resource (fidelity provisioned, its kind, locator, the variable the
  *   criteria read it from, and the tool that reaches it when there is one). A locator is never a credential
@@ -33,12 +35,16 @@ const SOURCE = /\.[cm]?[jt]sx?$/;
 /** Package names and tested API of the repository at `dir` (empty facts when nothing can be read). */
 export function repositoryFacts(dir: string): RepoFacts {
   let dependencies: string[] = [];
+  let bins: string[] = [];
   try {
-    dependencies = dependencyNames(readFileSync(join(dir, 'package.json'), 'utf8'));
+    const pkg = readFileSync(join(dir, 'package.json'), 'utf8');
+    dependencies = dependencyNames(pkg);
+    bins = packageBins(pkg);
   } catch {
     dependencies = [];
   }
   const tests: Array<{ path: string; text: string }> = [];
+  const binDir: string[] = [];
   let seen = 0;
   const walk = (abs: string): void => {
     let entries;
@@ -56,6 +62,7 @@ export function repositoryFacts(dir: string): RepoFacts {
       }
       if (!e.isFile()) continue;
       const rel = relative(dir, p).split(sep).join('/');
+      if (/^bin\/[^/]+$/.test(rel) && binDir.length < 8) binDir.push(rel);
       if (!SOURCE.test(rel) || !isTestPath(rel)) continue;
       try {
         if (statSync(p).size > MAX_TEST_BYTES) continue;
@@ -66,21 +73,32 @@ export function repositoryFacts(dir: string): RepoFacts {
     }
   };
   walk(dir);
+  /** A repository file's text, or null: every directory on the way is a real directory and the file a regular file (no symlink is followed). */
+  const readRepoFile = (rel: string): string | null => {
+    if (rel.startsWith('..') || rel.startsWith('/') || rel.split('/').some((seg) => SKIP_DIRS.has(seg))) return null;
+    try {
+      const segs = rel.split('/');
+      if (!segs.slice(0, -1).every((_, n) => lstatSync(join(dir, ...segs.slice(0, n + 1))).isDirectory())) return null;
+      const st = lstatSync(join(dir, rel));
+      return st.isFile() && st.size <= MAX_TEST_BYTES ? readFileSync(join(dir, rel), 'utf8') : null;
+    } catch {
+      return null;
+    }
+  };
   // The modules the tests import, read for the parameters their exported functions declare.
   const sources: Array<{ path: string; text: string }> = [];
   for (const t of testedApiOf(tests)) {
-    if (sources.length >= MAX_TEST_FILES || !SOURCE.test(t.module) || t.module.split('/').some((seg) => SKIP_DIRS.has(seg))) continue;
-    try {
-      // Every directory on the way is a real directory and the file a regular file: no symlink is followed.
-      const segs = t.module.split('/');
-      if (!segs.slice(0, -1).every((_, n) => lstatSync(join(dir, ...segs.slice(0, n + 1))).isDirectory())) continue;
-      const st = lstatSync(join(dir, t.module));
-      if (st.isFile() && st.size <= MAX_TEST_BYTES) sources.push({ path: t.module, text: readFileSync(join(dir, t.module), 'utf8') });
-    } catch {
-      // unreadable: skipped
-    }
+    if (sources.length >= MAX_TEST_FILES || !SOURCE.test(t.module)) continue;
+    const text = readRepoFile(t.module);
+    if (text !== null) sources.push({ path: t.module, text });
   }
-  return { dependencies, testedApi: testedApiOf(tests, sources) };
+  const entries: Array<{ path: string; text: string }> = [];
+  for (const p of [...new Set([...bins, ...binDir, ...spawnedByTests(tests)])].sort()) {
+    const text = entries.length < 8 ? readRepoFile(p) : null;
+    // a command is a script: a JavaScript file, or an extensionless file with a node shebang
+    if (text !== null && (SOURCE.test(p) || /^#!.*\bnode\b/.test(text))) entries.push({ path: p, text });
+  }
+  return { dependencies, testedApi: testedApiOf(tests, sources), assertions: assertionsOf(tests), entryPoints: entryPointsOf(entries) };
 }
 
 const MESSAGE = /^(mail|email|smtp|message|messaging|sms|chat|webhook|notification|queue)$/i;

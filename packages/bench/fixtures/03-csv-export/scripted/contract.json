@@ -44,6 +44,20 @@
     ],
     "assumptions": [
       "--format csv selects the CSV output"
+    ],
+    "envelope": [
+      {
+        "path": "bin/report.js",
+        "ops": [
+          "modify"
+        ]
+      },
+      {
+        "path": "src/report.js",
+        "ops": [
+          "modify"
+        ]
+      }
     ]
   }
 ]

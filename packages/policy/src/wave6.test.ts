@@ -228,6 +228,26 @@ describe('contract tampering: a worker edit to the contract or a criterion check
     // no contract: exactly the old findings
     expect(tamperFindings(changes, hunks, tOpts).filter((x) => x.code === 'contract-edit' || x.code === 'criterion-edit')).toEqual([]);
   });
+  it('a product file a criterion runs may change when the accepted envelope lists it for modify; its tests and the contract never', () => {
+    const k = (command: string) => ({ id: 'csv', statement: 'csv', check: { kind: 'command' as const, command, timeoutSec: 5 } });
+    const runs = contract({ criteria: [k('node bin/report.js --format csv && node --test test/report.test.js')] });
+    const changes = [{ path: 'bin/report.js', status: 'M' as const }, { path: 'test/report.test.js', status: 'M' as const }];
+    const codes = (c: AcceptanceContract) => tamperFindings(changes, [], { ...tOpts, contract: c }).filter((x) => x.code === 'criterion-edit').map((x) => x.path).sort();
+    expect(codes(runs)).toEqual(['bin/report.js', 'test/report.test.js']);
+    // the requestor signed off that bin/report.js changes: it is released, nothing else is
+    const signed = { ...runs, envelope: [{ path: 'bin/report.js', ops: ['modify' as const] }, { path: 'test/report.test.js', ops: ['modify' as const] }] };
+    expect(codes(signed)).toEqual(['test/report.test.js']);
+    // create only, or a glob, does not release it
+    expect(codes({ ...runs, envelope: [{ path: 'bin/report.js', ops: ['create' as const] }] })).toContain('bin/report.js');
+    expect(codes({ ...runs, envelope: [{ path: 'bin/*.js', ops: ['modify' as const] }] })).toContain('bin/report.js');
+    // and the hook agrees
+    const view = { capabilities: { tools: ['edit'], paths: { read: ['**'], write: ['**'], protected: [] }, network: 'none' as const, limits: { usd: 1, tokens: 1, calls: 1, wallMs: 1, depth: 1, iterations: 1 } }, blackboard: {}, hooks: [] };
+    const hook = (c: AcceptanceContract) => mandatoryHooks(manifest(), { permissions: DEFAULT_PERMISSIONS, contract: () => c }).find((h) => h.id === 'tamperCheck')!;
+    const write = (path: string): SpanEvent => ({ span: 'ToolCall', stage: 'Enter', spanId: 's', run: { runId: 'r', invokeId: 'i', depth: 0 }, attempt: 1, input: { tool: 'edit', method: 'write', path } as SpanEvent['input'] });
+    expect(hook(runs).handle(write('bin/report.js'), view)).toMatchObject([{ type: 'Abort' }]);
+    expect(hook(signed).handle(write('bin/report.js'), view)).toEqual([]);
+    expect(hook(signed).handle(write('test/report.test.js'), view)).toMatchObject([{ type: 'Abort' }]);
+  });
   it('the tamperCheck hook aborts a worker write to the contract or a criterion check, and only under a contract', () => {
     const view = { capabilities: { tools: ['edit'], paths: { read: ['**'], write: ['**'], protected: [] }, network: 'none' as const, limits: { usd: 1, tokens: 1, calls: 1, wallMs: 1, depth: 1, iterations: 1 } }, blackboard: {}, hooks: [] };
     const enter = (input: Record<string, unknown>): SpanEvent => ({ span: 'ToolCall', stage: 'Enter', spanId: 's', run: { runId: 'r', invokeId: 'i', depth: 0 }, attempt: 1, input: input as SpanEvent['input'] });

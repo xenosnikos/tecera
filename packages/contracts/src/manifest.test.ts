@@ -48,10 +48,10 @@ describe('parseManifest', () => {
 
   it('rejects inline credentials anywhere in the document', () => {
     const doc = baseManifest();
-    doc.providers = { anthropic: { auth: 'env:A' }, openai: { auth: 'sk-ant-api03-abcdefghijklmnop' } };
+    doc.providers = { anthropic: { auth: 'env:A' }, openai: { auth: 'sk-ant-api03-' + 'abcdefghijklmnop' } };
     expect(() => parseManifest(doc)).toThrow(/credential-looking/);
     const leak = baseManifest();
-    leak.name = 'ghp_abcdefghijklmnopqrstuvwxyz0123';
+    leak.name = 'ghp_' + 'abcdefghijklmnopqrstuvwxyz0123';
     expect(findSecretLeaks(leak as never)).toEqual([{ path: 'name', kind: 'github' }]);
   });
 

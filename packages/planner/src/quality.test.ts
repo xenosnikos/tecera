@@ -63,7 +63,7 @@ const wc = (c: WireCriterion) => ({
   tags: c.tags ?? [],
 });
 const wire = (criteria: WireCriterion[], needs: Array<{ id: string; kind: string; mockable: boolean | null }> = []) =>
-  JSON.stringify({ criteria: criteria.map(wc), outOfScope: [], assumptions: [], needs });
+  JSON.stringify({ criteria: criteria.map(wc), outOfScope: [], assumptions: [], envelope: [{ path: 'src/*.js', ops: ['create', 'modify'] }], needs });
 const assertion = (body: string) => `node --input-type=module -e 'import assert from "node:assert/strict"; ${body}'`;
 
 // ---------------------------------------------------------------------------------------------------------

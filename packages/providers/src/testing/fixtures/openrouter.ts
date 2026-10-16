@@ -40,7 +40,7 @@ export const OPENROUTER_FIXTURES: Readonly<Record<string, FixtureSpec>> = {
   ok: {
     status: 200,
     body: {
-      id: 'gen-1791195101-GzgsLQkHvvJG5s1mjWPe',
+      id: 'gen-1791195101-fixture-0001',
       object: 'chat.completion',
       created: 1791195101,
       model: 'anthropic/claude-haiku-4.5',
@@ -63,7 +63,7 @@ export const OPENROUTER_FIXTURES: Readonly<Record<string, FixtureSpec>> = {
   schema: {
     status: 200,
     body: {
-      id: 'gen-1791195103-MUBeNj88MuOeo8s5F8wP',
+      id: 'gen-1791195103-fixture-0002',
       object: 'chat.completion',
       created: 1791195103,
       model: 'anthropic/claude-sonnet-4.5',
@@ -86,7 +86,7 @@ export const OPENROUTER_FIXTURES: Readonly<Record<string, FixtureSpec>> = {
   length: {
     status: 200,
     body: {
-      id: 'gen-1791195116-YTQnIe0tLmBjdwnsKa26',
+      id: 'gen-1791195116-fixture-0003',
       object: 'chat.completion',
       created: 1791195116,
       model: 'google/gemini-3.1-pro-preview',

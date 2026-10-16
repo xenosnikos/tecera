@@ -111,9 +111,9 @@ describe('redaction', () => {
     expect(env.PATH).toBe('/usr/bin');
     expect(s.status).toEqual([{ provider: 'anthropic', ref: 'env:MY_PROVIDER_KEY', envName: 'MY_PROVIDER_KEY', resolved: true }]);
     const r = s.redactor;
-    const text = `key sk-ant-abcdefghijklmnop and ${secret} and ${Buffer.from(secret).toString('base64')} TECERA_CANARY_xyz Authorization: Bearer ${secret} ${encodeURIComponent(secret)} ${JSON.stringify(JSON.stringify(secret))}`;
+    const text = `key ${'sk-ant-' + 'abcdefghijklmnop'} and ${secret} and ${Buffer.from(secret).toString('base64')} TECERA_CANARY_xyz Authorization: Bearer ${secret} ${encodeURIComponent(secret)} ${JSON.stringify(JSON.stringify(secret))}`;
     const out = r.redactText(text);
-    for (const leak of ['sk-ant-abcdefghijklmnop', secret, Buffer.from(secret).toString('base64'), 'TECERA_CANARY_xyz']) expect(out).not.toContain(leak);
+    for (const leak of ['sk-ant-' + 'abcdefghijklmnop', secret, Buffer.from(secret).toString('base64'), 'TECERA_CANARY_xyz']) expect(out).not.toContain(leak);
     expect(out).toMatch(/\[REDACTED:anthropic:[0-9a-f]{8}\]/);
     expect(r.containsSecret(out)).toBeNull();
   });

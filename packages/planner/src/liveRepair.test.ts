@@ -37,6 +37,7 @@ const wire = (criteria: WireCriterion[], needs: Array<{ id: string; kind: string
     criteria: criteria.map((c) => ({ id: c.id, statement: c.statement, kind: 'command', command: c.command, timeoutSec: 60, prompt: null, requires: c.requires ?? [], tags: [] })),
     outOfScope: [],
     assumptions: [],
+    envelope: [{ path: 'src/*.js', ops: ['create', 'modify'] }],
     needs,
   });
 

@@ -1,5 +1,6 @@
-import { digest, ledgerProvenRun, prActionHash, type AchievementProof, type Json, type Ledger, type ProvenOptions, type RunVerdict, type StopHookDecision, type TeceraEvent } from '@tecera/contracts';
+import { digest, ledgerProvenRun, prActionHash, type AchievementProof, type Json, type Ledger, type ProvenOptions, type RunRegistryEntry, type RunVerdict, type StopHookDecision, type TeceraEvent } from '@tecera/contracts';
 import { evaluateStopLedger, stopDecisionForRuns, type ActiveRunRef } from '@tecera/policy';
+import { stopStateOf } from './hardened/registry.js';
 
 /**
  * The host Stop hook (D4: `tecera hook stop`, Claude Code's Stop event). The assistant may not stop while a
@@ -21,7 +22,22 @@ import { evaluateStopLedger, stopDecisionForRuns, type ActiveRunRef } from '@tec
  *
  * Every decision is recorded (stop.blocked / stop.allowed). A business case whose ledger cannot be read or
  * whose hash chain does not verify blocks (fail closed); a directory that is not a business case, or one with no ledger yet, has no run.
+ *
+ * Hardened mode: `registry` carries the runs the run registry holds open (hardenedStopRuns). Each is an
+ * active run whatever the events say, so a run.ended event, a denied or an expired approval cannot remove it;
+ * the hash chain is also compared with the head checkpoint, so a truncated, restored or replaced ledger
+ * blocks. The runs the events call active still count as well.
  */
+
+/** The open registry entries as the Stop policy's active runs (a missed heartbeat reads as interrupted). */
+export function hardenedStopRuns(entries: readonly RunRegistryEntry[], now: number): ActiveRunRef[] {
+  return entries
+    .filter((e) => e.state !== 'terminal')
+    .map((e) => {
+      const s = stopStateOf(e, now);
+      return { runId: e.runId, ...(e.goalId ? { goalId: e.goalId } : {}), state: s.state, source: 'registry' as const, note: s.note };
+    });
+}
 
 /** Exit codes after which a run is still open: held for a human (4), interrupted (130). */
 export const RESUMABLE_EXITS: ReadonlySet<number> = new Set([4, 130]);
@@ -219,9 +235,10 @@ export interface StopEvaluation {
  * goal.achieved event or a well-formed proof alone never allows). `opts` are the manifest's allowance,
  * requireApproval and secrets (provenOptionsOf). Never considers budget.
  */
-export async function evaluateStop(ledger: Ledger, opts: Omit<ProvenOptions, 'chain'> & { now?: number } = {}): Promise<StopEvaluation> {
-  const { now: _now, ...proven } = opts;
+export async function evaluateStop(ledger: Ledger, opts: Omit<ProvenOptions, 'chain'> & { now?: number; registry?: ActiveRunRef[] } = {}): Promise<StopEvaluation> {
+  const { now: _now, registry: _registry, ...proven } = opts;
   void _now;
+  void _registry;
   const ev = await evaluateStopLedger(ledger, opts);
   // The runs policy evaluated: the active ones by their events, and the ones an open approval still holds.
   const activeOf = (runId: string | undefined): ActiveRun | null => {

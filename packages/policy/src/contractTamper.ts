@@ -4,7 +4,9 @@ import { matchesAny, matchesGlob, normalizePath } from './glob.js';
 /**
  * The accepted contract and every criterion's check command are the requestor's, not the worker's. A worker
  * edit to the file holding the contract, to a file a criterion's command runs, or to the package.json script
- * it invokes changes what "done" means: tampering, refused by the tamperCheck hook and the tamper gate.
+ * it invokes changes what "done" means: tampering, refused by the tamperCheck hook and the tamper gate. The
+ * one exception is a product file the accepted envelope lists for modify (the request is to change it):
+ * test files a criterion runs stay protected whatever the envelope says.
  */
 
 /** Where contracts live by default (goal files with criteria, run state). */
@@ -285,13 +287,33 @@ export function packageScriptsOf(text: string): Record<string, string> {
   }
 }
 
-/** Whether a change to `path` is contract tampering: the contract's own file, or a file a criterion runs. */
+/** A test file by its path (`test/…`, `tests/…`, `__tests__/…`, `*.test.*`, `*.spec.*`): always the criterion's, never the work's. */
+const TEST_PATH = /(^|\/)(test|tests|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$/;
+
+/**
+ * Whether the accepted envelope names `p` itself (an exact path, not a glob) with `modify`: the requestor
+ * signed off that the work changes this file, so a criterion running it checks the changed file. The
+ * criterion's command text stays protected with the contract, and a test file is never released this way.
+ */
+function releasedByEnvelope(p: string, contract: AcceptanceContract | null | undefined): boolean {
+  if (TEST_PATH.test(p) || isPackageJson(p)) return false;
+  return (contract?.envelope ?? []).some((e) => !e.path.includes('*') && normalizePath(e.path).replace(/^\.\//, '') === p && e.ops.includes('modify'));
+}
+
+/**
+ * Whether a change to `path` is contract tampering: the contract's own file, or a file a criterion runs.
+ * A product file a criterion runs is not tampering when the accepted envelope lists it for modify (the
+ * request is to change it, e.g. the command a criterion spawns); a test file a criterion runs always is.
+ */
 export function contractTouch(path: string, guard: ContractGuard, targets: CriterionTargets = criterionTargets(guard.contract, guard.packageScripts ? { packageScripts: guard.packageScripts } : {})): { code: 'contract-edit' | 'criterion-edit'; detail: string } | null {
   const p = normalizePath(path).replace(/^\.\//, '');
   const held = matchesAny(p, guard.contractPaths ?? DEFAULT_CONTRACT_GLOBS);
   if (held) return { code: 'contract-edit', detail: `${p} holds the acceptance contract (${held})` };
   for (const t of targets.paths) {
-    if (t.includes('*') ? matchesGlob(p, t) : p === t || p.startsWith(`${t}/`)) return { code: 'criterion-edit', detail: `${p} is run by a criterion's check command` };
+    if (t.includes('*') ? matchesGlob(p, t) : p === t || p.startsWith(`${t}/`)) {
+      if (releasedByEnvelope(p, guard.contract)) continue;
+      return { code: 'criterion-edit', detail: `${p} is run by a criterion's check command` };
+    }
   }
   return null;
 }

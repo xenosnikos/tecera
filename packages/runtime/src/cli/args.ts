@@ -20,6 +20,10 @@ export const VALUE_FLAGS = [
   'session',
   'scripted',
   'file',
+  'operator',
+  'agent',
+  'state',
+  'import',
 ] as const;
 
 export const BOOL_FLAGS = [

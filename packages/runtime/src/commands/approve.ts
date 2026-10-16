@@ -22,6 +22,8 @@ import type { Runtime } from '../runtime.js';
  * - Accident guard (decisionGuard.ts): the command refuses (exit 8) under an agent-host marker or without a
  *   terminal on stdin, unless TECERA_DECISION_NONINTERACTIVE=1; the conditions it saw are recorded on the
  *   decision's event (`guard`). That is protection against accidents, not authentication.
+ * - Hardened mode: before that, the guard refuses (exit 8) unless the process runs as the operator's uid
+ *   (hardened/authority.ts); the principal then carries the OS identity (`identity.os`, `guard.os`).
  * - Under D6 the only approval point is the PR gate: the request names the committed sha it opens a PR for.
  */
 

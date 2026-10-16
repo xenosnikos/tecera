@@ -7,7 +7,7 @@ import { sampleFixFailingTestPlan } from './scripted.js';
 const m = sampleManifest();
 const permissions = samplePermissions();
 const CANARY = 'TECERA_CANARY_q7Zx91Lm';
-const KEY = 'sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUV';
+const KEY = 'sk-ant-api03-' + 'ABCDEFGHIJKLMNOPQRSTUV';
 
 describe('buildPlannerPrompt', () => {
   const msgs = buildPlannerPrompt({ manifest: m, goal, event: adopted, beliefs: [belief('baseline', { exitCode: 1 })], permissions, nonce: 'n0nce1' });

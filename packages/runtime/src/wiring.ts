@@ -1042,7 +1042,7 @@ export function createWiring(o: WiringOptions = {}): WireFn {
       const workerSeats = m.seats.workers.map((w) => ({ id: w.id, provider: w.provider, model: w.model, costPerMTok: priceFor(w.model).inputPerM }));
       let bridge: MeteredPlanner | null = null;
       const innerPlanner: Planner = scripts?.plan
-        ? new ScriptedRunPlanner(scripts.plan, { ...(scripts.contracts ? { contracts: scripts.contracts } : {}), connections: m.connections, allowedChanges: m.repo.allowedChanges, protectedPaths: m.policy.protectedPaths })
+        ? new ScriptedRunPlanner(scripts.plan, { ...(scripts.contracts ? { contracts: scripts.contracts } : {}), connections: m.connections, allowedChanges: m.repo.allowedChanges, protectedPaths: m.policy.protectedPaths, fileExists: repoFileView(wt.path) })
         : new LLMPlanner({
             // every planner call is cancelled by the loop meter's signal (deadline, loop stop) and the run's
             llm: cancellableLLM(plannerLLM, runSignal, () => bridge?.meterSignal()),

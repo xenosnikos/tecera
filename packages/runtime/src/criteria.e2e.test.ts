@@ -190,7 +190,7 @@ describe('acceptance contracts end to end (scripted models, real sandbox, real g
   it('(b) `tecera run "make the failing test pass"`: the drafted contract holds for sign-off (exit 4) before anything is planned; `criteria accept` signs it off, the PR holds, approve → achieved; one slug names the goal and the branch on every segment (L5-F1)', async () => {
     const { dir, wt, res } = await sampleRepo();
     const env = { ...KEYS, TECERA_WORKTREES: wt, TECERA_RESOURCES: res };
-    const contract = { criteria: [{ id: 'tests-pass', statement: 'the whole test suite passes', check: { kind: 'command', command: 'node --test', timeoutSec: 120 } }], assumptions: ['the failing test states the intended behaviour'] };
+    const contract = { criteria: [{ id: 'tests-pass', statement: 'the whole test suite passes', check: { kind: 'command', command: 'node --test', timeoutSec: 120 } }], assumptions: ['the failing test states the intended behaviour'], envelope: [{ path: 'src/slugify.js', ops: ['modify'] }] };
     const seg1 = await cli(dir, ['run', 'make the failing test pass', '--scripted', scripts({ contract, replies: {} })], { env });
     if (seg1.code !== EXIT.held) console.log(await dump(dir));
     expect(seg1.code, seg1.err + seg1.out).toBe(EXIT.held);
@@ -774,7 +774,7 @@ describe('carried-over L5 regressions', () => {
     const { dir, res } = await sampleRepo();
     const wtRoot = join(tmp('tecera-wtroot-'), 'nested', 'worktrees');
     const env = { ...KEYS, TECERA_WORKTREES: wtRoot, TECERA_RESOURCES: res };
-    const contract = { criteria: [{ id: 'tests-pass', statement: 's', check: { kind: 'command', command: 'node --test', timeoutSec: 60 } }] };
+    const contract = { criteria: [{ id: 'tests-pass', statement: 's', check: { kind: 'command', command: 'node --test', timeoutSec: 60 } }], envelope: [{ path: 'src/slugify.js', ops: ['modify'] }] };
     const r = await cli(dir, ['run', 'make the failing test pass', '--scripted', scripts({ contract, replies: {} })], { env });
     expect(r.code, r.err + r.out).toBe(EXIT.held);
     const { statSync } = await import('node:fs');
@@ -836,7 +836,7 @@ describe('review repairs', () => {
   it('criteria accept and amend refuse on a ledger whose hash chain is broken (exit 9, nothing recorded)', async () => {
     const { dir, wt, res } = await sampleRepo();
     const env = { ...KEYS, TECERA_WORKTREES: wt, TECERA_RESOURCES: res };
-    const contract = { criteria: [{ id: 'tests-pass', statement: 's', check: { kind: 'command', command: 'node --test', timeoutSec: 60 } }] };
+    const contract = { criteria: [{ id: 'tests-pass', statement: 's', check: { kind: 'command', command: 'node --test', timeoutSec: 60 } }], envelope: [{ path: 'src/slugify.js', ops: ['modify'] }] };
     const seg1 = await cli(dir, ['run', 'make the failing test pass', '--scripted', scripts({ contract, replies: {} })], { env });
     expect(seg1.code, seg1.err + seg1.out).toBe(EXIT.held);
     const before = await events(dir);
@@ -865,7 +865,7 @@ describe('review repairs', () => {
       (m.budgets as Record<string, unknown>).wallClockSec = 300;
     }));
     const env = { ...KEYS, TECERA_WORKTREES: wt, TECERA_RESOURCES: res };
-    const contract = { criteria: [{ id: 'tests-pass', statement: 's', check: { kind: 'command', command: 'node --test', timeoutSec: 60 } }] };
+    const contract = { criteria: [{ id: 'tests-pass', statement: 's', check: { kind: 'command', command: 'node --test', timeoutSec: 60 } }], envelope: [{ path: 'src/slugify.js', ops: ['modify'] }] };
     const seg1 = await cli(dir, ['run', 'make the failing test pass', '--scripted', scripts({ contract, replies: {} })], { env });
     expect(seg1.code, seg1.err + seg1.out).toBe(EXIT.held);
     const evs = await events(dir);

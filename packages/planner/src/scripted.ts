@@ -28,7 +28,8 @@ import { planId } from './schema.js';
  *
  * draftContract() returns a scripted contract: the first entry whose `when` matches the statement (an entry
  * without `when` matches any). It goes through the same assembly and checks as the model's draft (stamped
- * goal id and statement, needs, contractDraftIssues); a refused or missing one is ContractRejected.
+ * goal id and statement, needs, contractDraftIssues, a change-path envelope required); a refused or missing
+ * one is ContractRejected.
  */
 
 /** A canned contract: the proposal (no goal id, no statement) and which statements it answers. */
@@ -46,6 +47,8 @@ export interface ScriptedPlannerOptions {
   /** The manifest's repo.allowedChanges and policy.protectedPaths: a scripted envelope is screened against them too. */
   allowedChanges?: readonly string[];
   protectedPaths?: readonly string[];
+  /** Whether a repository path exists: a scripted envelope is screened against the repository too. */
+  fileExists?: (path: string) => boolean;
   /** 'order' (default) or 'goalKind'. */
   mode?: 'order' | 'goalKind';
   /** Goal kind for 'goalKind' mode. Default: goal.id (goal files use the kind as id, e.g. fix-failing-test). */
@@ -103,7 +106,16 @@ export class ScriptedPlanner implements Planner {
     );
     if (!entry) throw new ContractRejected(['no scripted contract for this statement'], 1);
     const { when: _when, ...proposal } = entry;
-    const built = assembleDraft(clone(proposal), { statement: text, goal, inventory, connections: this.o.connections, ...(this.o.allowedChanges ? { allowedChanges: this.o.allowedChanges } : {}), ...(this.o.protectedPaths ? { protectedPaths: this.o.protectedPaths } : {}) });
+    const built = assembleDraft(clone(proposal), {
+      statement: text,
+      goal,
+      inventory,
+      connections: this.o.connections,
+      ...(this.o.allowedChanges ? { allowedChanges: this.o.allowedChanges } : {}),
+      ...(this.o.protectedPaths ? { protectedPaths: this.o.protectedPaths } : {}),
+      ...(this.o.fileExists ? { fileExists: this.o.fileExists } : {}),
+      requireEnvelope: true,
+    });
     if (!built.ok) throw new ContractRejected(built.issues, 1);
     return built.draft;
   }

@@ -151,7 +151,7 @@ describe('approval (security.md §6; D1 local principal, D6 PR gate)', () => {
     const anon = await approve(h.dir, h.requestId, { ...h.env, USER: '', USERNAME: '' }, null);
     expect(anon.code, anon.out + anon.err).not.toBe(0);
     expect(await approvalState(h.dir, h.requestId)).toBe('pending');
-    const tok = await cli(h.dir, ['approve', h.requestId, '--token', 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJyb290In0.', '--yes'], { env: { ...h.env, USER: '', USERNAME: '' } });
+    const tok = await cli(h.dir, ['approve', h.requestId, '--token', `${Buffer.from('{"alg":"none"}').toString('base64url')}.${Buffer.from('{"sub":"root"}').toString('base64url')}.`, '--yes'], { env: { ...h.env, USER: '', USERNAME: '' } });
     expect(tok.code).not.toBe(0);
     expect(await approvalState(h.dir, h.requestId)).toBe('pending');
     // and resuming without a grant delivers nothing (the hold stays; the commit stays on the work branch only)

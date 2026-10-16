@@ -237,6 +237,13 @@ export const initCommand: Command = async (c) => {
   // ledger
   const rt = new Runtime({ cwd: target, env, now: c.opts.now, ids: c.opts.ids });
   try {
+    // Hardened mode: the ledger lives in the protected state and is created by the operator, once.
+    if (rt.hardened && !rt.ledgerExists()) c.out.info('  ledger     hardened mode: not created here; the operator runs `tecera hardened enroll`');
+    else await recordInit();
+  } finally {
+    rt.close();
+  }
+  async function recordInit(): Promise<void> {
     const ledger = rt.ledger();
     let created = false;
     for await (const e of ledger.events({ kinds: ['manifest.created'] })) if ((e.payload as { manifestHash?: string }).manifestHash === hash) created = true;
@@ -246,8 +253,6 @@ export const initCommand: Command = async (c) => {
     let n = 0;
     for await (const _ of ledger.events()) n++;
     c.out.info(`  ledger     ${ledgerRel}  ${created ? 'exists' : 'manifest.created'} sha256:${hash.slice(0, 12)} · ${n} event(s)`);
-  } finally {
-    rt.close();
   }
   if (securityNotes.length) {
     for (const n of securityNotes) c.out.error(`security conflict  ${n}`);

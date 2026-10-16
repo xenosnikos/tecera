@@ -5,7 +5,9 @@ import { parsePlanOutput } from './parse.js';
 import { PLAN_WIRE_JSON_SCHEMA, toPlan } from './schema.js';
 import { ScriptedPlanner } from './scripted.js';
 import { createPlanValidator } from './checks.js';
-import { goal, goodDoc, sampleManifest, samplePermissions } from './fixtures.testkit.js';
+import { FakeLLM, goal, goodDoc, sampleManifest, samplePermissions } from './fixtures.testkit.js';
+import { ContractRejected } from './contract.js';
+import { LLMPlanner } from './llmPlanner.js';
 
 /**
  * The change-path envelope in the planner: drafted with the contract, screened against the manifest and the
@@ -74,6 +76,66 @@ describe('drafting: the planner proposes the envelope with the criteria', () => 
     expect((await ok.draftContract('collapse separator runs', statementGoal, [])).contract.envelope).toEqual(ENV);
     const out = new ScriptedPlanner({ plans: [plan], contracts: [{ criteria: [{ id: 'c', statement: 's', check: { kind: 'command', command: "node -e 'process.exit(1)'", timeoutSec: 30 } }], envelope: [{ path: 'lib/x.js', ops: ['create'] }] }], allowedChanges: ['src/**'], protectedPaths: [] });
     await expect(out.draftContract('collapse separator runs', statementGoal, [])).rejects.toThrow(/outside repo\.allowedChanges/);
+  });
+});
+
+describe('drafting: every drafted contract states an envelope', () => {
+  const m = sampleManifest();
+  const has = (p: string) => p === 'src/slugify.js';
+  const planner = (answers: string[]) => new LLMPlanner({ llm: new FakeLLM(answers), manifest: m, permissions: samplePermissions(), nonce: () => 'q7q7q7', repoFiles: has });
+  const caught = (pr: Promise<unknown>) => pr.then(() => null, (e: unknown) => e);
+  const STMT = 'collapse separator runs';
+  // a focused, behavioural criterion (the quality screen passes it), so only the envelope decides
+  const focused = { ...criterion, command: `node --input-type=module -e 'import assert from "node:assert/strict"; import { slugify } from "./src/slugify.js"; assert.equal(slugify("a--b"), "a-b");'` };
+  const wire = (envelope: unknown) => JSON.stringify({ criteria: [focused], outOfScope: [], assumptions: [], envelope, needs: [] });
+
+  it('the wire schema asks for at least one entry', () => {
+    const env = (CONTRACT_WIRE_JSON_SCHEMA as { properties: { envelope: { minItems?: number } } }).properties.envelope;
+    expect(env.minItems).toBe(1);
+  });
+
+  it('a draft without an envelope is refused and redrafted; the accepted draft carries the envelope it was asked for', async () => {
+    const llm = new FakeLLM([wire([]), wire(ENV)]);
+    const p = new LLMPlanner({ llm, manifest: m, permissions: samplePermissions(), nonce: () => 'q7q7q7', repoFiles: has });
+    const d = await p.draftContract(STMT, statementGoal, []);
+    expect(d.contract.envelope).toEqual(ENV);
+    expect(llm.requests).toHaveLength(2);
+    expect(llm.requests[1]!.messages.at(-1)!.content).toMatch(/states no change-path envelope/);
+    const err = (await caught(planner([wire(undefined), wire([])]).draftContract(STMT, statementGoal, []))) as ContractRejected;
+    expect(err).toBeInstanceOf(ContractRejected);
+    expect(err.issues.join()).toMatch(/states no change-path envelope/);
+  });
+
+  it('a draft whose envelope reaches outside repo.allowedChanges (or onto a protected path) is refused and redrafted', async () => {
+    expect(m.repo.allowedChanges).toEqual(['src/**']);
+    const broad = [{ path: 'lib/extra.js', ops: ['create'] }, ...ENV];
+    const llm = new FakeLLM([wire(broad), wire(ENV)]);
+    const d = await new LLMPlanner({ llm, manifest: m, permissions: samplePermissions(), nonce: () => 'q7q7q7', repoFiles: has }).draftContract(STMT, statementGoal, []);
+    expect(d.contract.envelope).toEqual(ENV);
+    expect(llm.requests[1]!.messages.at(-1)!.content).toMatch(/outside repo\.allowedChanges/);
+    for (const bad of [broad, [{ path: 'test/slugify.test.js', ops: ['modify'] }]]) {
+      const err = (await caught(planner([wire(bad), wire(bad)]).draftContract(STMT, statementGoal, []))) as ContractRejected;
+      expect(err, JSON.stringify(bad)).toBeInstanceOf(ContractRejected);
+      expect(err.issues.join()).toMatch(/outside repo\.allowedChanges|protected path/);
+    }
+    // and against the repository: a path to modify that does not exist
+    const err = (await caught(planner([wire([{ path: 'src/nothere.js', ops: ['modify'] }]), wire([{ path: 'src/nothere.js', ops: ['modify'] }])]).draftContract(STMT, statementGoal, []))) as ContractRejected;
+    expect(err.issues.join()).toMatch(/does not exist in the repository/);
+  });
+
+  it('a scripted contract without an envelope is refused; with one it is screened against the repository too', async () => {
+    const plan = toPlan(parsePlanDoc(goodDoc()), { trigger: { kind: 'goal.adopted' } });
+    const k = { id: 'c', statement: 's', check: { kind: 'command' as const, command: "node -e 'process.exit(1)'", timeoutSec: 30 } };
+    await expect(new ScriptedPlanner({ plans: [plan], contracts: [{ criteria: [k] }], allowedChanges: ['src/**'], protectedPaths: [] }).draftContract(STMT, statementGoal, [])).rejects.toThrow(/states no change-path envelope/);
+    await expect(new ScriptedPlanner({ plans: [plan], contracts: [{ criteria: [k], envelope: [{ path: 'src/nothere.js', ops: ['modify'] }] }], allowedChanges: ['src/**'], protectedPaths: [], fileExists: has }).draftContract(STMT, statementGoal, [])).rejects.toThrow(/does not exist in the repository/);
+    expect((await new ScriptedPlanner({ plans: [plan], contracts: [{ criteria: [k], envelope: ENV }], allowedChanges: ['src/**'], protectedPaths: [], fileExists: has }).draftContract(STMT, statementGoal, [])).contract.envelope).toEqual(ENV);
+  });
+
+  it('assembly alone (a goal file\'s contract is never drafted) still accepts a contract without one', () => {
+    const parsed = parseContractOutput(wire([]));
+    if (!parsed.ok) throw new Error('unreachable');
+    expect(assembleDraft(parsed.proposal, { statement: STMT, goal: statementGoal }).ok).toBe(true);
+    expect(assembleDraft(parsed.proposal, { statement: STMT, goal: statementGoal, requireEnvelope: true }).ok).toBe(false);
   });
 });
 

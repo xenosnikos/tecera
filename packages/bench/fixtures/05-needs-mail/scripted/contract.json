@@ -36,6 +36,14 @@
         "kind": "smtp",
         "mockable": true
       }
+    ],
+    "envelope": [
+      {
+        "path": "src/signup.js",
+        "ops": [
+          "modify"
+        ]
+      }
     ]
   }
 ]

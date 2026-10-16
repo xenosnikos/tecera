@@ -384,7 +384,7 @@ describe('provisioned resources are debts (D12)', () => {
     expect(resourceProblem(resource({ kind: 'postgres' }), ALLOW)).toMatch(/outside the allowance/);
     expect(resourceProblem(resource({ expiresAt: 1000 + 7_200_000 }), ALLOW)).toMatch(/longer than the allowance/);
     expect(resourceProblem(resource(), { ...ALLOW, scope: 'none' })).toMatch(/nothing may be provisioned/);
-    for (const bad of ['postgres://admin:hunter22@127.0.0.1/db', 'http://127.0.0.1:9/x?api_key=abc', 'http://127.0.0.1:9/?token=1', 'Bearer abcdefgh', '/tmp/TECERA_CANARY_X', 'ghp_abcdefghijkl1234']) {
+    for (const bad of ['postgres://admin:hunter22@127.0.0.1/db', 'http://127.0.0.1:9/x?api_key=abc', 'http://127.0.0.1:9/?token=1', 'Bearer abcdefgh', '/tmp/TECERA_CANARY_X', 'ghp_' + 'abcdefghijkl1234']) {
       const why = locatorProblem(bad);
       expect(why, bad).not.toBeNull();
       expect(why).not.toContain(bad);
@@ -632,7 +632,7 @@ describe('kernel repair: review findings', () => {
       'http://127.0.0.1:9/x%3Ftoken%3Dabc',
       'http%3A%2F%2Fu%3Ap%40127.0.0.1',
       '/tmp/x\nAuthorization',
-      'sk-abcdefgh12345678',
+      'sk-' + 'abcdefgh12345678',
       '/tmp/tecera_canary_x',
     ]) {
       const why = locatorProblem(bad);

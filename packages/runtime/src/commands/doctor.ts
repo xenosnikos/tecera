@@ -1,4 +1,5 @@
 import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { seatVendor, type Json } from '@tecera/contracts';
 import { checkAdapter, enabledHosts } from '../adapters/install.js';
 import { buildInventory } from '../capabilities/inventory.js';
@@ -15,6 +16,8 @@ import { reviewAllowlist } from '../env.js';
 import { gitSync, onPath, repoExecHazards } from '../util/proc.js';
 import { PlannedFs } from '../vfs.js';
 import type { SeatRef } from '../wiring.js';
+import { HardenedError } from '../hardened/config.js';
+import { hardenedChecks } from '../hardened/doctor.js';
 
 /**
  * `tecera doctor [--skip-live] [--fix]`: is this machine and business case ready? Node and git, the
@@ -83,8 +86,18 @@ export async function doctorChecks(c: CommandContext, opts: { skipLive: boolean;
     }
   } catch (e) {
     if (e instanceof ManifestLoadError) add('manifest', 'missing', e.message);
+    else if (e instanceof HardenedError) add('manifest', 'missing', `not loaded: ${e.message}`);
     else throw e;
   }
+  let root: string | null = rt?.root ?? null;
+  if (!root) {
+    try {
+      root = dirname(locateManifest(c.opts.cwd, c.args.values.manifest));
+    } catch {
+      root = null;
+    }
+  }
+  for (const k of hardenedChecks(env, root, rt?.hardened ?? null)) add(k.name, k.status, k.detail);
 
   // node / git
   const major = Number(process.versions.node.split('.')[0]);

@@ -209,7 +209,8 @@ export const CONTRACT_WIRE_JSON_SCHEMA: JsonObject = wClosed({
   assumptions: wStrings('What the contract assumes without checking.'),
   envelope: {
     type: 'array',
-    description: 'The change-path envelope: every repository path the work may touch and how. Existing files it must modify or delete, new files the criteria imply. Empty only when the paths cannot be told from the request and the repository.',
+    minItems: 1,
+    description: 'The change-path envelope: every repository path the work may touch and how. Existing files it must modify or delete, new files the criteria imply. Never empty: a contract without one is refused.',
     items: wClosed({
       path: wStr('A repository-relative path, or a narrow glob whose first segment is a literal directory (src/reports/*.js).'),
       ops: { type: 'array', items: { type: 'string', enum: ['create', 'modify', 'delete'] }, description: 'The operations allowed on it.' },
@@ -331,6 +332,11 @@ export interface DraftContext {
   allowedChanges?: readonly string[];
   protectedPaths?: readonly string[];
   fileExists?: (path: string) => boolean;
+  /**
+   * The draft must state an envelope (both planners set it: a drafted contract is always signed off with
+   * an explicit path list). A goal file's contract is not drafted and keeps the manifest boundary without one.
+   */
+  requireEnvelope?: boolean;
 }
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
@@ -411,7 +417,7 @@ export function envelopeDraftIssues(envelope: readonly ChangePath[] | undefined,
  * as stamped, bounds, capability ids, commands that can fail, needs that match the criteria, a complete
  * secret scan, and every requestor criterion of the goal kept (requestorCriteriaIssues). Never throws.
  */
-export function contractDraftIssues(draft: ContractDraft, c: Pick<DraftContext, 'goal' | 'statement' | 'redactor' | 'allowedChanges' | 'protectedPaths' | 'fileExists'>): string[] {
+export function contractDraftIssues(draft: ContractDraft, c: Pick<DraftContext, 'goal' | 'statement' | 'redactor' | 'allowedChanges' | 'protectedPaths' | 'fileExists' | 'requireEnvelope'>): string[] {
   try {
     const issues: string[] = [];
     const k = draft?.contract;
@@ -422,6 +428,7 @@ export function contractDraftIssues(draft: ContractDraft, c: Pick<DraftContext, 
     if (k.criteria.length > MAX_CRITERIA) issues.push(`contract has ${k.criteria.length} criteria; at most ${MAX_CRITERIA}`);
     if (k.outOfScope.length > MAX_CONTRACT_NOTES || k.assumptions.length > MAX_CONTRACT_NOTES) issues.push(`outOfScope and assumptions hold at most ${MAX_CONTRACT_NOTES} items each`);
     for (const x of [...k.outOfScope, ...k.assumptions]) if (x.length > MAX_NOTE_CHARS) issues.push(`an outOfScope or assumptions item is longer than ${MAX_NOTE_CHARS} characters`);
+    if (c.requireEnvelope && !k.envelope?.length) issues.push('the contract states no change-path envelope: list every repository path the work may create, modify or delete (existing files with modify or delete, new files with create)');
     issues.push(...envelopeDraftIssues(k.envelope, c));
     for (const x of k.criteria) {
       const id = safeSegment(x.id);

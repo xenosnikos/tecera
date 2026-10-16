@@ -17,7 +17,8 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
   (src/decisionGuard.ts): they refuse with exit 8 under an agent-host marker (`CLAUDECODE`,
   `CLAUDE_CODE_ENTRYPOINT`, `CODEX_*`, `TECERA_SANDBOX`) or without a terminal on stdin, unless
   `TECERA_DECISION_NONINTERACTIVE=1` is set, and record what they saw as `guard` on the decision event. It
-  prevents accidents; it is not authentication.
+  prevents accidents; it is not authentication. In hardened mode (below) they first require the
+  operator's uid.
 - **reflexes on.** Seams are `rule` / `model` / `frontier` (the manifest refuses `off`); the planner seat is
   the frontier, wired into the reflex router and as `LoopPorts.frontier` (metered by its own SeatMeter).
 - **budgets off by default.** `openRunPools` opens usd / tokens / calls / wallMs with `budgets.enforce`
@@ -39,7 +40,8 @@ The composition root and the `tecera` CLI. `wireRunPorts` (src/wiring.ts) builds
   case). It never considers budget. Every decision is recorded (`stop.blocked` / `stop.allowed`). A run with
   an open approval request stays held whatever its events say, and delivery counts only with a consumed
   human approval plus the PR gate's evidence. A run with no open approval is judged from run events, which
-  a process that can write the ledger can forge. The hook is installed for Claude Code only.
+  a process that can write the ledger can forge. The hook is installed for Claude Code only. In hardened
+  mode the active runs come from the run registry instead (below).
 - **review plugged in.** `review.foreign` must be true; the reviewer seat runs live on its own key and the
   review gate checks provider AND key fingerprint against every writer. `--allow-same-vendor-review` is gone.
 - **PR-level gating.** Writes inside `repo.allowedChanges` on the leased work branch proceed under any
@@ -149,13 +151,17 @@ reviewer call; the durable PR approval re-held; commit reconciled, never repeate
 - **A contract may state where the change may land.** `envelope:` in a goal file's front matter is a
   one-line JSON flow list: `envelope: [{"path": "src/slugify.js", "ops": ["modify"]}, {"path": "src/reports/*.js", "ops": ["create"]}]`.
   It needs `criteria:`, must lie inside `repo.allowedChanges` and off the protected paths, and is part of
-  the contract hash. For a statement the planner drafts it with the criteria and the requestor signs both
-  off; a scripted `contract.json` may carry `envelope` too. A plan's writing steps may declare a subset
+  the contract hash. For a statement the planner always drafts it with the criteria and the requestor signs
+  both off: a draft without one, or with a path outside `repo.allowedChanges`, on a protected path or at odds
+  with the repository (a file to modify that does not exist), is refused and redrafted; a request about a
+  command must list the command file. A scripted `contract.json` must carry `envelope` too. A plan's writing steps may declare a subset
   (`changes`); a step that names more is rejected with the plan. A write or deletion outside it fails at
   the tool; a file that got there another way fails the step when it returns (the retried worker is told
   which paths and can remove them with `deleteFile(path, digest)`); a candidate that still has one is
-  refused at verify and at commit. Without `envelope:` nothing changes: `repo.allowedChanges` is the
-  boundary and the contract hash is the one it had.
+  refused at verify and at commit. A goal file without `envelope:` keeps the old boundary:
+  `repo.allowedChanges` alone, and the contract hash it had. A product file a criterion runs (a command the
+  check spawns) is normally protected as part of the check; an envelope that lists it with `modify` releases
+  it for the work, while the criterion's command and any test file it runs stay protected.
 - **Every criterion is verified.** The verify gate runs each command criterion on the frozen candidate;
   the PR lists every criterion, how it was proven and at what fidelity. Human criteria are asked at the PR
   hold, one `answer_criterion` approval each (`tecera approve <request>`).
@@ -235,7 +241,8 @@ undispatched until a later resume completes the preparation.
    - A git repository gets `git worktree add --detach <base>` under host-controlled git, after `assertSafeRepo`.
    - A business case that is not a git repository gets a private copy with a fresh one-commit repository,
      recorded as `worktree.no-git`.
-   - The lease is `ledger.lease('worktree:<runId>')`, renewed while the run lives. Its fencing token goes to every
+   - The lease is `ledger.lease('worktree:<runId>')`, renewed from the moment it is granted (the worktree setup
+     included) for as long as the run lives. Its fencing token goes to every
      worker step. Resume reuses the worktree and refuses if it is missing or foreign.
    - `prepareBranch` puts the worktree on a later intention's branch at the base commit (the branch is
      created there, HEAD is pointed at it, the tree and index are reset and proven equal to the base tree),
@@ -257,8 +264,9 @@ undispatched until a later resume completes the preparation.
      envelope the edit and delete tools get the step's declared subset (from the accepted contract and the
      step's `changes`) and refuse any other path, naming it;
    - every known secret, for redaction and the canary;
-   - Brain context (lessons, episodes) added to each step's inputs. No run writes episodes or stages
-     lessons yet, so this context is empty in practice.
+   - Brain context (graduated lessons, episodes) added to each step's inputs as untrusted data.
+     Episodes and candidate lessons come from src/learning.ts (below); a lesson reaches a worker only after
+     a human graduates it.
 
    The tool kinds `tool.denied`, `sandbox.*` become `evidence.appended` events that carry the step trace.
    Provisioned sqlite / http-stub resources join the tools under their capability's name; a step whose plan
@@ -287,7 +295,13 @@ undispatched until a later resume completes the preparation.
 `budgets.enforce`), binds the goal's check into the effective
 manifest (gates, worker and baseline run the same command) and records the run's policy fingerprint. It runs
 the baseline through the verify gate (which also records the ignored-file baseline the commit gate needs),
-cancelled by the durable run deadline when budgets are enforced. A generated plan is staged only after its goal is achieved
+cancelled by the durable run deadline when budgets are enforced. At the end of every segment, and on a resume
+with nothing left to do, `recordRunLearning` (src/learning.ts) projects the run's ledger into memory without a
+model call: one bounded, redacted episode per `step.completed`, `step.failed` and `run.ended`, and one
+candidate lesson per verified recovery (a `verify.passed` after a failed step of the same goal). Each entry
+names its source event and is written once per source (an idempotency key and the brain's own replay rule), so
+projecting a run again writes nothing. A failure of the projection is a note on the run, never its outcome.
+A generated plan is staged only after its goal is achieved
 (src/staging.ts).
 
 `resumeRun` re-validates the restored authority against the current policy (exit 8 when a plan is no longer
@@ -297,6 +311,47 @@ dispatchable.
 
 `defaultProbe` (doctor) is a real completion per seat through the provider adapters and
 `@tecera/providers` `doctorProbe`; doctor and preflight run it last, only when every offline check passed.
+
+## Hardened mode (src/hardened/)
+
+Opt-in; single-user mode is unchanged when no hardened configuration exists. docs/security.md (section 4,
+"Hardened mode") states the guarantees and their limits.
+
+- **Configuration** (config.ts): `/etc/tecera/hardened.json`, or the file `TECERA_HARDENED_CONFIG` names
+  when there is none there: `{version: 1, stateDir, operator: {uid}, agents: [{uid}]}`. The file and its
+  directories must be owned by root or the operator and writable by nobody else; operator and agents must
+  differ; no agent is root. Anything else is a HardenedError (exit 3) for every command.
+- **State** (context.ts): `<stateDir>/cases/<caseId>/` holds `ledger.sqlite` (rollback journal), `head.json`
+  and its journal, `runs/` and `case.json`. `new Runtime` checks the ownership and modes of the state
+  directory, its parents and its contents, and that it lies outside the business case and the worktrees,
+  before anything else (exit 3 on any problem). The ledger is opened with its head checkpoint
+  (`@tecera/ledger` HeadStore), writable only when the process's real and effective uid are the operator's;
+  any other identity reads it. The manifest's `ledger.path` is not used; `tecera init` leaves the ledger to
+  `tecera hardened enroll`.
+- **Checks** (context.ts `checkIdentityProblem`, `HardenedVerifyRunner`): no check runs as root or as the
+  operator. `tecera run` refuses (exit 3) and the runtime's verify runner refuses every check unless
+  `TECERA_VERIFY_UID`/`GID` names another identity (which needs a root supervisor to switch to).
+- **Decisions** (authority.ts, decisionGuard.ts, principal.ts): every decision command refuses (exit 8)
+  unless the process credentials are the operator's and not an agent's; `--as` is the label; the principal
+  is `method: operator-uid` with `os: {uid, euid, gid, user}`, recorded on the decision event (`guard.os`,
+  `identity.os`) and in the identity evidence.
+- **Run registry** (registry.ts; commands/run.ts): `tecera run` refuses unless it is the operator, registers
+  the run before wiring, marks it running when wiring returns, heartbeats every 10 s, and records the end
+  from the outcome it computed (4 held, 130 interrupted, 10 provisional, else terminal). Wiring that refuses
+  puts the entry back; an exception leaves it interrupted. A terminal run is not resumed (exit 3).
+- **Stop hook** (stopHook.ts `hardenedStopRuns`, commands/hook.ts): the registry's open entries of this
+  business case go to `evaluateStopLedger` as `registry`; open entries of other business cases, or any open
+  entry when the payload's directory is not a business case, block; a registered run whose ledger is
+  missing blocks. As the agent identity the hook prints its decision and does not record it.
+- **Commands** (command.ts): `tecera hardened init [--operator u] [--agent u] [--state dir]` prints the
+  administrator's setup commands and changes nothing; `enroll [--import <ledger>]` (operator) creates a
+  genesis ledger or enrolls an existing one as a legacy baseline and enters its open runs in the registry;
+  `status` shows the configuration, the identity, the head and the registry; `abandon <run> --reason <text>`
+  (operator) records `run.ended` (exit 9) and makes the entry terminal. `tecera doctor` adds the hardened
+  checks (hardened/doctor.ts), including a write probe as each agent uid when it runs as root.
+- **Tests**: src/hardened.test.ts runs the CLI as root (the operator) and spawns the agent as a spare uid
+  (65520, 65521) against state directories under a temp directory; it is skipped unless the tests run as
+  root.
 
 ## Exit codes
 

@@ -352,7 +352,7 @@ describe('limit hooks and mandatory set', () => {
     expect(it5.handle(ev('LLMQuery', 'Enter'))[0]).toMatchObject({ type: 'Abort', code: 'iterations' });
   });
   it('mandatoryHooks produces the full set; assertMandatory refuses a missing one', () => {
-    const hooks = mandatoryHooks(manifest(), { permissions: DEFAULT_PERMISSIONS, secretValues: ['sk-ant-api03-verysecretvalue'] });
+    const hooks = mandatoryHooks(manifest(), { permissions: DEFAULT_PERMISSIONS, secretValues: ['sk-ant-api03-' + 'verysecretvalue'] });
     expect(hooks.map((h) => h.id).sort()).toEqual([...MANDATORY_HOOKS].sort());
     expect(() => assertMandatory(hooks, manifest())).not.toThrow();
     expect(() => assertMandatory(hooks.filter((h) => h.id !== 'verifyGate'), manifest())).toThrow(MissingMandatoryHooks);
@@ -371,8 +371,8 @@ describe('limit hooks and mandatory set', () => {
     expect(byId.approvalGate!.handle(ev('ToolCall', 'Send', { input: { tool: 'externalWrite' } }), view)).toMatchObject([{ type: 'Suspend' }]);
     const strict = mandatoryHooks(manifest(), { permissions: { always: [], requiresApproval: ['edit'], never: [] } }).find((h) => h.id === 'approvalGate')!;
     expect(strict.handle(ev('ToolCall', 'Send', { input: { tool: 'edit', method: 'write', path: 'src/a.ts' } }), view)).toEqual([]);
-    expect(byId.secretCanary!.handle(ev('LLMQuery', 'Enter', { input: { prompt: 'key is sk-ant-api03-verysecretvalue' } }), view)).toMatchObject([{ code: 'policy' }]);
-    expect(byId.secretCanary!.handle(ev('LLMQuery', 'Enter', { input: { prompt: 'AKIAABCDEFGHIJKLMNOP leaked' } }), view)).toMatchObject([{ code: 'policy' }]);
+    expect(byId.secretCanary!.handle(ev('LLMQuery', 'Enter', { input: { prompt: 'key is sk-ant-api03-' + 'verysecretvalue' } }), view)).toMatchObject([{ code: 'policy' }]);
+    expect(byId.secretCanary!.handle(ev('LLMQuery', 'Enter', { input: { prompt: 'AKIA' + 'ABCDEFGHIJKLMNOP leaked' } }), view)).toMatchObject([{ code: 'policy' }]);
     expect(byId.evidenceRecorder!.handle(ev('Invoke', 'Enter'), view)).toMatchObject([{ type: 'AppendEvidence', kind: 'governance' }]);
   });
 
@@ -403,11 +403,11 @@ describe('limit hooks and mandatory set', () => {
   });
 
   it('the secret canary aborts on a secret in an output (Complete), and the protectedPaths hook covers directory-style patterns', () => {
-    const hooks = mandatoryHooks(manifest(), { permissions: DEFAULT_PERMISSIONS, secretValues: ['sk-ant-api03-verysecretvalue'] });
+    const hooks = mandatoryHooks(manifest(), { permissions: DEFAULT_PERMISSIONS, secretValues: ['sk-ant-api03-' + 'verysecretvalue'] });
     const byId = Object.fromEntries(hooks.map((h) => [h.id, h]));
     const view = { capabilities: { tools: ['read', 'edit'], paths: { read: ['**'], write: ['**'], protected: ['tests/', 'fixtures', '.github', 'conf/locked/'] }, network: 'none' as const, limits: { usd: 1, tokens: 1, calls: 1, wallMs: 1, depth: 1, iterations: 1 } }, blackboard: {}, hooks: [] };
     for (const span of ['LLMQuery', 'ToolCall', 'Invoke'] as const) {
-      expect(byId.secretCanary!.handle(ev(span, 'Complete', { input: {}, output: { text: 'the key is sk-ant-api03-verysecretvalue' } }), view), span).toMatchObject([{ type: 'Abort', code: 'policy', reason: expect.stringMatching(/secret canary tripped on output/) }]);
+      expect(byId.secretCanary!.handle(ev(span, 'Complete', { input: {}, output: { text: 'the key is sk-ant-api03-' + 'verysecretvalue' } }), view), span).toMatchObject([{ type: 'Abort', code: 'policy', reason: expect.stringMatching(/secret canary tripped on output/) }]);
       expect(byId.secretCanary!.handle(ev(span, 'Complete', { input: {}, output: { text: 'nothing here' } }), view), span).toEqual([]);
     }
     for (const path of ['tests/a.ts', 'tests/deep/b.ts', 'pkg/tests/a.ts', 'fixtures/x.json', '.github/workflows/ci.yml', 'conf/locked/a.yml', 'tests']) {

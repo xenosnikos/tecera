@@ -17,6 +17,9 @@ import {
   type Json,
   type JsonObject,
   type Ledger,
+  type LedgerHead,
+  type LedgerHeadState,
+  type LedgerHeadTransition,
   type BudgetOptions,
   type Lease,
   type PoolUsage,
@@ -25,10 +28,14 @@ import {
   type TeceraEvent,
 } from '@tecera/contracts';
 import { GENESIS_HASH, chainHash, evidenceHash } from './hash.js';
+import { HeadError, type HeadStore } from './headStore.js';
 import { normalizeEvent } from './memory.js';
 import { SCHEMA_POST_SQL, SCHEMA_SQL } from './schema.js';
 
 type Row = Record<string, unknown>;
+
+/** A write transaction's body, run by SqliteLedger.write (an identity: it marks what runs under the lock). */
+const writeFn = <T>(fn: () => T): (() => T) => fn;
 
 /**
  * Where a test may hold a write transaction open: right after its write lock is taken, before the row it
@@ -45,6 +52,18 @@ export interface SqliteLedgerOptions {
    * hold one connection inside its critical section while another contends. Never set in production.
    */
   testBarrier?: (point: LedgerBarrierPoint) => void;
+  /**
+   * Hardened mode: the head checkpoint in the protected state. Every write is admitted against it and every
+   * write that changes a chain moves it (headStore.ts); verifyChain compares the database with it.
+   */
+  head?: HeadStore;
+  /**
+   * 'wal' (default) or 'delete'. Hardened mode uses the rollback journal: a WAL database cannot be read by
+   * an identity that may not write its -shm file, and the Stop hook reads the ledger as the agent identity.
+   */
+  journalMode?: 'wal' | 'delete';
+  /** Open an existing database read-only (no schema, no migration): every write fails. */
+  readonly?: boolean;
 }
 
 /**
@@ -57,14 +76,87 @@ export class SqliteLedger implements Ledger {
   private readonly db: Database.Database;
   private readonly now: () => number;
   private readonly barrier: (point: LedgerBarrierPoint) => void;
+  private readonly headStore: HeadStore | undefined;
 
   constructor(path: string, opts: SqliteLedgerOptions = {}) {
     this.now = opts.now ?? Date.now;
     this.barrier = opts.testBarrier ?? (() => undefined);
+    this.headStore = opts.head;
+    if (opts.readonly) {
+      this.db = new Database(path, { readonly: true, fileMustExist: true });
+      return;
+    }
     this.db = new Database(path);
-    this.db.exec(SCHEMA_SQL);
+    this.db.exec(opts.journalMode === 'delete' ? SCHEMA_SQL.replace('PRAGMA journal_mode = WAL;', 'PRAGMA journal_mode = DELETE;') : SCHEMA_SQL);
     this.migrate();
     this.db.exec(SCHEMA_POST_SQL);
+  }
+
+  /**
+   * One IMMEDIATE write transaction. With a head checkpoint (hardened mode) the database is admitted against
+   * it once the write lock is held, and a write that changed a chain moves the checkpoint before the commit
+   * and settles it after (headStore.ts); a failed commit puts the checkpoint back.
+   */
+  private write<T>(fn: () => T): T {
+    const store = this.headStore;
+    if (!store) return this.db.transaction(fn).immediate();
+    let staged: LedgerHeadTransition | null = null;
+    const tx = this.db.transaction((): T => {
+      const before = store.admit(this.headState());
+      const r = fn();
+      staged = store.stage(before, this.headState());
+      return r;
+    });
+    let r: T;
+    try {
+      r = tx.immediate();
+    } catch (e) {
+      if (staged) store.abort(staged);
+      throw e;
+    }
+    if (staged) store.settle(staged);
+    return r;
+  }
+
+  /** The head of both chains as the database states it (hardened mode compares it with the checkpoint). */
+  headState(): LedgerHeadState {
+    let ledgerId: string | null = null;
+    try {
+      ledgerId = ((this.db.prepare(`SELECT value FROM ledger_meta WHERE key = 'ledgerId'`).get() as Row | undefined)?.value as string | undefined) ?? null;
+    } catch {
+      ledgerId = null; // a ledger opened read-only from before the meta table existed
+    }
+    const ev = this.db.prepare('SELECT seq, hash FROM events ORDER BY seq DESC LIMIT 1').get() as Row | undefined;
+    const evi = this.db.prepare('SELECT n, hash FROM evidence ORDER BY n DESC LIMIT 1').get() as Row | undefined;
+    return {
+      ledgerId,
+      eventCount: (ev?.seq as number | undefined) ?? 0,
+      eventHeadHash: (ev?.hash as string | undefined) ?? GENESIS_HASH,
+      evidenceCount: (evi?.n as number | undefined) ?? 0,
+      evidenceHeadHash: (evi?.hash as string | undefined) ?? GENESIS_HASH,
+    };
+  }
+
+  /**
+   * Enroll this ledger under its head checkpoint (hardened mode), once: the chains must verify and be
+   * numbered contiguously; the database gets its ledger id (kept if it has one and no checkpoint exists is
+   * refused: an enrolled ledger whose checkpoint is missing is an error, not a reason to enroll again), and
+   * the current head becomes the baseline. 'legacy' marks history written before enrollment, which the
+   * checkpoint cannot vouch for; 'genesis' is an empty ledger created under hardened mode.
+   */
+  async enroll(baseline: LedgerHead['baseline'], ledgerId: string): Promise<LedgerHead> {
+    const store = this.headStore;
+    if (!store) throw new HeadError('this ledger was opened without a head checkpoint store');
+    const chain = await this.verifyChain({ skipHead: true });
+    if (!chain.ok) throw new HeadError(`the ledger does not verify (seq ${chain.brokenAtSeq}${chain.reason ? `: ${chain.reason}` : ''}); refusing to enroll it`);
+    const tx = this.db.transaction((): LedgerHead => {
+      const d = this.headState();
+      if (d.ledgerId) throw new HeadError(`the ledger ${d.ledgerId} was enrolled before and its checkpoint is missing; refusing to enroll it again`);
+      if (baseline === 'genesis' && (d.eventCount > 0 || d.evidenceCount > 0)) throw new HeadError('a ledger with history is enrolled as a legacy baseline, not as genesis');
+      this.db.prepare(`INSERT INTO ledger_meta (key, value) VALUES ('ledgerId', ?)`).run(ledgerId);
+      return store.enroll({ ...d, ledgerId }, baseline);
+    });
+    return tx.immediate();
   }
 
   close(): void {
@@ -149,7 +241,7 @@ export class SqliteLedger implements Ledger {
     } catch (err) {
       throw new LedgerError(`append failed: ${(err as Error).message}`, 'io');
     }
-    const tx = this.db.transaction((): AppendResult => {
+    const tx = (): AppendResult => {
       if (e.idemKey) {
         const dup = this.db.prepare('SELECT seq, hash FROM events WHERE idem_key = ?').get(e.idemKey) as Row | undefined;
         if (dup) return { seq: dup.seq as number, hash: dup.hash as string, duplicate: true };
@@ -157,9 +249,9 @@ export class SqliteLedger implements Ledger {
       const dupId = this.db.prepare('SELECT seq, hash FROM events WHERE id = ?').get(e.id) as Row | undefined;
       if (dupId) return { seq: dupId.seq as number, hash: dupId.hash as string, duplicate: true };
       return { ...this.insertEvent(e), duplicate: false };
-    });
+    };
     try {
-      return tx.immediate();
+      return this.write(tx);
     } catch (err) {
       throw new LedgerError(`append failed: ${(err as Error).message}`, 'io');
     }
@@ -190,7 +282,8 @@ export class SqliteLedger implements Ledger {
    * Sequence numbers must run 1..N without a gap in both: the event hash does not cover `seq`, so without
    * this check a renumbered log would still verify.
    */
-  async verifyChain(): Promise<ChainVerdict> {
+  async verifyChain(opts: { skipHead?: boolean } = {}): Promise<ChainVerdict> {
+    const store = opts.skipHead ? undefined : this.headStore;
     const read = this.db.transaction((): ChainVerdict => {
       let prev = GENESIS_HASH;
       let n = 0;
@@ -224,6 +317,13 @@ export class SqliteLedger implements Ledger {
         if (evidenceHash(evPrev, { n: expectN, key, kind: row.kind as string, runId: row.run_id as string, digest: row.digest as string, seq, eventHash }) !== row.hash) return broken('evidence hash mismatch');
         evPrev = row.hash as string;
       }
+      if (store) {
+        // Inside the same read transaction: a writer cannot commit until it ends (rollback journal), so the
+        // checkpoint files read here describe this snapshot or the one transition in flight from it.
+        const d = this.headState();
+        const why = store.check(d);
+        if (why) return { ok: false, brokenAtSeq: d.eventCount, reason: `ledger head checkpoint: ${why}` };
+      }
       return { ok: true, length: n };
     });
     return read.deferred();
@@ -232,7 +332,7 @@ export class SqliteLedger implements Ledger {
   async evidence(e: { key: string; kind: string; runId: string; body: Json }): Promise<EvidenceRecord> {
     const body = normalizeJson(e.body);
     const d = digestOf(body);
-    const tx = this.db.transaction((): EvidenceRecord | string => {
+    const tx = (): EvidenceRecord | string => {
       const existing = this.db.prepare('SELECT * FROM evidence WHERE key = ?').get(e.key) as Row | undefined;
       if (existing) return existing.digest !== d ? `evidence key ${e.key} already exists with a different body` : rowToEvidence(existing);
       const headRow = this.db.prepare('SELECT seq, hash FROM events ORDER BY seq DESC LIMIT 1').get() as Row | undefined;
@@ -246,10 +346,10 @@ export class SqliteLedger implements Ledger {
         .prepare('INSERT INTO evidence (key, kind, run_id, digest, body, seq, n, prev_hash, hash, event_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(e.key, e.kind, e.runId, d, canonicalJson(body), seq, n, prev, hash, eventHash);
       return { key: e.key, kind: e.kind, runId: e.runId, digest: d, body, seq };
-    });
+    };
     let r: EvidenceRecord | string;
     try {
-      r = tx.immediate();
+      r = this.write(tx);
     } catch (err) {
       throw new LedgerError(`evidence write failed: ${(err as Error).message}`, 'io');
     }
@@ -279,7 +379,7 @@ export class SqliteLedger implements Ledger {
   async openBudget(runId: string, pool: string, cap: number, opts?: BudgetOptions): Promise<void> {
     if (!(cap >= 0)) throw new LedgerError(`budget cap for ${pool} must be >= 0`, 'budget');
     const enforce = opts?.enforce === false ? 0 : 1;
-    const tx = this.db.transaction(() => {
+    const tx = writeFn(() => {
       const cur = this.db.prepare('SELECT cap, enforce FROM budgets WHERE run_id = ? AND pool = ?').get(runId, pool) as Row | undefined;
       if (!cur) this.db.prepare('INSERT INTO budgets (run_id, pool, cap, enforce) VALUES (?, ?, ?, ?)').run(runId, pool, cap, enforce);
       else {
@@ -288,7 +388,7 @@ export class SqliteLedger implements Ledger {
         if (next !== cur.cap || nextEnforce !== cur.enforce) this.db.prepare('UPDATE budgets SET cap = ?, enforce = ? WHERE run_id = ? AND pool = ?').run(next, nextEnforce, runId, pool);
       }
     });
-    tx.immediate();
+    this.write(tx);
   }
 
   async budgetUsage(runId: string): Promise<PoolUsage[]> {
@@ -309,7 +409,7 @@ export class SqliteLedger implements Ledger {
 
   async reserve(pool: string, amount: number, runId: string, idemKey: string): Promise<Reservation> {
     if (!(amount >= 0)) throw new LedgerError('reservation amount must be >= 0', 'budget');
-    const tx = this.db.transaction((): Reservation => {
+    const tx = writeFn((): Reservation => {
       this.barrier('reserve:locked');
       const dup = this.db.prepare('SELECT * FROM reservations WHERE idem_key = ?').get(idemKey) as Row | undefined;
       if (dup) return { id: dup.id as string, pool: dup.pool as string, amount: dup.amount as number, runId: dup.run_id as string };
@@ -324,12 +424,12 @@ export class SqliteLedger implements Ledger {
       this.db.prepare(`INSERT INTO reservations (id, run_id, pool, amount, state, idem_key) VALUES (?, ?, ?, ?, 'reserved', ?)`).run(id, runId, pool, amount, idemKey);
       return { id, pool, amount, runId, ...(over ? { exhausted: { used: used.used as number, cap: cap.cap as number } } : {}) };
     });
-    return tx.immediate();
+    return this.write(tx);
   }
 
   async settle(reservationId: string, actual: number): Promise<void> {
     if (!(actual >= 0)) throw new LedgerError('settled amount must be >= 0', 'budget');
-    const r = this.db.prepare(`UPDATE reservations SET state = 'charged', actual = ? WHERE id = ? AND state = 'reserved'`).run(actual, reservationId);
+    const r = this.write(() => this.db.prepare(`UPDATE reservations SET state = 'charged', actual = ? WHERE id = ? AND state = 'reserved'`).run(actual, reservationId));
     if (r.changes !== 1) throw new LedgerError(`reservation ${reservationId} not in reserved state`, 'budget');
   }
 
@@ -338,7 +438,7 @@ export class SqliteLedger implements Ledger {
    * decides on the time it actually runs at, never on one taken before the wait.
    */
   async lease(resource: string, holder: string, ttlMs: number): Promise<Lease | null> {
-    const tx = this.db.transaction((): Lease | null => {
+    const tx = writeFn((): Lease | null => {
       this.barrier('lease:locked');
       const now = this.now();
       const cur = this.db.prepare('SELECT * FROM leases WHERE resource = ?').get(resource) as Row | undefined;
@@ -348,7 +448,7 @@ export class SqliteLedger implements Ledger {
       this.db.prepare('INSERT OR REPLACE INTO leases (resource, holder, fencing_token, expires_at) VALUES (?, ?, ?, ?)').run(resource, holder, token, expiresAt);
       return { resource, holder, fencingToken: token, expiresAt };
     });
-    return tx.immediate();
+    return this.write(tx);
   }
 
   /**
@@ -356,7 +456,7 @@ export class SqliteLedger implements Ledger {
    * nobody else has acquired the resource yet: its holder must take a new lease, with a new fencing token.
    */
   async renew(lease: Lease, ttlMs: number): Promise<Lease> {
-    const tx = this.db.transaction((): Lease | string => {
+    const tx = writeFn((): Lease | string => {
       this.barrier('renew:locked');
       const now = this.now();
       const cur = this.db.prepare('SELECT * FROM leases WHERE resource = ?').get(lease.resource) as Row | undefined;
@@ -367,27 +467,29 @@ export class SqliteLedger implements Ledger {
       if (r.changes !== 1) return `lease on ${lease.resource} is no longer held by ${lease.holder}`;
       return { ...lease, expiresAt };
     });
-    const r = tx.immediate();
+    const r = this.write(tx);
     if (typeof r === 'string') throw new LedgerError(r, 'lease');
     return r;
   }
 
   async release(lease: Lease): Promise<void> {
-    const tx = this.db.transaction((): void => {
+    const tx = writeFn((): void => {
       this.barrier('release:locked');
       // Keep the row so the fencing token stays monotonic across holders; just expire it.
       this.db.prepare('UPDATE leases SET expires_at = 0 WHERE resource = ? AND holder = ? AND fencing_token = ?').run(lease.resource, lease.holder, lease.fencingToken);
     });
-    tx.immediate();
+    this.write(tx);
   }
 
   async requestApproval(r: ApprovalRequest): Promise<ApprovalRequest> {
-    const info = this.db
-      .prepare(
-        `INSERT OR IGNORE INTO approvals (request_id, run_id, session_id, action_hash, requester_kind, requester_id, reason, state, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
-      )
-      .run(r.requestId, r.runId, r.sessionId, r.actionHash, r.requester.kind, r.requester.id, r.reason, r.expiresAt);
+    const info = this.write(() =>
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO approvals (request_id, run_id, session_id, action_hash, requester_kind, requester_id, reason, state, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+        )
+        .run(r.requestId, r.runId, r.sessionId, r.actionHash, r.requester.kind, r.requester.id, r.reason, r.expiresAt),
+    );
     if (info.changes !== 1) throw new LedgerError(`approval ${r.requestId} already exists`, 'approval');
     return r;
   }
@@ -422,7 +524,7 @@ export class SqliteLedger implements Ledger {
         throw new LedgerError(`approval ${requestId}: invalid audit event: ${(err as Error).message}`, 'approval');
       }
     }
-    const tx = this.db.transaction((): { grant: ApprovalGrant } | { error: string } => {
+    const tx = writeFn((): { grant: ApprovalGrant } | { error: string } => {
       this.barrier('approve:locked');
       const row = this.db.prepare('SELECT * FROM approvals WHERE request_id = ?').get(requestId) as Row | undefined;
       if (!row) return { error: `unknown approval request ${requestId}` };
@@ -451,7 +553,7 @@ export class SqliteLedger implements Ledger {
     });
     let r: { grant: ApprovalGrant } | { error: string };
     try {
-      r = tx.immediate();
+      r = this.write(tx);
     } catch (err) {
       if (err instanceof LedgerError) throw err;
       throw new LedgerError(`approval ${requestId}: store error: ${(err as Error).message}`, 'io');
@@ -461,7 +563,7 @@ export class SqliteLedger implements Ledger {
   }
 
   async deny(requestId: string, approver: Principal, reason: string, at: number): Promise<void> {
-    const tx = this.db.transaction((): string | null => {
+    const tx = writeFn((): string | null => {
       const row = this.db.prepare('SELECT state, expires_at FROM approvals WHERE request_id = ?').get(requestId) as Row | undefined;
       if (!row || row.state !== 'pending') return `approval ${requestId} is not pending`;
       if ((row.expires_at as number) <= at) {
@@ -473,7 +575,7 @@ export class SqliteLedger implements Ledger {
         .run(approver.kind, approver.id, at, reason, requestId);
       return u.changes === 1 ? null : `approval ${requestId} is not pending`;
     });
-    const err = tx.immediate();
+    const err = this.write(tx);
     if (err) throw new LedgerError(err, 'approval');
   }
 
@@ -500,7 +602,7 @@ export class SqliteLedger implements Ledger {
   }
 
   async consume(requestId: string, actionHash: string, sessionId: string, idemKey: string, at: number): Promise<void> {
-    const tx = this.db.transaction((): string | null => {
+    const tx = writeFn((): string | null => {
       this.barrier('consume:locked');
       const row = this.db.prepare('SELECT * FROM approvals WHERE request_id = ?').get(requestId) as Row | undefined;
       const why = !row
@@ -532,7 +634,7 @@ export class SqliteLedger implements Ledger {
     });
     let why: string | null;
     try {
-      why = tx.immediate();
+      why = this.write(tx);
     } catch (err) {
       // consume_idem is UNIQUE: a reused idempotency key is a refusal, not an I/O fault.
       throw new LedgerError(`cannot consume approval ${requestId}: ${/UNIQUE/i.test((err as Error).message) ? 'idempotency key reused' : 'store error'}`, 'approval');
@@ -543,7 +645,7 @@ export class SqliteLedger implements Ledger {
   async checkpoint(runId: string, key: string, state: JsonObject): Promise<string> {
     const id = randomUUID();
     const normalized = normalizeJson(state);
-    this.db.prepare('INSERT INTO checkpoints (id, run_id, key, state, digest, at) VALUES (?, ?, ?, ?, ?, ?)').run(id, runId, key, canonicalJson(normalized), digestOf(normalized), this.now());
+    this.write(() => this.db.prepare('INSERT INTO checkpoints (id, run_id, key, state, digest, at) VALUES (?, ?, ?, ?, ?, ?)').run(id, runId, key, canonicalJson(normalized), digestOf(normalized), this.now()));
     return id;
   }
 

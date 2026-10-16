@@ -228,7 +228,8 @@ export interface MemoryEntry {
   tier: 'personal' | 'working' | 'semantic' | 'episodic';
   kind: string;
   content: string;
-  provenance: { runId?: string; hookId?: string; evidenceKey?: string; commitSha?: string };
+  /** `source`: the ledger event a production entry was projected from (one entry per tier and source). */
+  provenance: { runId?: string; hookId?: string; evidenceKey?: string; commitSha?: string; source?: string };
   salience: { createdAt: number; pain: number; importance: number; recurrence: number };
   state: 'active' | 'candidate' | 'rejected' | 'retracted';
   decisions: Array<{ by: Principal; verdict: string; rationale: string; at: number }>;

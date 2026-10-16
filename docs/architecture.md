@@ -32,23 +32,32 @@ proof per criterion with its fidelity. One pure function (`provenAchievement`) d
 proves a goal; the Stop hook, the run's exit status and replay all call it, so a forged `goal.achieved`
 event with no verification evidence behind it proves nothing. The Stop hook also holds a run while the
 approvals table has an open request for it, and counts a pull request as delivered only with a consumed
-human approval and the gate's own evidence. A run with no open approval is still judged active from run
-events alone, which a process able to write the ledger can forge (see the README's known limitations).
+human approval and the gate's own evidence. In the default single-user mode a run with no open approval is
+still judged active from run events alone, which a process able to write the ledger can forge (see the
+README's known limitations). In hardened mode the hook reads a run registry kept outside the ledger, which
+only the supervisor writes: a registered run stays active until the supervisor records it terminal (see
+"Hardened mode" below).
 
 ## Acceptance and capabilities
 
 Before planning, a request becomes an **acceptance contract**: criteria, each with a check (a command
 that must exit 0 on the final candidate, or a question for a human), what is out of scope, and what was
-assumed. The planner seat drafts it; model output is screened (no generic "tests pass" contracts, no
-criteria that import packages the repository lacks or need the network) and recorded as `criteria.drafted`.
+assumed. The planner seat drafts it from the host's reading of the repository: the API its tests use (call
+shapes, what a returned handler is given and gives back), the exact values the tests assert, the interfaces
+the code documents in comments, and its commands with the modules they import. Model output is screened (no
+generic "tests pass" contracts, no criteria that import packages the repository lacks or need the network,
+none that contradicts an asserted value, a tested call shape or a documented interface) and recorded as
+`criteria.drafted`.
 A free-text request holds until the requestor accepts the contract through a local approval bound to
 its hash (`accept_criteria`, approver not the requester); a goal file that carries criteria is accepted
 by the file.
 
-A contract may also state a **change-path envelope**: a list of repository paths, or narrow globs whose
+A contract also states a **change-path envelope**: a list of repository paths, or narrow globs whose
 first segment is a literal directory, each with the operations allowed on it (`create`, `modify`,
-`delete`, relative to the base commit). The planner drafts it with the criteria (existing files the work
-must touch, new files the criteria imply), a goal file carries it as `envelope:`, and it is part of the
+`delete`, relative to the base commit). The planner drafts one for every contract (existing files the work
+must touch, new files the criteria imply, the command file when the request is about a command); a draft
+without one, or with a path outside `repo.allowedChanges`, on a protected path or at odds with the repository,
+is refused and redrafted. A goal file carries it as `envelope:`. It is part of the
 contract hash, so it is signed off with the criteria and only an amendment can widen it. A plan may
 declare a subset per writing step (`changes`) and is rejected if a step names a path or an operation
 outside the accepted envelope. The envelope is enforced deterministically in three places: the worker's
@@ -57,9 +66,11 @@ computes what changed (untracked and ignored files, deletions, both sides of a r
 began and since the base, and fails the step if anything lies outside; and the verify and commit gates
 refuse a final candidate with an unexpected path, whatever the reviewer's verdict. The review packet
 lists the accepted criteria, the out-of-scope items, the envelope and the unexpected paths the host found.
-`repo.allowedChanges` stays the outer boundary. A contract that states no envelope keeps the hash it
-always had and is held to `repo.allowedChanges` alone, exactly as before; the gates record that as
-envelope source `manifest`. An amendment after acceptance (`criteria.amended`) makes the running plan stale and forces a
+`repo.allowedChanges` stays the outer boundary. A goal file's contract that states no envelope keeps the
+hash it always had and is held to `repo.allowedChanges` alone, exactly as before; the gates record that as
+envelope source `manifest`. A file a criterion's command runs is part of the check and a worker may not change
+it, except a product file (a command the check runs) that the accepted envelope lists for `modify`; the
+criterion's command text and the test files it runs stay protected. An amendment after acceptance (`criteria.amended`) makes the running plan stale and forces a
 re-plan against the new hash.
 
 Every intention has its own work branch. The first intention of a goal in a run commits to
@@ -123,15 +134,17 @@ the PR opens marked provisional, the run exits 10, and the Stop hook keeps block
   for sign-off of its acceptance contract, and a human criterion is asked at this hold). The grant is
   bound to the commit, to one approver who is not the requester, and to an expiry; it is consumed exactly
   once and only if its audit event exists. The approver is the local person running `tecera approve`,
-  named with `--as` (default `$USER`); the identity is recorded, not authenticated. Tecera pushes and
-  opens the PR, or writes a patch bundle. It never merges.
+  named with `--as` (default `$USER`); the identity is recorded, not authenticated. In hardened mode the
+  command also requires the operator's uid and records it. Tecera pushes and opens the PR, or writes a
+  patch bundle. It never merges.
 - **Budgets.** Usage is reserved before and settled after every model call and reported per step and per
   model. Exhaustion stops a run only when `budgets.enforce` is true. Loop-safety limits (depth, iterations,
   attempts, execution timeouts) do not depend on that switch.
 
 ## The worker
 
-A worker step is an invoke loop (ported from JAZ): the model writes a short program, the program runs in a
+A worker step that may edit files is always given `runVerify` as well (when the host wires it), so it can
+run the tests before it returns. A worker step is an invoke loop (ported from JAZ): the model writes a short program, the program runs in a
 fresh restricted Node child process, and the loop continues until the program returns a value that
 satisfies the step's output schema. The program is given no network or file API, and the child process
 may read only its own entry file; where the host provides them it also runs in its own network
@@ -149,13 +162,37 @@ fencing tokens, approvals and checkpoints live beside the log. `tecera why <even
 to its step, intention, goal and triggering event; an offline replay re-derives a goal's status from the
 ledger alone.
 
+## Hardened mode
+
+Opt-in, configured by a host file (`/etc/tecera/hardened.json`), never by the manifest. Two OS identities:
+the operator, who owns Tecera's state, runs the supervisor and makes the human decisions, and the agent the
+host assistant runs as. Per business case the state directory holds the ledger, a run registry and a
+checkpoint of the ledger's head, all owned by the operator and readable but not writable by the agent;
+Tecera refuses to start when the ownership or modes would let an agent write any of it. The supervisor
+registers a run before dispatching anything and alone moves it to a terminal state; the Stop hook treats
+every non-terminal entry as active whatever the ledger's events say. Every ledger write is checked against
+the checkpoint and moves it, through a one-transition journal that recovers a crash at any step exactly,
+so a truncated, restored or replaced ledger is detected. Every decision command checks the caller's real
+uid against the operator's. docs/security.md (section 4) states what this guarantees and what it does not:
+root, a compromised supervisor and anything that runs as the operator defeat it, and it does not identify
+which person used the operator account.
+
 ## Memory and learning
 
 Four tiers over the log: working, episodic, semantic (lessons) and procedural (the plan library). A
 generated plan is staged as a candidate once its goal is achieved and enters the library only when a
 human graduates it with a rationale. Lessons have the same lifecycle (stage, graduate, reject, retract,
-all kept on record), but nothing in a run writes episodes or stages lessons yet, so the episodic and
-semantic tiers are empty in practice.
+all kept on record).
+
+The runtime writes memory deterministically at the end of every run segment and on resume, without a model
+call: one bounded, redacted episode per step completion, step failure and run outcome, and a candidate lesson
+when a failed step of a goal is followed by a passing verification. Every entry names the ledger event it
+came from and is written once per source, so a run projected again (after a reload or a resume) adds
+nothing. Replay admits only what the live methods could have written: an `evidence.appended` entry must be a
+valid episode; `lesson.staged` always creates a candidate, whatever state it claims; graduate, reject and
+retract apply only to an existing lesson in the state the lifecycle allows, as the decision of the human who is
+the event's actor, with a rationale; an id is never overwritten. Only a graduated lesson is recalled, and
+lessons and episodes reach a worker as untrusted data.
 
 ## Benchmarks
 
@@ -165,8 +202,9 @@ secret, an impossible task, interruption and amendment mid-run, and an audit fro
 The runner drives the real CLI, scripted or with live models, and performs the declared human steps; the
 scorer works from the ledger and the delivered repository. It is meant to report human touches per job
 (autonomy), false achievements and landed violations (control), and the share of actions traceable to a
-step, intention, goal and approval (compliance). The pass rules are being tightened and the scorecard
-should not yet be read as a measurement; with live models, 1 of 5 goals has been achieved so far.
+step, intention, goal and approval (compliance). The scripted benchmark passes all ten scenarios' rules;
+with live models, 1 of 5 goals has been achieved with a delivered pull request so far, and no live run has
+falsely reported achievement or landed a violation.
 
 ## Package dependencies
 

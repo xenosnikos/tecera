@@ -48,6 +48,14 @@
         "kind": "sqlite",
         "mockable": true
       }
+    ],
+    "envelope": [
+      {
+        "path": "src/sessions.js",
+        "ops": [
+          "modify"
+        ]
+      }
     ]
   }
 ]

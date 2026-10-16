@@ -111,7 +111,7 @@ describe('owner decisions D1–D7 (2026-10-05)', () => {
     // behaviour: on a real PR hold, a token is no ingress; the local human principal ($USER) is, audited
     const h = await heldAtPr();
     const rid = requestIdOf(await h.flow.pending())!;
-    const tok = await cli(h.dir, ['approve', rid, '--token', 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJyb290In0.', '--yes'], { env: { ...h.flow.env, USER: '', USERNAME: '' } });
+    const tok = await cli(h.dir, ['approve', rid, '--token', `${Buffer.from('{"alg":"none"}').toString('base64url')}.${Buffer.from('{"sub":"root"}').toString('base64url')}.`, '--yes'], { env: { ...h.flow.env, USER: '', USERNAME: '' } });
     expect(tok.code).not.toBe(0);
     const ok = await cli(h.dir, ['approve', rid, '--yes'], { env: { ...h.flow.env, USER: 'local-owner' } });
     expect(ok.code, ok.err).toBe(0);

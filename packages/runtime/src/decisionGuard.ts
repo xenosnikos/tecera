@@ -1,8 +1,10 @@
 import { isatty } from 'node:tty';
-import type { Json } from '@tecera/contracts';
+import type { Json, OsDecisionIdentity } from '@tecera/contracts';
 import { SANDBOX_MARKER_ENV } from '@tecera/worker';
 import type { CommandContext } from './cli/context.js';
 import { EXIT } from './errors.js';
+import { callerIdentity, operatorRefusal } from './hardened/authority.js';
+import { HardenedError, loadHardenedConfig } from './hardened/config.js';
 import type { Env } from './util/proc.js';
 
 /**
@@ -17,6 +19,11 @@ import type { Env } from './util/proc.js';
  * A person who really runs a decision without a terminal (their own script, CI they control) sets
  * TECERA_DECISION_NONINTERACTIVE=1. An agent host that scrubs or deny-lists its tools' environment should
  * cover that variable, so an agent does not inherit the opt-out.
+ *
+ * Hardened mode is different, and checked first: the command refuses (exit 8) unless the process's real and
+ * effective uid are the configured operator's and not an agent's (hardened/authority.ts). That check reads
+ * the process credentials only; no variable, flag or terminal changes its answer. A configuration that cannot
+ * be trusted refuses too (exit 3). The OS identity is recorded with the guard (`os`).
  */
 
 /** Set to exactly `1` to run a decision command without a terminal or under an agent-host marker. */
@@ -41,6 +48,8 @@ export interface DecisionGuardRecord {
   agentMarkers: string[];
   /** TECERA_DECISION_NONINTERACTIVE=1 was set: the checks above were waived by the operator. */
   nonInteractiveOptOut: boolean;
+  /** Hardened mode: the operator identity the decision was authorized on (process credentials). */
+  os?: OsDecisionIdentity;
 }
 
 export interface DecisionGuardVerdict extends DecisionGuardRecord {
@@ -76,7 +85,7 @@ export function decisionGuard(env: Env, stdinTty: boolean): DecisionGuardVerdict
 }
 
 export function guardJson(g: DecisionGuardRecord): Json {
-  return { stdinTty: g.stdinTty, agentMarkers: [...g.agentMarkers], nonInteractiveOptOut: g.nonInteractiveOptOut };
+  return { stdinTty: g.stdinTty, agentMarkers: [...g.agentMarkers], nonInteractiveOptOut: g.nonInteractiveOptOut, ...(g.os ? { os: { ...g.os } as unknown as Json } : {}) };
 }
 
 /** Why a verdict refused, for the message (markers by name; values are never printed). */
@@ -92,8 +101,27 @@ function refusalReasons(g: DecisionGuardVerdict): string {
  * printing why it refused. Call it before anything is read or written for the decision.
  */
 export function guardDecision(c: Pick<CommandContext, 'opts' | 'out'>, what: string): DecisionGuardRecord | number {
+  let os: OsDecisionIdentity | undefined;
+  try {
+    const cfg = loadHardenedConfig(c.opts.env);
+    if (cfg) {
+      os = callerIdentity();
+      const refused = operatorRefusal(cfg, os);
+      if (refused) {
+        c.out.error(`${what}: refused. Hardened mode: ${refused}. Run it as the operator. (--as only labels who decided; it does not change who may.)`);
+        c.out.set('error', 'hardened mode: not the operator identity');
+        c.out.set('os', { ...os } as unknown as Json);
+        return EXIT.policy;
+      }
+    }
+  } catch (e) {
+    if (!(e instanceof HardenedError)) throw e;
+    c.out.error(`${what}: refused. ${e.message}`);
+    c.out.set('error', e.message);
+    return e.exitCode;
+  }
   const g = decisionGuard(c.opts.env, decisionTerminal.stdinIsTTY());
-  const record: DecisionGuardRecord = { stdinTty: g.stdinTty, agentMarkers: g.agentMarkers, nonInteractiveOptOut: g.nonInteractiveOptOut };
+  const record: DecisionGuardRecord = { stdinTty: g.stdinTty, agentMarkers: g.agentMarkers, nonInteractiveOptOut: g.nonInteractiveOptOut, ...(os ? { os } : {}) };
   if (!g.refused) return record;
   c.out.error(
     `${what}: refused. This is a human decision, and this does not look like a person at a terminal (${refusalReasons(g)}). ` +

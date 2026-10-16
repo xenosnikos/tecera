@@ -37,8 +37,8 @@ goal + criteria ──► capability inventory (declared connections probed; a m
 - **Beliefs** are a projection of the log. Nothing is remembered that cannot be traced to an event.
 - **Goals** carry an environmental check. A worker returning is never completion; the check passing is.
 - **Acceptance contracts** turn a request into criteria, each proven by a command or a named human
-  judgment. A free-text request holds until the requestor accepts the contract; a goal file that carries
-  criteria is already accepted. Every proof records how the criterion was met: `real`, `provisioned`
+  judgment, and the list of paths the change may touch. A free-text request holds until the requestor
+  accepts the contract; a goal file that carries criteria is already accepted. Every proof records how the criterion was met: `real`, `provisioned`
   or `mocked`. A goal that rests on a mock is `provisional`, never achieved.
 - **Provisioned resources are debts.** When a criterion needs a capability the project lacks, Tecera can
   create a local stand-in (a temporary directory, a bare git remote, a SQLite file, a loopback HTTP stub)
@@ -138,19 +138,21 @@ tecera criteria show|accept|amend <run> [--as <you>]      tecera resources list|
 tecera status | evidence <run> [--export <dir>] | why <event> | gate <goal>
 tecera plans|memory candidates|graduate|reject|retract <id> --rationale <text>
 tecera adapters install|upgrade|doctor <host>        tecera hook pre-tool|stop
+tecera hardened init|enroll [--import <ledger>]|status|abandon <run> --reason <text>
 ```
 
 Exit codes: 0 ok · 1 error · 2 invalid or usage · 3 not ready · 4 held for approval · 5 verify failed ·
 6 review rejected · 7 budget (only when `budgets.enforce` is true) · 8 policy · 9 ledger or human needed ·
 10 provisional (every criterion proven, at least one on a mock) · 130 interrupted.
 
-Approvals are local and unauthenticated. `tecera approve`, `criteria accept` and the other decision
+In single-user mode (the default) approvals are local and unauthenticated. `tecera approve`, `criteria accept` and the other decision
 commands record whoever `--as` names (default `$USER`) as a human principal; there are no tokens and no
 login. The ledger refuses a grant from the requester (the loop) or from a non-human principal, binds each
 grant to one action and consumes it once, but it cannot tell which local process typed the command. The
 decision commands refuse (exit 8) when they run under an agent host (Claude Code, Codex, Tecera's own
 sandbox) or without a terminal; set `TECERA_DECISION_NONINTERACTIVE=1` to decide from a script you control.
-This guard prevents accidents and is not authentication.
+This guard prevents accidents and is not authentication. In hardened mode the same commands also refuse
+(exit 8) unless they run as the operator's uid, read from the process credentials.
 
 ## Configuration
 
@@ -183,6 +185,17 @@ assistant. What is installed differs by host:
 The host adapters are a second layer. Enforcement proper is `tecera run`: sandboxed workers and gates run
 by the harness.
 
+**Hardened mode** (opt-in) separates the person from the assistant at the operating-system level. The
+host assistant runs as its own account; Tecera's ledger, its run registry and a checkpoint of the ledger's
+head live in a directory owned by the operator's account, which the assistant can read but not write; and
+every human decision command checks that it runs as the operator's uid. It is configured by a host file,
+`/etc/tecera/hardened.json`, not by the manifest the assistant can edit. `tecera hardened init` prints the
+setup commands for an administrator (it changes nothing itself), `tecera hardened enroll` creates or imports
+a business case's ledger, and `tecera doctor` reports whether the host meets the preconditions. Checks
+run repository code and never run as the operator in this mode, which today means a root supervisor that
+runs them as another account (`TECERA_VERIFY_UID`). What it does and does not guarantee is in
+[docs/security.md](docs/security.md) (section 4, "Hardened mode").
+
 ## Packages
 
 | Package | Responsibility |
@@ -193,7 +206,7 @@ by the harness.
 | `@tecera/reflex` | The six decision seams as rules, with a router that escalates and records |
 | `@tecera/worker` | Model-written programs in a restricted child process, broker, tools, verify runner |
 | `@tecera/policy` | Permissions, diff boundary, tamper checks, plan validation, mandatory hooks |
-| `@tecera/brain` | Memory tiers over the log; human-only graduation of lessons (no run writes lessons yet) |
+| `@tecera/brain` | Memory tiers over the log; replay admits only valid entries; human-only graduation of lessons |
 | `@tecera/providers` | Anthropic, OpenAI and OpenRouter adapters with usage and cost |
 | `@tecera/planner` | Planner prompt, strict plan schema, validation and repair |
 | `@tecera/gates` | Verify, foreign review, commit and pull-request gates |
@@ -207,36 +220,49 @@ Tecera is research-grade. What follows is the state of the code, not a roadmap.
 
 - **Scope.** Coding is the only implemented kind of work. Only the `process` sandbox profile exists;
   `bwrap` and `docker` are accepted by the manifest and refused at run time.
-- **Live results.** With real models on the bundled benchmark scenarios, 1 of 5 goals has been achieved so
-  far: the simplest one (fix a failing test), delivered through verification, foreign review and a
-  human-approved pull request. The four harder scenarios did not reach their goal in two attempts each;
-  those runs ended without claiming achievement.
-- **The ledger is not a trust anchor against its own user.** An internal review found ways for a host
-  assistant to reach a human decision command, for forged ledger events to make the stop hook allow, and
-  for repository git configuration to influence the pull-request push. Those specific paths are fixed and
-  have adversarial cases. What remains is structural: Tecera, the host assistant and the ledger run as one
-  operating-system user, so the ledger's hash chain shows internal consistency, not who wrote a record. A
-  forged end-of-run event can still hide a run that has no open approval, and a truncated ledger tail is
-  not detected. Treat the host adapters as protection against accidents, not against a determined agent,
-  and read every acceptance contract and pull request yourself.
-- **Approvals are not authenticated.** A decision is a local command and the approver is the name given
-  with `--as`. The decision commands refuse under an agent-host marker or without a terminal, which stops
-  accidents only: any local process that can run `tecera`, allocate a terminal and choose its own
-  environment can approve under any name.
+- **Live results.** With real models on the bundled benchmark scenarios, 1 of 5 goals has been achieved
+  with a delivered pull request: the simplest one (fix a failing test), through verification, foreign
+  review and a human-approved pull request. The four harder scenarios did not reach their goal in two
+  attempts each; those runs ended without claiming achievement, and in five live runs no goal was falsely
+  reported achieved and no policy violation landed. The failures came from what the planner wrote into
+  the acceptance contract (call shapes and expected values that contradicted the repository's own tests,
+  a change-path list that left out the file the request was about) and from worker edits that deleted
+  existing code or did not parse. Screens and edit checks for those causes were added after the last
+  live run and have not yet been measured live.
+- **In the default single-user mode the ledger is not a trust anchor against its own user.** An internal
+  review found ways for a host assistant to reach a human decision command, for forged ledger events to make
+  the stop hook allow, and for repository git configuration to influence the pull-request push. Those
+  specific paths are fixed and have adversarial cases. What remains is structural: Tecera, the host
+  assistant and the ledger run as one operating-system user, so the ledger's hash chain shows internal
+  consistency, not who wrote a record. A forged end-of-run event can still hide a run that has no open
+  approval, and a truncated ledger tail is not detected. Treat the host adapters as protection against
+  accidents, not against a determined agent, and read every acceptance contract and pull request yourself.
+  Hardened mode (see Configuration) closes these three for an assistant that runs as a separate account;
+  it does not hold against root, against anything that can run code as the operator, or against an
+  assistant that can remove the host's Stop hook, and it does not say which person used the operator
+  account.
+- **In single-user mode approvals are not authenticated.** A decision is a local command and the approver
+  is the name given with `--as`. The decision commands refuse under an agent-host marker or without a
+  terminal, which stops accidents only: any local process that can run `tecera`, allocate a terminal and
+  choose its own environment can approve under any name. In hardened mode a decision needs the operator's
+  uid; `--as` remains a label.
 - **Codex gets no hooks** (see Configuration).
 - **The benchmark is not yet a measurement.** Its pass rules are being tightened: at present a scenario
   can pass its rule without the delivered work being complete. Do not read its scorecard, including its
   control and compliance figures, as evidence of what works.
-- **Learning is not wired.** Generated plans are staged after an achieved goal and can be graduated by a
-  human. Lessons have the same lifecycle in `@tecera/brain`, but no run writes episodes or stages lessons,
-  so `tecera memory candidates` stays empty and workers receive no learned context.
+- **Learning is modest.** Every run records one short episode per step completion, step failure and run
+  outcome, and stages a candidate lesson when a failed step is followed by a passing verification. Both are
+  deterministic summaries of the ledger, not generalizations. A lesson is used only after a human graduates
+  it (`tecera memory graduate`), and workers receive lessons and episodes as untrusted data. A graduation is
+  recorded under the local `--as` name, which is not authenticated.
 - **HTTP stub provisioning.** A provisioned loopback HTTP stub is served to workers as a brokered tool, but
   a criterion's check runs in a network namespace of its own and cannot reach it. A criterion that needs
   the stub fails verification.
-- **The change-path envelope controls paths, not content.** When a contract states one, a file outside it
-  cannot be written, deleted or committed, whatever a reviewer says. It does not detect unrequested
-  behaviour inside a file the envelope allows, and a contract without an envelope (the default) leaves
-  `repo.allowedChanges` as the only path boundary: an extra file inside it is then stopped by review alone.
+- **The change-path envelope controls paths, not content.** A file outside the accepted envelope cannot be
+  written, deleted or committed, whatever a reviewer says. Every contract the planner drafts for a free-text
+  request carries one. It does not detect unrequested behaviour inside a file the envelope allows. A goal
+  file that states criteria but no envelope leaves `repo.allowedChanges` as the only path boundary: an extra
+  file inside it is then stopped by review alone.
 - **Degraded hosts.** With `sandbox.isolation: "node"` (the shipped sample) the worker child runs with
   Node's permission model and whatever OS controls the host offers; the missing ones are recorded as
   `isolation.degraded`. A non-root supervisor runs checks under its own uid.
