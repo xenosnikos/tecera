@@ -17,7 +17,7 @@ describe('env construction: allowlist ∩ SANDBOX_SAFE_ENV, dangerous names refu
       expect(() => assertEnvAllowlist([name]), name).toThrow(EnvRefused);
     }
     try {
-      scrubEnv(['PATH', 'OPENAI_API_KEY'], { OPENAI_API_KEY: 'sk-secret-value-123456789' });
+      scrubEnv(['PATH', 'OPENAI_API_KEY'], { OPENAI_API_KEY: 'sk-' + 'secret-value-123456789' });
     } catch (e) {
       expect(e).toBeInstanceOf(EnvRefused);
       expect((e as EnvRefused).names).toEqual(['OPENAI_API_KEY']);

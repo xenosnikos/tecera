@@ -22,7 +22,7 @@ const caps = (): CapabilitySet => ({
   limits: { usd: 1, tokens: 1000, calls: 10, wallMs: 1000, depth: 2, iterations: 5 },
 });
 const req = (...args: Json[]): ToolRequest => ({ callId: 'c1', tool: 't', method: 'call', args, idemKey: 'k' });
-const ORIGINAL = 'export const f = 1;\n';
+const ORIGINAL = 'const f = 1;\n';
 
 let root: string;
 let outside: string;
@@ -32,7 +32,7 @@ beforeEach(async () => {
   outside = await mkdtemp(join(tmpdir(), 'tecera-fence-out-'));
   await mkdir(join(root, 'src/d'), { recursive: true });
   await mkdir(join(root, 'test'), { recursive: true });
-  await writeFile(join(root, 'src/a.ts'), 'export const a = 1;\n');
+  await writeFile(join(root, 'src/a.ts'), 'const a = 1;\n');
   await writeFile(join(root, 'src/d/f.ts'), ORIGINAL);
   ctx = { runId: 'r1', worktree: root, capabilities: caps(), fencingToken: 7 };
 });
@@ -48,7 +48,7 @@ describe('the write guard is required and checked at every mutation (contracts W
     const r = await createEditTool().call(req('src/a.ts', 'x'), ctx);
     expect(r.ok).toBe(false);
     expect(r.error?.message).toMatch(/fence lost: no write guard/);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
     let ran = false;
     const v = await createRunVerifyTool({ runner: { run: async () => ((ran = true), { exitCode: 0, signal: null, timedOut: false, stdout: '', stderr: '', durationMs: 1, truncated: false }) }, command: 'node --test', timeoutSec: 5 }).call(req(), ctx);
     expect(v.ok).toBe(false);
@@ -69,11 +69,11 @@ describe('the write guard is required and checked at every mutation (contracts W
     it(`a fence lost ${stage}: FenceLost, nothing written, no temp file left`, async () => {
       const g = new FakeWriteGuard();
       const edit = createEditTool({ [seam]: async () => g.revoke('lease taken over') });
-      const r = await edit.call(req('src/a.ts', 'after revocation'), ctx, g.guard);
+      const r = await edit.call(req('src/a.ts', '// after revocation'), ctx, g.guard);
       expect(r.ok).toBe(false);
       expect(r.error?.name).toBe('FenceLost');
       expect(r.error?.message).toMatch(/lease taken over/);
-      expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+      expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
       expect(await strays(join(root, 'src'))).toEqual([]);
     });
   }
@@ -81,11 +81,11 @@ describe('the write guard is required and checked at every mutation (contracts W
   it('a fence lost inside the synchronous commit window (beforeCommit, after the pre-commit verification): FenceLost, the target and a new file stay untouched', async () => {
     const g = new FakeWriteGuard();
     const edit = createEditTool({ beforeCommit: () => g.revoke('lease taken over in the commit window') });
-    const r = await edit.call(req('src/a.ts', 'after revocation'), ctx, g.guard);
+    const r = await edit.call(req('src/a.ts', '// after revocation'), ctx, g.guard);
     expect(r.ok).toBe(false);
     expect(r.error?.name).toBe('FenceLost');
     expect(r.error?.message).toMatch(/lease taken over in the commit window/);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
     expect(await strays(join(root, 'src'))).toEqual([]);
 
     const g2 = new FakeWriteGuard();
@@ -99,12 +99,12 @@ describe('the write guard is required and checked at every mutation (contracts W
   it('D6: with the loop guard (always allowed after the fence) every write proceeds without a hold, each authorized with its exact bytes', async () => {
     const g = new FakeWriteGuard();
     expect((await createEditTool().call(req('src/a.ts', 'one'), ctx, g.guard)).ok).toBe(true);
-    expect((await createEditTool().call(req('src/n/m/x.ts', 'new'), ctx, g.guard)).ok).toBe(true);
+    expect((await createEditTool().call(req('src/n/m/x.ts', 'fresh'), ctx, g.guard)).ok).toBe(true);
     expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('one');
-    expect(await readFile(join(root, 'src/n/m/x.ts'), 'utf8')).toBe('new');
+    expect(await readFile(join(root, 'src/n/m/x.ts'), 'utf8')).toBe('fresh');
     expect(g.authorized).toEqual([
       { path: 'src/a.ts', contentDigest: sha256('one') },
-      { path: 'src/n/m/x.ts', contentDigest: sha256('new') },
+      { path: 'src/n/m/x.ts', contentDigest: sha256('fresh') },
     ]);
   });
 
@@ -116,14 +116,14 @@ describe('the write guard is required and checked at every mutation (contracts W
   ] as const satisfies ReadonlyArray<readonly [string, (w: { path: string; contentDigest: string }) => WriteAuthorization]>) {
     it(`D6: a guard answering ${label} (per-write approvals were removed) refuses the write: WriteRefused, nothing written, no directory created`, async () => {
       const g = new FakeWriteGuard({ answer });
-      const r = await createEditTool().call(req('src/n/m/x.ts', 'new'), ctx, g.guard);
+      const r = await createEditTool().call(req('src/n/m/x.ts', 'fresh'), ctx, g.guard);
       expect(r.ok).toBe(false);
       expect(r.error?.name).toBe('WriteRefused');
       await expect(stat(join(root, 'src/n'))).rejects.toThrow();
-      expect(g.authorized).toEqual([{ path: 'src/n/m/x.ts', contentDigest: sha256('new') }]);
+      expect(g.authorized).toEqual([{ path: 'src/n/m/x.ts', contentDigest: sha256('fresh') }]);
       const old = await createEditTool().call(req('src/a.ts', 'over'), ctx, g.guard);
       expect(old.error?.name).toBe('WriteRefused');
-      expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+      expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
       expect(await strays(join(root, 'src'))).toEqual([]);
     });
   }
@@ -151,7 +151,7 @@ describe('the write guard is required and checked at every mutation (contracts W
 
   it('writeInWorktree refuses without a guard even when called directly', async () => {
     await expect(writeInWorktree(root, 'src/a.ts', () => 'x', { maxBytes: 100, mode: 'write', authorize: () => undefined })).rejects.toBeInstanceOf(FenceLost);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
   });
 });
 
@@ -170,7 +170,7 @@ describe.skipIf(!fdVerificationSupported())('external rename race inside the com
   it('a directory relocated into a protected path INSIDE the synchronous commit window: rolled back, the protected destination keeps its original content, the worktree is quarantined', async () => {
     const g = new FakeWriteGuard();
     const edit = createEditTool({ beforeCommit: () => renameSync(join(root, 'src/d'), join(root, 'test/d')) });
-    const r = await edit.call(req('src/d/f.ts', 'landed elsewhere'), ctx, g.guard);
+    const r = await edit.call(req('src/d/f.ts', '// landed elsewhere'), ctx, g.guard);
     expect(r.ok).toBe(false);
     expect(r.error?.name).toBe('TaintError');
     expect(r.error?.message).toMatch(/rolled back/);

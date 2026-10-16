@@ -362,6 +362,9 @@ export interface WriteOptions {
   assumeNoProcFd?: boolean;
 }
 
+/** Computes the new content of a write from the current one (see writeInWorktree). */
+export type WriteContent = (current: string | null, rel: string) => string | Promise<string>;
+
 export interface WriteResult {
   rel: string;
   created: boolean;
@@ -372,13 +375,14 @@ export interface WriteResult {
 }
 
 /**
- * Write a file inside the worktree. `next(current)` gets the current UTF-8 content (null for a new file)
- * and returns the new content; the content it sees comes from the verified descriptor of the authorized
+ * Write a file inside the worktree. `next(current, rel)` gets the current UTF-8 content (null for a new file)
+ * and the resolved worktree-relative path, and returns (or resolves to) the new content; throwing from it
+ * refuses the write before anything is created; the content it sees comes from the verified descriptor of the authorized
  * inode. Holds the worktree lock throughout. Throws PathError (refused, nothing changed), FenceLost /
  * WriteRefused from the guard (refused, nothing changed) or TaintError (the commit could not be verified:
  * it was rolled back where possible and the worktree is quarantined).
  */
-export async function writeInWorktree(worktree: string, input: unknown, next: (current: string | null) => string, o: WriteOptions): Promise<WriteResult> {
+export async function writeInWorktree(worktree: string, input: unknown, next: WriteContent, o: WriteOptions): Promise<WriteResult> {
   const guard = requireWriteGuard(o.guard);
   const root = await rootOf(worktree);
   if (!PROC_FD || o.assumeNoProcFd) throw new PathError('writes are refused on this platform: descriptor paths (/proc/self/fd) cannot be verified, and there is no path-based fallback');
@@ -396,8 +400,8 @@ export async function writeInWorktree(worktree: string, input: unknown, next: (c
 }
 
 /** The content to write, checked against the size cap and authorized (authorizeWrite) before any mutation. */
-async function prepare(r: Resolved, current: string | null, next: (current: string | null) => string, o: WriteOptions): Promise<{ content: string; buf: Buffer; contentDigest: string }> {
-  const content = next(current);
+async function prepare(r: Resolved, current: string | null, next: WriteContent, o: WriteOptions): Promise<{ content: string; buf: Buffer; contentDigest: string }> {
+  const content = await next(current, r.rel);
   if (typeof content !== 'string') throw new PathError('the new content must be a string');
   const buf = Buffer.from(content, 'utf8');
   if (buf.length > o.maxBytes) throw new PathError(`content too large (${buf.length} > ${o.maxBytes} bytes)`);
@@ -406,7 +410,7 @@ async function prepare(r: Resolved, current: string | null, next: (current: stri
   return { content, buf, contentDigest };
 }
 
-async function writeViaFds(root: string, r: Resolved, next: (current: string | null) => string, o: WriteOptions, guard: WriteGuard): Promise<WriteResult> {
+async function writeViaFds(root: string, r: Resolved, next: WriteContent, o: WriteOptions, guard: WriteGuard): Promise<WriteResult> {
   const ids = r.identity;
   if (!ids || ids.dirs.length === 0) throw new PathError('write was not authorized with identities; refused');
   const segs = r.rel.split('/');

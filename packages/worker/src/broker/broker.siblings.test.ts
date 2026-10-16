@@ -167,7 +167,7 @@ describe('tree-wide quarantine of already-open brokers', () => {
     const child = parent.child(caps());
     const pb = parent.beginExec(session(1, 'inv_s'));
     const cb = child.beginExec(session(2, 'inv_s/e1c1'));
-    const writing = call(child.bridge, cb.writeFile, ['src/a.ts', 'written after the quarantine']);
+    const writing = call(child.bridge, cb.writeFile, ['src/a.ts', '// written after the quarantine']);
     await atData.p; // the temp file exists; the data write is next
     await quarantineParent(parent, pb, started.p);
     goOn.resolve();

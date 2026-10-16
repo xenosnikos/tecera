@@ -44,7 +44,7 @@ let root: string;
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'tecera-wave4-'));
   await mkdir(join(root, 'src'), { recursive: true });
-  await writeFile(join(root, 'src/a.ts'), 'export const a = 1;\n');
+  await writeFile(join(root, 'src/a.ts'), 'const a = 1;\n');
   await writeFile(join(root, 'src/private.txt'), PRIVATE);
 });
 afterEach(async () => rm(root, { recursive: true, force: true }));
@@ -213,7 +213,7 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
     const llm = new FakeLLM([js(`let m = ''; try { await writeFile('src/a.ts', 'late'); } catch (e) { m = e.message; }\nreturn { summary: m };`)]);
     const out = await mk(ledger, llm).run(request(guard));
     expect(out.kind).not.toBe('suspended');
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
     expect(ledger.approvals.size).toBe(0);
   });
 
@@ -224,7 +224,7 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
     const out = await mk(ledger, llm).run(request(guard));
     expect(out).toMatchObject({ kind: 'returned', value: { summary: expect.stringMatching(/per-write approvals were removed/) } });
     expect(ledger.approvals.size).toBe(0);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
   });
 
   it('a held step whose checkpoint names a write (an older per-write hold) is never resumed and its grant is not consumed', async () => {
@@ -241,7 +241,7 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
     const out = await resume(first.resumeToken, grant, deps(ledger, { llm, hooks: [notifyGate], broker: new Broker({ tools: [createReadTool(), createEditTool(), notifyTool()], runId: 'run_4', worktree: root, capabilities: capsN, fencingToken: 2, guard: liveWriteGuard() }), capabilities: capsN }));
     expect(out).toMatchObject({ kind: 'aborted', reasons: [{ code: 'policy', reason: expect.stringMatching(/per-write approvals were removed/) }] });
     expect(ledger.consumed).toEqual([]);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
   });
 
   it('a turn-level Suspend that names a write is never recorded: aborted (policy), no checkpoint, no approval request', async () => {
@@ -261,7 +261,7 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
     const first = await invoke(goal, opts(llm, { hooks: [notifyGate], ledger, broker: mkBroker(capsN, [createReadTool(), createEditTool(), t1]), capabilities: capsN }));
     if (first.kind !== 'suspended') throw new Error('expected suspended');
     expect(t1.ran).toBe(0);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
     const grant = await ledger.grantAudited(first.request.requestId, human, 'local', Date.now());
     const t2 = notifyTool();
     const done = await resume(first.resumeToken, grant, deps(ledger, { llm, hooks: [notifyGate], broker: mkBroker(capsN, [createReadTool(), createEditTool(), t2]), capabilities: capsN }));
@@ -299,7 +299,7 @@ describe('durable quarantine: a worktree quarantined by an earlier process is re
     const grant = await ledger.grantAudited(first.request.requestId, human, 'sess', Date.now());
     const out = await held.resume(first.resumeToken, grant, undefined, new FakeWriteGuard().guard);
     expect(isTainted(out)).toBe(true);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
     expect(ledger.consumed).toEqual([]); // refused before the grant was touched
   });
 

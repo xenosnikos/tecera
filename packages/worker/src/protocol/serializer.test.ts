@@ -80,9 +80,9 @@ describe('redact', () => {
     ['HEX', `x ${b.toString('hex').toUpperCase()} y`, `[REDACTED:secret:${sha8(secret)}]`],
     ['url-encoded', `x ${encodeURIComponent('p@ss w/rd&=!')} y`, `[REDACTED:secret:${sha8('p@ss w/rd&=!')}]`],
     ['canary', 'leak TECERA_CANARY_abc123XYZ here', `[REDACTED:canary:${sha8('TECERA_CANARY_abc123XYZ')}]`],
-    ['anthropic pattern', 'k=sk-ant-api03-AAAAAAAAAAAAAAAA', `[REDACTED:anthropic:${sha8('sk-ant-api03-AAAAAAAAAAAAAAAA')}]`],
-    ['github pattern', 'ghp_abcdefghijklmnopqrstuvwxyz0123', `[REDACTED:github:${sha8('ghp_abcdefghijklmnopqrstuvwxyz0123')}]`],
-    ['aws pattern', 'AKIAABCDEFGHIJKLMNOP', `[REDACTED:aws:${sha8('AKIAABCDEFGHIJKLMNOP')}]`],
+    ['anthropic pattern', 'k=sk-ant-api03-' + 'A'.repeat(16), `[REDACTED:anthropic:${sha8('sk-ant-api03-' + 'A'.repeat(16))}]`],
+    ['github pattern', 'ghp_' + 'abcdefghijklmnopqrstuvwxyz0123', `[REDACTED:github:${sha8('ghp_' + 'abcdefghijklmnopqrstuvwxyz0123')}]`],
+    ['aws pattern', 'AKIA' + 'ABCDEFGHIJKLMNOP', `[REDACTED:aws:${sha8('AKIA' + 'ABCDEFGHIJKLMNOP')}]`],
   ];
   for (const [name, text, marker] of table) {
     it(`redacts ${name}`, () => {

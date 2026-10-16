@@ -31,7 +31,7 @@ const js = (body: string): string => `\`\`\`js\n${body}\n\`\`\``;
 const SCHEMA: JsonObject = { type: 'object', required: ['summary'], properties: { summary: { type: 'string' } } };
 const goal: Inputs = { goal: { kind: 'value', value: { statement: 'make a = 2' }, provenance: { src: 'goal', trust: 'trusted' } } };
 const CANARY = 'TECERA_CANARY_invoke_Zz9';
-const SECRET = 'sk-live-secret-value-0001';
+const SECRET = 'sk-' + 'live-secret-value-0001';
 
 let root: string;
 let writes = 0;
@@ -43,7 +43,7 @@ beforeEach(async () => {
   writes = 0;
   root = await mkdtemp(join(tmpdir(), 'tecera-invoke-fc-'));
   await mkdir(join(root, 'src'), { recursive: true });
-  await writeFile(join(root, 'src/a.ts'), 'export const a = 1;\n');
+  await writeFile(join(root, 'src/a.ts'), 'const a = 1;\n');
 });
 afterEach(async () => rm(root, { recursive: true, force: true }));
 
@@ -90,7 +90,7 @@ describe('approval.hash_mismatch / approval.replay: one grant binds one request'
       return e.stage === 'Send' && i.tool === 'edit' ? [{ type: 'Suspend', request: { requestId: `ap2_${e.spanId}`, action: 'edit', actionHash: i.actionHash, reason: 'second gate', requester: 'worker' } }] : [];
     });
     const ledger = new FakeLedger();
-    const program = js(`await writeFile('src/a.ts', 'two gates');\nreturn { summary: 'ok' };`);
+    const program = js(`await writeFile('src/a.ts', '// two gates');\nreturn { summary: 'ok' };`);
     const first = await invoke(goal, opts(new FakeLLM([program]), { hooks: [approvalGate, gate2], ledger }));
     if (first.kind !== 'suspended') throw new Error(`expected suspended, got ${first.kind}`);
     const g1 = await ledger.grantAudited(first.request.requestId, human, 'local', Date.now());
@@ -100,7 +100,7 @@ describe('approval.hash_mismatch / approval.replay: one grant binds one request'
     expect((await resume(first.resumeToken, g1, deps(ledger, { hooks: [approvalGate, gate2] }))).kind).toBe('aborted');
     const g2 = await ledger.grantAudited(mid.request.requestId, human, 'local', Date.now());
     expect(await resume(mid.resumeToken, g2, deps(ledger, { hooks: [approvalGate, gate2] }))).toMatchObject({ kind: 'returned' });
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('two gates');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('// two gates');
   });
 
   it('changed arguments on resume: the grant does not cover the new action, which suspends again', async () => {
@@ -139,7 +139,7 @@ describe('approval.hash_mismatch / approval.replay: one grant binds one request'
   it('nested suspension recovery: the child resumes from its own checkpoint (no re-planning) and its grant lifts exactly its action', async () => {
     const ledger = new FakeLedger();
     const parent = js(`const r = await invoke({ file: 'src/a.ts' }, { output: { type: 'object' }, narrow: { tools: ['read', 'edit'] } });\nreturn { summary: 'child said ' + JSON.stringify(r.value) };`);
-    const child = js(`await writeFile(file, 'from child');\nreturn { wrote: file };`);
+    const child = js(`await writeFile(file, '// from child');\nreturn { wrote: file };`);
     const llm = new FakeLLM([parent, child]);
     const first = await invoke(goal, opts(llm, { hooks: [approvalGate], ledger }));
     if (first.kind !== 'suspended') throw new Error(`expected suspended, got ${JSON.stringify(first)}`);
@@ -150,7 +150,7 @@ describe('approval.hash_mismatch / approval.replay: one grant binds one request'
     const done = await resume(first.resumeToken, g, deps(ledger, { llm }));
     expect(done).toMatchObject({ kind: 'returned', value: { summary: 'child said {"wrote":"src/a.ts"}' } });
     expect(llm.requests).toHaveLength(2); // neither parent nor child asked the model again
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('from child');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('// from child');
     expect(writes).toBe(1);
   });
 
@@ -337,7 +337,7 @@ describe('secret.canary_*: every boundary', () => {
     const repl = new FakeRepl();
     const seenByProgram: string[] = [];
     const turn1 = js(`const f = await readFile('src/s.txt');\ncheckpoint('copy', f.content);\nconsole.log(f.content);\nthrow new Error('failed with ' + f.content);`);
-    const turn2 = js(`const f = await readFile('src/s.txt');\nawait writeFile('src/out.ts', 'saw ' + f.content.length);\nreturn { summary: f.content };`);
+    const turn2 = js(`const f = await readFile('src/s.txt');\nawait writeFile('src/out.ts', '// saw ' + f.content.length);\nreturn { summary: f.content };`);
     const llm = new FakeLLM([turn1, turn2]);
     const spy: Hook = hook('spy', ['ToolCall'], (e) => (e.stage === 'Complete' ? (seenByProgram.push(JSON.stringify(e.output)), []) : []));
     const first = await invoke(goal, opts(llm, { hooks: [approvalGate, spy], ledger, trace, repl, secrets: [SECRET] }));

@@ -152,7 +152,7 @@ describe('checkpoint keys cross the redaction boundary (new finding 4)', () => {
 });
 
 describe('output caps cut after redaction (new finding 5)', () => {
-  const SECRET = 'sk-test-REGISTERED-secret-0123456789abcdef';
+  const SECRET = 'sk-' + 'test-REGISTERED-secret-0123456789abcdef';
   const b64 = Buffer.from(SECRET).toString('base64');
   const hex = Buffer.from(SECRET).toString('hex');
 

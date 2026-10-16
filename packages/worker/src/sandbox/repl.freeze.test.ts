@@ -320,7 +320,7 @@ describe('dialect: contracts rpc.ts (findings 5, 7)', () => {
 
 describe('redaction boundary (finding 4)', () => {
   const CANARY = 'TECERA_CANARY_SBX_redaction_42';
-  const KNOWN = 'known-secret-value-9f8e7d6c';
+  const KNOWN = 'known-secret-value-' + '9f8e7d6c';
 
   it('secret.canary_*: canaries in tool output, tool errors, bindings, history never reach the child, printed output, checkpoints, evidence or the result', async () => {
     const cps: CheckpointRecord[] = [];

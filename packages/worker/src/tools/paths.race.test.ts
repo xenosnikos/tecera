@@ -39,8 +39,8 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'tecera-race-'));
   await mkdir(join(root, 'src/d'), { recursive: true });
   await mkdir(join(root, 'test'), { recursive: true });
-  await writeFile(join(root, 'src/a.ts'), 'export const a = 1;\n');
-  await writeFile(join(root, 'src/d/f.ts'), 'export const f = 1;\n');
+  await writeFile(join(root, 'src/a.ts'), 'const a = 1;\n');
+  await writeFile(join(root, 'src/d/f.ts'), 'const f = 1;\n');
   await writeFile(join(root, 'test/p.test.ts'), PROTECTED);
   ctx = { runId: 'r1', worktree: root, capabilities: caps(), fencingToken: 7 };
 });
@@ -52,7 +52,7 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
     const r = await racing.call(req({ path: 'src/a.ts', oldText: 'a = 1', newText: 'a = 2' }), ctx);
     expect(r.ok).toBe(false);
     expect(r.error?.message).toMatch(/moved|vanished|refused/);
-    expect(await readFile(join(root, 'test/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'test/a.ts'), 'utf8')).toBe('const a = 1;\n');
     await expect(stat(join(root, 'src/a.ts'))).rejects.toThrow();
     expect(worktreeTaint(root)).toBeNull();
   });
@@ -62,17 +62,17 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
     const r = await racing.call(req('src/a.ts', 'pwned'), ctx);
     expect(r.ok).toBe(false);
     expect(r.error?.message).toMatch(/hardlink/);
-    expect(await readFile(join(root, 'test/hl.test.ts'), 'utf8')).toBe('export const a = 1;\n');
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'test/hl.test.ts'), 'utf8')).toBe('const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
   });
 
   it('a hardlink added inside the synchronous commit window is refused before the first mutation: neither name changes', async () => {
     const racing = createEditTool({ beforeCommit: () => linkSync(join(root, 'src/a.ts'), join(root, 'test/late.test.ts')) });
-    const r = await racing.call(req('src/a.ts', 'new content'), ctx);
+    const r = await racing.call(req('src/a.ts', '// new content'), ctx);
     expect(r.ok).toBe(false);
     expect(r.error?.message).toMatch(/hardlinked file \(nlink=2, a link was added during the write\)/);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
-    expect(await readFile(join(root, 'test/late.test.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
+    expect(await readFile(join(root, 'test/late.test.ts'), 'utf8')).toBe('const a = 1;\n');
     const { readdir } = await import('node:fs/promises');
     expect((await readdir(join(root, 'src'))).filter((n) => n.startsWith('.tecera-'))).toEqual([]);
     expect(worktreeTaint(root)).toBeNull();
@@ -99,7 +99,7 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
     expect(r.ok).toBe(false);
     expect(r.error?.message).toMatch(/inode changed|replaced/);
     expect(await readFile(join(root, 'src/d/f.ts'), 'utf8')).toBe('decoy');
-    expect(await readFile(join(root, 'src/d.old/f.ts'), 'utf8')).toBe('export const f = 1;\n');
+    expect(await readFile(join(root, 'src/d.old/f.ts'), 'utf8')).toBe('const f = 1;\n');
   });
 
   it('the parent directory moved into a protected location after the descriptors were verified: refused before commit', async () => {
@@ -107,7 +107,7 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
     const r = await racing.call(req('src/d/f.ts', 'pwned'), ctx);
     expect(r.ok).toBe(false);
     expect(r.error?.message).toMatch(/refused before commit|moved/);
-    expect(await readFile(join(root, 'test/d/f.ts'), 'utf8')).toBe('export const f = 1;\n');
+    expect(await readFile(join(root, 'test/d/f.ts'), 'utf8')).toBe('const f = 1;\n');
     expect(worktreeTaint(root)).toBeNull();
   });
 
@@ -121,12 +121,12 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
 
   it('a move inside the synchronous commit window is detected after the commit: TaintError, the worktree is quarantined and every later tool refuses', async () => {
     const racing = createEditTool({ beforeCommit: () => renameSync(join(root, 'src/d'), join(root, 'test/d')) });
-    const r = await racing.call(req('src/d/f.ts', 'landed elsewhere'), ctx);
+    const r = await racing.call(req('src/d/f.ts', '// landed elsewhere'), ctx);
     expect(r.ok).toBe(false);
     expect(r.error?.name).toBe('TaintError');
     expect(worktreeTaint(root)).toMatch(/post-commit verification failed/);
     // the commit was rolled back in the moved directory: the protected destination keeps its original bytes
-    expect(await readFile(join(root, 'test/d/f.ts'), 'utf8')).toBe('export const f = 1;\n');
+    expect(await readFile(join(root, 'test/d/f.ts'), 'utf8')).toBe('const f = 1;\n');
     // quarantine: no later read, write, listing or verification on this worktree
     expect((await createReadTool().call(req('src/a.ts'), ctx)).error?.message).toMatch(/quarantined/);
     expect((await createEditTool().call(req('src/a.ts', 'x'), ctx)).error?.message).toMatch(/quarantined/);
@@ -135,7 +135,7 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
     const runner: VerifyRunner = { run: async () => ((ran = true), { exitCode: 0, signal: null, timedOut: false, stdout: '', stderr: '', durationMs: 1, truncated: false }) };
     expect((await createRunVerifyTool({ runner, command: 'node --test', timeoutSec: 5 }).call(req(), ctx)).error?.message).toMatch(/quarantined/);
     expect(ran).toBe(false);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
   });
 
   it('a write cancelled through the exec signal changes nothing', async () => {
@@ -144,18 +144,18 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
     const r = await cancelling.call(req('src/a.ts', 'cancelled'), { ...ctx, signal: ac.signal } as WorkerToolContext);
     expect(r.ok).toBe(false);
     expect(r.error?.message).toMatch(/cancelled/);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
   });
 
   it('a write cancelled inside the synchronous commit window (after the pre-commit verification) changes nothing', async () => {
     for (const path of ['src/a.ts', 'src/d/new.ts']) {
       const ac = new AbortController();
       const cancelling = createEditTool({ beforeCommit: () => ac.abort() });
-      const r = await cancelling.call(req(path, 'cancelled late'), { ...ctx, signal: ac.signal } as WorkerToolContext);
+      const r = await cancelling.call(req(path, '// cancelled late'), { ...ctx, signal: ac.signal } as WorkerToolContext);
       expect(r.ok, path).toBe(false);
       expect(r.error?.message, path).toMatch(/write cancelled before commit/);
     }
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
     await expect(stat(join(root, 'src/d/new.ts'))).rejects.toThrow();
     const { readdir } = await import('node:fs/promises');
     expect((await readdir(join(root, 'src'))).filter((n) => n.startsWith('.tecera-'))).toEqual([]);
@@ -179,7 +179,7 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
       edit.call(req({ path: 'src/a.ts', oldText: 'a = 2', newText: 'a = 3' }), ctx),
     ]);
     expect(results.map((r) => r.ok)).toEqual([true, true]);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 3;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 3;\n');
   });
 
   it('a verification run holds the worktree lock: an edit issued during it waits until it ends', async () => {
@@ -197,7 +197,7 @@ describe.skipIf(!fdVerificationSupported())('writes after descriptor validation 
     const verify = createRunVerifyTool({ runner, command: 'node --test', timeoutSec: 5 }).call(req(), ctx);
     await new Promise((r) => setTimeout(r, 10));
     const editing = createEditTool()
-      .call(req('src/a.ts', 'after verify'), ctx)
+      .call(req('src/a.ts', '// after verify'), ctx)
       .then((r) => (order.push('edit'), r));
     await new Promise((r) => setTimeout(r, 20));
     expect(order).toEqual(['verify:start']);
@@ -212,7 +212,7 @@ describe('unsupported platforms and hardlinked reads', () => {
     const r = await createEditTool({ assumeNoProcFd: true }).call(req('src/a.ts', 'x'), ctx);
     expect(r.ok).toBe(false);
     expect(r.error?.message).toMatch(/refused on this platform/);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
   });
 
   it('a hardlinked file is never read (it may alias a file outside the worktree)', async () => {
