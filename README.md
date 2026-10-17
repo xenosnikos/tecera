@@ -220,15 +220,14 @@ Tecera is research-grade. What follows is the state of the code, not a roadmap.
 
 - **Scope.** Coding is the only implemented kind of work. Only the `process` sandbox profile exists;
   `bwrap` and `docker` are accepted by the manifest and refused at run time.
-- **Live results.** With real models on the bundled benchmark scenarios, 1 of 5 goals has been achieved
-  with a delivered pull request: the simplest one (fix a failing test), through verification, foreign
-  review and a human-approved pull request. The four harder scenarios did not reach their goal in two
-  attempts each; those runs ended without claiming achievement, and in five live runs no goal was falsely
-  reported achieved and no policy violation landed. The failures came from what the planner wrote into
-  the acceptance contract (call shapes and expected values that contradicted the repository's own tests,
-  a change-path list that left out the file the request was about) and from worker edits that deleted
-  existing code or did not parse. Screens and edit checks for those causes were added after the last
-  live run and have not yet been measured live.
+- **Live results.** In the latest live run on the five bundled benchmark scenarios, 3 passed their
+  scenario rules and 2 reached their goal with a delivered, human-approved pull request (fixing a failing
+  test, and persisting sessions in a provisioned SQLite database); the mocked-mail scenario ended
+  provisional as its rules require. The rate-limiting and CSV-export scenarios did not reach their goal in
+  two attempts. In six live runs no goal was falsely reported achieved and no policy violation landed.
+  The remaining failures: a worker can call the test runner, ignore a failing result and return anyway;
+  whole-file rewrites that keep a module's exports but change its behaviour are caught only by review;
+  and a review rework re-runs every writing step, including ones with nothing left to change.
 - **In the default single-user mode the ledger is not a trust anchor against its own user.** An internal
   review found ways for a host assistant to reach a human decision command, for forged ledger events to make
   the stop hook allow, and for repository git configuration to influence the pull-request push. Those

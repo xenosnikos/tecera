@@ -203,8 +203,8 @@ The runner drives the real CLI, scripted or with live models, and performs the d
 scorer works from the ledger and the delivered repository. It is meant to report human touches per job
 (autonomy), false achievements and landed violations (control), and the share of actions traceable to a
 step, intention, goal and approval (compliance). The scripted benchmark passes all ten scenarios' rules;
-with live models, 1 of 5 goals has been achieved with a delivered pull request so far, and no live run has
-falsely reported achievement or landed a violation.
+in the latest live run 3 of 5 scenarios passed their rules and 2 of 5 goals were achieved with a delivered
+pull request, and no live run has falsely reported achievement or landed a violation.
 
 ## Package dependencies
 
