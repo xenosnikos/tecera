@@ -144,7 +144,25 @@ the PR opens marked provisional, the run exits 10, and the Stop hook keeps block
 ## The worker
 
 A worker step that may edit files is always given `runVerify` as well (when the host wires it), so it can
-run the tests before it returns. A worker step is an invoke loop (ported from JAZ): the model writes a short program, the program runs in a
+run the tests before it returns. The last writing step before a verify gate must: the broker records every
+edit and every `runVerify` result as the tools reported them, and a program that returns while the step has
+changed files and no check has passed since its last edit is refused and given the reason and another turn
+(at most three times; the next return goes to the gate, and every decision is `worker.return` evidence).
+A pass is bound to the fingerprint of the tree the check ran on: a check that rewrote the tree did not
+pass, and a tree changed afterwards (while the step was suspended included) needs the check again. An
+earlier writer of a multi-writer plan, which cannot see the check pass yet, is not held to it; the writers
+that could be last before one gate run one at a time, in plan order, so the last one is always known. Every
+writing step also carries a keep-list (`inputs.keep`): the exports, call shapes, asserted values and
+documented interfaces of the files it changes that must stay as they are, the planner's own entries plus
+what the host read from the repository (bounded: 40 entries, at most 12 the planner's own, room kept for
+the asserted values; what is left out is reported as `inputs.keepDropped`). The edit tool refuses content
+that does not parse, an edit that removes a top-level name of an existing module (an export, or a
+module-level binding, function or class) or stops exporting one unless the request declares it with
+`removeNames`, and any edit of an existing file the step has not read in this invocation or whose content
+changed since. A review rejection whose findings all name paths re-runs only the writers whose declared
+changes cover them, chosen among every editing writer upstream of the review; a done writer the findings do
+not name is retained, so it is never refused for returning without a change, and a gate waits for every
+step upstream of it, not only its direct dependencies. A worker step is an invoke loop (ported from JAZ): the model writes a short program, the program runs in a
 fresh restricted Node child process, and the loop continues until the program returns a value that
 satisfies the step's output schema. The program is given no network or file API, and the child process
 may read only its own entry file; where the host provides them it also runs in its own network

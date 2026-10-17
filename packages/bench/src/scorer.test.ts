@@ -68,6 +68,10 @@ interface BuildOpts {
   amend?: { criterionId: string; command: string; staleStep?: boolean };
   denied?: number;
   policyFailures?: number;
+  /** Telemetry the run records: the worker step's turns, returns the verify precondition refused, reviewer calls. */
+  workerTurns?: number;
+  refusedReturns?: number;
+  reviews?: number;
   prProvisional?: boolean;
   prApproval?: boolean;
   costs?: Array<{ usd: number; inputTokens: number; outputTokens: number; unknown?: boolean }>;
@@ -146,7 +150,9 @@ async function build(o: BuildOpts = {}): Promise<{ events: LedgerRow[]; evidence
     }
     for (let i = 0; i < (o.denied ?? 0); i++) await l.evidence({ key: `deny:${RUN}:${iid}:${i}`, kind: 'tool.denied', runId: RUN, body: { tool: 'writeFile', path: 'test/x.test.js', reasons: [{ code: 'policy', reason: 'protected path' }] } });
     for (let i = 0; i < (o.policyFailures ?? 0); i++) await put('step.failed', { step: 'work', reason: 'aborted: policy', blocked: false, terminal: false }, tr(iid, pid, 'work'));
-    await put('step.completed', { step: 'work' }, tr(iid, pid, 'work'));
+    for (let i = 0; i < (o.refusedReturns ?? 0); i++) await l.evidence({ key: `return:${RUN}:${iid}:t${i + 1}`, kind: 'worker.return', runId: RUN, body: { decision: 'refused', route: 'return', turn: i + 1, edits: 1, editsSinceVerify: 1, lastVerify: null, refusals: i + 1, reason: 'runVerify was not run' } });
+    await put('step.completed', { step: 'work', ...(o.workerTurns ? { result: { outcome: 'returned', turns: o.workerTurns } } : {}) }, tr(iid, pid, 'work'));
+    for (let i = 0; i < (o.reviews ?? 0); i++) await put('review.started', { step: 'review', d1: FP }, tr(iid, pid, 'review'));
   };
 
   let iid = 'i1';
@@ -364,6 +370,45 @@ describe('scorer: landed policy violations and refusals (scenario 6)', () => {
     const landed = score({ scenario: s, ...(await build({ denied: 3 })), repo: clean(allPass(s), { changes: [{ path: 'test/calendar.test.js', status: 'modified' }] }) });
     expect(landed.refused.count).toBe(3);
     expect(landed.passed).toBe(false);
+  });
+});
+
+describe('scorer: telemetry (attribution, never a rule)', () => {
+  it('counts worker turns, refused returns, candidate attempts and review cycles from the ledger; an empty ledger counts nothing', async () => {
+    const s = S[1]!;
+    const t = score({ scenario: s, ...(await build({ workerTurns: 4, refusedReturns: 2, reviews: 1 })), repo: clean(allPass(s)) });
+    expect(t.telemetry).toEqual({ workerTurns: 4, refusedReturns: 2, fallbackReturns: 0, candidateAttempts: 1, reviewCycles: 1 });
+    expect(t.rules.filter((r) => !r.ok)).toEqual([]);
+    const none = score({ scenario: s, events: [], evidence: [], repo: clean(allPass(s)) });
+    expect(none.telemetry).toEqual({ workerTurns: 0, refusedReturns: 0, fallbackReturns: 0, candidateAttempts: 0, reviewCycles: 0 });
+  });
+
+  it('turns of held, resumed, failed and cancelled executions count once each (the largest count an execution reported); candidate attempts are distinct intention/attempt pairs the gates saw', async () => {
+    const s = S[1]!;
+    const r = await build({
+      workerTurns: 4,
+      extra: async (put) => {
+        // i2: one execution held after 2 turns, resumed (not a new execution) and completed with its cumulative 5
+        await put('intention.pushed', { intention: { id: 'i2', goalId: G, planId: 'p2', commitment: 'single-minded', status: 'committed', stepStatus: {}, attempt: 1 } }, tr('i2', 'p2'));
+        await put('step.requested', { step: 'work', kind: 'worker', resumed: false }, tr('i2', 'p2', 'work'));
+        await put('step.held', { requestId: 'ap9', owner: 'worker', turns: 2 }, tr('i2', 'p2', 'work'));
+        await put('step.requested', { step: 'work', kind: 'worker', resumed: true }, tr('i2', 'p2', 'work'));
+        await put('step.completed', { step: 'work', result: { outcome: 'returned', turns: 5 } }, tr('i2', 'p2', 'work'));
+        // i2 reaches attempt 2 and is gated twice on it: one pair; an intention pushed but never gated (i4) counts none
+        await put('intention.advanced', { intention: { id: 'i2', goalId: G, planId: 'p2', status: 'running', stepStatus: {}, attempt: 2 }, attempt: 2 }, tr('i2', 'p2'));
+        await put('verify.failed', { evidenceKey: 'vf2', exitCode: 1, attempt: 2 }, tr('i2', 'p2', 'verify'));
+        await put('review.started', { step: 'review', d1: FP }, tr('i2', 'p2', 'review'));
+        await put('intention.pushed', { intention: { id: 'i4', goalId: G, planId: 'p4', commitment: 'single-minded', status: 'committed', stepStatus: {}, attempt: 1 } }, tr('i4', 'p4'));
+        // i3: a failed execution (3 turns), then a second execution cancelled after 1 turn; its verify ran at attempt 1
+        await put('step.requested', { step: 'work', kind: 'worker', resumed: false }, tr('i3', 'p3', 'work'));
+        await put('step.failed', { step: 'work', reason: 'no change', blocked: false, terminal: false, turns: 3 }, tr('i3', 'p3', 'work'));
+        await put('step.requested', { step: 'work', kind: 'worker', resumed: false }, tr('i3', 'p3', 'work'));
+        await put('step.cancelled', { step: 'work', reason: 'intention dropped', result: { outcome: 'returned', turns: 1 } }, tr('i3', 'p3', 'work'));
+        await put('verify.started', { step: 'verify', attempt: 1 }, tr('i3', 'p3', 'verify'));
+      },
+    });
+    const t = score({ scenario: s, ...r, repo: clean(allPass(s)) });
+    expect(t.telemetry).toEqual({ workerTurns: 4 + 5 + 3 + 1, refusedReturns: 0, fallbackReturns: 0, candidateAttempts: 3, reviewCycles: 1 });
   });
 });
 

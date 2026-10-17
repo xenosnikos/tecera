@@ -57,8 +57,9 @@ import { PLAN_WIRE_JSON_SCHEMA, toPlan } from './schema.js';
  *
  * The host settles three things in the model's document before it is stamped (settlePlanDocument):
  * permissions.write is the manifest's allowedChanges (what the request or contract names never narrows it),
- * every file-changing worker step returns {changed, summary} with at least one changed path, and every
- * file-changing worker step may run the tests (runVerify, when the tool catalog has it).
+ * every file-changing worker step returns {changed, summary} with at least one changed path, every
+ * file-changing worker step may run the tests (runVerify, when the tool catalog has it), and every
+ * file-changing worker step carries a keep-list (inputs.keep) of what must stay as it is.
  *
  * draftContract(): prompt → one completion → strict decode (CONTRACT_WIRE_JSON_SCHEMA) → host-stamped goal
  * id and statement, needs built from the criteria → contractDraftIssues (contractProblem, bounds, secrets, no
@@ -592,7 +593,7 @@ export class LLMPlanner implements Planner {
     const { budget, issues: budgetIssues } = materializeBudget(parsed.plan.budget, this.o.manifest, goal);
     // The host settles the write scope (the manifest's allowedChanges) and the return schema of every
     // file-changing worker step.
-    const doc = settlePlanDocument(parsed.plan, { manifest: this.o.manifest, toolCatalog: this.catalogFor(goal, ctx) });
+    const doc = settlePlanDocument(parsed.plan, { manifest: this.o.manifest, toolCatalog: this.catalogFor(goal, ctx), ...(repo ? { repo } : {}) });
     // The host records the contract the plan answers to and adds every capability its criteria require.
     const contractHash = planContractHash(ctx, goal);
     const capabilities = planCapabilities(doc.capabilities, ctx, goal);

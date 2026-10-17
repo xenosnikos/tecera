@@ -43,7 +43,7 @@ beforeEach(async () => {
   writes = 0;
   root = await mkdtemp(join(tmpdir(), 'tecera-invoke-fc-'));
   await mkdir(join(root, 'src'), { recursive: true });
-  await writeFile(join(root, 'src/a.ts'), 'const a = 1;\n');
+  await writeFile(join(root, 'src/a.ts'), '// a\n');
 });
 afterEach(async () => rm(root, { recursive: true, force: true }));
 
@@ -90,7 +90,7 @@ describe('approval.hash_mismatch / approval.replay: one grant binds one request'
       return e.stage === 'Send' && i.tool === 'edit' ? [{ type: 'Suspend', request: { requestId: `ap2_${e.spanId}`, action: 'edit', actionHash: i.actionHash, reason: 'second gate', requester: 'worker' } }] : [];
     });
     const ledger = new FakeLedger();
-    const program = js(`await writeFile('src/a.ts', '// two gates');\nreturn { summary: 'ok' };`);
+    const program = js(`await readFile('src/a.ts');\nawait writeFile('src/a.ts', '// two gates');\nreturn { summary: 'ok' };`);
     const first = await invoke(goal, opts(new FakeLLM([program]), { hooks: [approvalGate, gate2], ledger }));
     if (first.kind !== 'suspended') throw new Error(`expected suspended, got ${first.kind}`);
     const g1 = await ledger.grantAudited(first.request.requestId, human, 'local', Date.now());
@@ -119,7 +119,7 @@ describe('approval.hash_mismatch / approval.replay: one grant binds one request'
 
   it('cross-session, wrong-approver, unverifiable and expired grants are refused', async () => {
     const ledger = new FakeLedger();
-    const program = js(`await writeFile('src/a.ts', 'x');\nreturn { summary: 'ok' };`);
+    const program = js(`await readFile('src/a.ts');\nawait writeFile('src/a.ts', 'x');\nreturn { summary: 'ok' };`);
     const first = await invoke(goal, opts(new FakeLLM([program]), { hooks: [approvalGate], ledger, sessionId: 'sess-A' }));
     if (first.kind !== 'suspended') throw new Error('expected suspended');
     await expect(ledger.grantAudited(first.request.requestId, human, 'sess-B', Date.now())).rejects.toThrow(/session/);
@@ -139,7 +139,7 @@ describe('approval.hash_mismatch / approval.replay: one grant binds one request'
   it('nested suspension recovery: the child resumes from its own checkpoint (no re-planning) and its grant lifts exactly its action', async () => {
     const ledger = new FakeLedger();
     const parent = js(`const r = await invoke({ file: 'src/a.ts' }, { output: { type: 'object' }, narrow: { tools: ['read', 'edit'] } });\nreturn { summary: 'child said ' + JSON.stringify(r.value) };`);
-    const child = js(`await writeFile(file, '// from child');\nreturn { wrote: file };`);
+    const child = js(`await readFile(file);\nawait writeFile(file, '// from child');\nreturn { wrote: file };`);
     const llm = new FakeLLM([parent, child]);
     const first = await invoke(goal, opts(llm, { hooks: [approvalGate], ledger }));
     if (first.kind !== 'suspended') throw new Error(`expected suspended, got ${JSON.stringify(first)}`);

@@ -120,6 +120,17 @@ describe('scorecard', () => {
     expect(scorecardMarkdown(piped)).toContain('x \\| y');
   });
 
+  it('prints the worker telemetry of every measured run in its own section, never in the pass table', () => {
+    const t = scored(1, { ...pass, telemetry: { workerTurns: 7, refusedReturns: 2, fallbackReturns: 1, candidateAttempts: 2, reviewCycles: 2 } });
+    const md = scorecardMarkdown(buildScorecard([{ scenario: scenarios[0]!, score: t }, { scenario: scenarios[1]!, score: scored(2, unmeasured('verify ran as root')) }]));
+    expect(md).toContain('## Worker telemetry');
+    expect(md).toContain('| 01-fix-failing-test | 7 | 2 | 1 | 2 | 2 |');
+    // the unmeasured run has no telemetry row; the pass table keeps its own columns
+    expect(md.split('\n').filter((l) => l.startsWith('| 02-api-no-limits |'))).toHaveLength(0);
+    expect(md.split('\n').filter((l) => /^\| \d+ \|/.test(l))).toHaveLength(2);
+    expect(md.split('\n').find((l) => /^\| 1 \| 01-fix-failing-test \| autonomy/.test(l))).not.toMatch(/\| 7 \|/);
+  });
+
   it('writes scorecard.json (machine, round-trips) and scorecard.md', () => {
     const dir = mkdtempSync(join(tmpdir(), 'bench-card-'));
     temps.push(dir);

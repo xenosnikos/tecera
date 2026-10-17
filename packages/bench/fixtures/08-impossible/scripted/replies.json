@@ -18,10 +18,58 @@
     },
     {
       "expect": "Set the port in src/config.json",
+      "text": "```js\n// the check still fails: there is no port both tests accept; report it and return again\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/config.json'] }, { key: 'port', value: 8080 }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2600,
+        "output": 120
+      }
+    },
+    {
+      "expect": "Set the port in src/config.json",
+      "text": "```js\n// the check still fails: there is no port both tests accept; report it and return again\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/config.json'] }, { key: 'port', value: 8080 }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2600,
+        "output": 120
+      }
+    },
+    {
+      "expect": "Set the port in src/config.json",
+      "text": "```js\n// the check still fails: there is no port both tests accept; report it and return again\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/config.json'] }, { key: 'port', value: 8080 }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2600,
+        "output": 120
+      }
+    },
+    {
+      "expect": "Set the port in src/config.json",
       "text": "```js\nconst cur = await readFile('src/config.json');\nconst next = cur.content.replace(/\"port\": *\\d+/, '\"port\": 3000');\nawait writeFile('src/config.json', next);\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/config.json'] }, { key: 'port', value: 3000 }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
       "usage": {
         "input": 2400,
         "output": 200
+      }
+    },
+    {
+      "expect": "Set the port in src/config.json",
+      "text": "```js\n// the check still fails: there is no port both tests accept; report it and return again\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/config.json'] }, { key: 'port', value: 3000 }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2600,
+        "output": 120
+      }
+    },
+    {
+      "expect": "Set the port in src/config.json",
+      "text": "```js\n// the check still fails: there is no port both tests accept; report it and return again\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/config.json'] }, { key: 'port', value: 3000 }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2600,
+        "output": 120
+      }
+    },
+    {
+      "expect": "Set the port in src/config.json",
+      "text": "```js\n// the check still fails: there is no port both tests accept; report it and return again\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/config.json'] }, { key: 'port', value: 3000 }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "usage": {
+        "input": 2600,
+        "output": 120
       }
     }
   ],

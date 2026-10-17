@@ -2,12 +2,13 @@ import { link, lstat, mkdtemp, mkdir, readFile, rename, rm, stat, symlink, write
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { WorkerToolContext } from './common.js';
 import type { CapabilitySet, Json, ToolContext, ToolRequest, VerifyRequest, VerifyRunner } from '@tecera/contracts';
 import { createEditTool as rawEditTool, type EditToolOptions } from './edit.js';
 import { createListFilesTool } from './listFiles.js';
 import { createReadTool } from './read.js';
 import { createRunVerifyTool as rawRunVerifyTool, type RunVerifyOptions } from './runVerify.js';
-import { liveWriteGuard } from '../invoke/fakes.js';
+import { liveWriteGuard, seenOnDisk } from '../invoke/fakes.js';
 import type { AuthorizingTool } from './common.js';
 
 /** Write-class tools get a live step guard unless a test passes its own (Tool.call's third argument). */
@@ -26,7 +27,7 @@ const req = (...args: Json[]): ToolRequest => ({ callId: 'c1', tool: 't', method
 
 let root: string;
 let outside: string;
-let ctx: ToolContext;
+let ctx: WorkerToolContext;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'tecera-tools-'));
@@ -42,7 +43,7 @@ beforeEach(async () => {
   await writeFile(join(root, '.git/HEAD'), 'ref');
   await writeFile(join(root, '.tecera/x.json'), '{}');
   await writeFile(join(outside, 'secret.txt'), 'TOP SECRET');
-  ctx = { runId: 'r1', worktree: root, capabilities: caps(), fencingToken: 7 };
+  ctx = { runId: 'r1', worktree: root, capabilities: caps(), fencingToken: 7, knownDigest: seenOnDisk(root) };
 });
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });

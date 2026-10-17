@@ -1,6 +1,7 @@
 import { requireWriteGuard, type Redactor, type ToolContext, type ToolRequest, type ToolResult, type VerifyOutcome, type VerifyRunner, type WriteGuard } from '@tecera/contracts';
 import { assertLease, assertMethod, assertWorktree, combinedSignal, fail, ok, redactorOf, type AuthorizingTool } from './common.js';
 import { markWorktreeTainted, withWorktreeLock } from './paths.js';
+import { digestTree, treeDifference } from './treeDigest.js';
 
 /**
  * runVerify: run the goal's check command through the injected VerifyRunner (a separate scrubbed
@@ -19,6 +20,10 @@ import { markWorktreeTainted, withWorktreeLock } from './paths.js';
  *   boolean truncated; optional stdoutTruncated/stderrTruncated/cancelled boolean when present) with exit
  *   code 0, no timeout, not cancelled, no signal, and no truncated stream. A missing `truncated` flag is
  *   not evidence of complete output: it fails.
+ * - A pass is bound to the tree it ran on: the worktree is fingerprinted (treeDigest.ts) under the lock
+ *   before and after the run, and a check that changed the tree did not pass (`why` names the paths). The
+ *   result carries the fingerprint as `candidate`; the broker keeps it with its verify state, and a return
+ *   under the verify precondition is accepted only while the tree still has that fingerprint.
  * - Output is redacted in full (the step's redactor, when the broker supplies it) BEFORE the tail is taken,
  *   and the cut is reported in a separate field, so a tail can never start mid-secret behind a prefix
  *   that defeats later redaction.
@@ -78,10 +83,13 @@ export function createRunVerifyTool(o: RunVerifyOptions): AuthorizingTool {
         g.check();
         if (signal.aborted) throw new Error('runVerify cancelled before it started');
         const red = redactorOf(ctx) ?? o.redactor;
-        const r = await withWorktreeLock(ctx.worktree, async () => {
+        const { r, candidate, treeChanged } = await withWorktreeLock(ctx.worktree, async () => {
           assertWorktree(ctx); // re-check under the lock: a quarantine may have happened while waiting
           g.check(); // immediately before the run (repository scripts can mutate the tree)
-          return o.runner.run({ cwd: ctx.worktree, command: o.command, timeoutSec: o.timeoutSec, envAllowlist: o.envAllowlist ?? ['PATH', 'HOME', 'CI'] }, signal);
+          const before = await digestTree(ctx.worktree);
+          const result = await o.runner.run({ cwd: ctx.worktree, command: o.command, timeoutSec: o.timeoutSec, envAllowlist: o.envAllowlist ?? ['PATH', 'HOME', 'CI'] }, signal);
+          const after = await digestTree(ctx.worktree);
+          return { r: result, candidate: before.digest, treeChanged: before.digest === after.digest ? null : treeDifference(before, after) };
         });
         // A runner that reports survivors (a live writer in the tree) quarantines the worktree for every tool.
         const survivors = (r as { tainted?: { reason?: unknown } } | undefined)?.tainted;
@@ -102,9 +110,11 @@ export function createRunVerifyTool(o: RunVerifyOptions): AuthorizingTool {
         const err = tailOf(clean(r?.stderr), n);
         const truncated = r?.truncated !== false || r?.stdoutTruncated === true || r?.stderrTruncated === true;
         const cancelled = r?.cancelled === true || signal.aborted;
-        const passed = whole && fenceLost === null && r.exitCode === 0 && r.timedOut === false && !cancelled && !truncated && r.signal === null;
+        const passed = whole && fenceLost === null && r.exitCode === 0 && r.timedOut === false && !cancelled && !truncated && r.signal === null && treeChanged === null;
         return ok(req, 'runVerify', {
           command: o.command,
+          candidate,
+          ...(treeChanged ? { treeChanged } : {}),
           exitCode: whole ? r.exitCode : null,
           signal: typeof r?.signal === 'string' ? r.signal : null,
           timedOut: r?.timedOut === true,
@@ -118,7 +128,7 @@ export function createRunVerifyTool(o: RunVerifyOptions): AuthorizingTool {
           complete: whole,
           passed,
           ...(fenceLost !== null ? { fenceLost: red ? red.redactText(fenceLost) : fenceLost } : {}),
-          ...(passed ? {} : { why: !whole ? `incomplete verification result: ${problem}` : fenceLost !== null ? 'the write fence was lost during the run' : truncated ? 'output exceeded the cap (truncated): never a pass' : cancelled ? 'cancelled' : r.timedOut ? 'timed out' : r.signal ? `killed by ${r.signal}` : `exit code ${r.exitCode}` }),
+          ...(passed ? {} : { why: !whole ? `incomplete verification result: ${problem}` : fenceLost !== null ? 'the write fence was lost during the run' : truncated ? 'output exceeded the cap (truncated): never a pass' : cancelled ? 'cancelled' : r.timedOut ? 'timed out' : r.signal ? `killed by ${r.signal}` : r.exitCode !== 0 ? `exit code ${r.exitCode}` : `the check changed the tree (${treeChanged!.join(', ')}): no pass on a candidate it rewrote` }),
         });
       } catch (e) {
         return fail(req, 'runVerify', e);

@@ -110,7 +110,7 @@ console.log(JSON.stringify({
     expect(r.contractOpenai).toEqual([]);
     expect(r.contractAnthropic).toEqual([]);
     expect(r.planId).toMatch(/^p_[0-9a-f]{8}$/);
-    expect(r.editInputs).toEqual({ hint: 'src' });
+    expect(r.editInputs).toEqual({ hint: 'src', keep: [] }); // every writing step carries its keep-list (empty without repository facts)
     expect(r.sentStrict).toBe(true);
     expect(r.sentSchemaIsWire).toBe(true);
     expect(r.docParses).toBe(true);

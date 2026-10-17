@@ -27,6 +27,7 @@ import {
   weakestFidelity,
   commitActionHash,
   describeUnexpected,
+  envelopePathMatches,
   isWritingStep,
   statedEnvelope,
   unexpectedChanges,
@@ -719,7 +720,26 @@ export class Loop {
 
   /** Dispatchable steps, minus intentions blocked on a worktree restore. */
   private dispatchable(): ReturnType<IntentionSet['dispatchable']> {
-    return this.intentions.dispatchable().filter((b) => !this.awaitingWorktree.has(b.intention.id) && !this.awaitingPreparation.has(b.intention.id));
+    const ready = this.intentions.dispatchable().filter((b) => !this.awaitingWorktree.has(b.intention.id) && !this.awaitingPreparation.has(b.intention.id));
+    // The terminal writers of one verify gate run one at a time, in plan order (terminalWriterGate): the
+    // last one dispatched is then the last writer before the gate, and the only one held to its check.
+    const out: typeof ready = [];
+    const taken = new Set<string>();
+    for (const b of ready) {
+      // A rework narrowed to a writer behind another (narrowRework) leaves the writer between them done:
+      // a step waits for everything upstream of it, not only its direct dependencies, so a gate never
+      // checks the tree before the rework reached it.
+      if (!upstreamDone(b.plan, b.intention, b.step)) continue;
+      const gate = terminalWriterGate(b.plan, b.step);
+      if (gate) {
+        const key = `${b.intention.id}:${gate.id}`;
+        const busy = b.plan.steps.some((s) => s.id !== b.step.id && (b.intention.stepStatus[s.id] === 'running' || b.intention.stepStatus[s.id] === 'held') && terminalWriterGate(b.plan, s)?.id === gate.id);
+        if (busy || taken.has(key)) continue;
+        taken.add(key);
+      }
+      out.push(b);
+    }
+    return out;
   }
 
   /**
@@ -1256,7 +1276,9 @@ export class Loop {
     for (let changed = true; changed; ) {
       changed = false;
       for (const s of plan.steps) {
-        if (out.has(s.id) || i.stepStatus[s.id] === 'pending') continue;
+        // A done dependent is kept: its effects are in the latest checkpoint (the restore target), and a
+        // dependent done while its dependency runs again is a writer a narrowed rework retained.
+        if (out.has(s.id) || i.stepStatus[s.id] === 'pending' || i.stepStatus[s.id] === 'done') continue;
         if (s.dependsOn.some((d) => out.has(d))) {
           out.add(s.id);
           changed = true;
@@ -2735,7 +2757,9 @@ export class Loop {
         this.stepBaseline.set(k, baseline);
       }
     }
-    await this.emit('step.requested', { step: step.id, kind: step.kind, seatId, resumed, ...(recovery ? { recovered: true } : {}) }, this.traceFor(intentionId, step.id));
+    // The last writer before its verify gate must see its own runVerify pass before it returns (the worker enforces it).
+    const verifyBeforeReturn = step.kind === 'worker' && mode.kind !== 'resume-worker' && lastWriterBeforeVerify(plan, i, step);
+    await this.emit('step.requested', { step: step.id, kind: step.kind, seatId, resumed, ...(recovery ? { recovered: true } : {}), ...(verifyBeforeReturn ? { verifyBeforeReturn: true } : {}) }, this.traceFor(intentionId, step.id));
     await this.emit('step.started', { step: step.id, ...(baseline ? { baseline } : {}) }, this.traceFor(intentionId, step.id));
 
     const ac = new AbortController();
@@ -2753,7 +2777,7 @@ export class Loop {
       // The step is handed the intention as it stands now (events were appended since the transition).
       i = this.intentions.get(intentionId)!;
       const ctx: GateContext = { ...this.gateContext(i, plan, step, ac.signal, mode.kind === 'approved' ? mode.approval : undefined, recovery !== undefined), guard, ...(await this.contractFields(i, step)) };
-      let result = await this.runStep(ctx, seatId, ac.signal, mode, recovery);
+      let result = await this.runStep(ctx, seatId, ac.signal, mode, recovery, verifyBeforeReturn);
       const delivered = (result.kind === 'gate.commit' || result.kind === 'gate.pr') && result.exitCode === 0 && !result.terminal;
       // Past an enforced deadline the result is not progress (a commit or PR that already happened stands).
       if (!delivered && (await this.deadlineStops())) result = { ...result, terminal: true, reason: 'budget: run deadline exceeded', failure: 'budget' };
@@ -2771,7 +2795,7 @@ export class Loop {
     }
   }
 
-  private async runStep(ctx: GateContext, seatId: string, signal: AbortSignal, mode: ExecMode, recovery?: Recovery): Promise<StepResult> {
+  private async runStep(ctx: GateContext, seatId: string, signal: AbortSignal, mode: ExecMode, recovery?: Recovery, verifyBeforeReturn = false): Promise<StepResult> {
     const trace = this.traceFor(ctx.intention.id, ctx.step.id);
     switch (ctx.step.kind) {
       case 'worker': {
@@ -2799,6 +2823,7 @@ export class Loop {
             worktree: ctx.worktree,
             ...(typeof fencingToken === 'number' ? { fencingToken } : {}),
             ...(ctx.guard ? { guard: ctx.guard } : {}),
+            ...(verifyBeforeReturn ? { verifyBeforeReturn: true } : {}),
           },
           signal,
         );
@@ -2944,6 +2969,8 @@ export class Loop {
       const provenance: JsonObject = mocked ? (simulatedProvenance(mocked.length ? mocked.join(',') : step.id, this.p.runId) as unknown as JsonObject) : { src: `worker:${step.id}`, trust: 'untrusted' };
       if (Array.isArray(facts)) for (const f of facts) if (f && typeof f.key === 'string') await this.emit('belief.added', { key: f.key, value: f.value ?? null, provenance }, this.traceFor(intentionId, step.id));
     }
+    // The model turns the worker reports: recorded on every event that ends or parks the execution (telemetry).
+    const turns = result.kind === 'worker' ? turnsOf(result.outcome) : undefined;
     if (result.kind === 'worker' && result.outcome.kind === 'suspended' && !result.terminal) {
       // The worker hit an approval-gated tool: hold the step with the worker's request and resume token.
       const req = result.outcome.request;
@@ -2973,12 +3000,12 @@ export class Loop {
       if (i.status !== 'held') i = transitionIntention(i, 'held');
       i = { ...i, resumeToken, heldRequestId: req.requestId };
       this.intentions.update(i);
-      await this.emit('step.held', { requestId: req.requestId, reason: req.reason, owner: 'worker', actionHash: req.actionHash, ...(worktreeCheckpoint ? { worktreeCheckpoint } : {}) }, this.traceFor(intentionId, step.id));
+      await this.emit('step.held', { requestId: req.requestId, reason: req.reason, owner: 'worker', actionHash: req.actionHash, ...(worktreeCheckpoint ? { worktreeCheckpoint } : {}), ...(turns !== undefined ? { turns } : {}) }, this.traceFor(intentionId, step.id));
       await this.emit('intention.held', { intention: i as unknown as Json, requestId: req.requestId }, this.traceFor(intentionId));
       return;
     }
     if (result.terminal) {
-      await this.failStep(i, plan, step, result.reason ?? describeFailure(result), { terminal: true, ...(result.failure ? { failure: result.failure } : {}) });
+      await this.failStep(i, plan, step, result.reason ?? describeFailure(result), { terminal: true, ...(result.failure ? { failure: result.failure } : {}), ...(turns !== undefined ? { turns } : {}) });
       return;
     }
     // L5-F2: a worker step that can edit (editsFiles) must have changed the worktree; one that may only read
@@ -3003,7 +3030,7 @@ export class Loop {
       if (env) {
         const before = this.stepBefore.get(heldKey(intentionId, step.id));
         if (!this.p.stepChanges || typeof before !== 'string' || !checkpoint) {
-          await this.failStep(i, plan, step, `the changes of ${step.id} cannot be checked against its change-path envelope (${!this.p.stepChanges ? 'this wiring computes no changed paths' : 'the step has no baseline checkpoint'})`, { terminal: true, failure: 'human' });
+          await this.failStep(i, plan, step, `the changes of ${step.id} cannot be checked against its change-path envelope (${!this.p.stepChanges ? 'this wiring computes no changed paths' : 'the step has no baseline checkpoint'})`, { terminal: true, failure: 'human', ...(turns !== undefined ? { turns } : {}) });
           return;
         }
         // Two views: what this step changed, against its own subset; and everything that differs from the
@@ -3021,12 +3048,12 @@ export class Loop {
           const total = whole ? unexpectedChanges(whole, await listed('base')) : [];
           unexpected = [...own, ...total.filter((t) => !own.some((o) => o.path === t.path && o.op === t.op))];
         } catch (err) {
-          await this.failStep(i, plan, step, `the changed paths of ${step.id} could not be computed: ${msgOf(err)}`, { terminal: true, failure: 'human' });
+          await this.failStep(i, plan, step, `the changed paths of ${step.id} could not be computed: ${msgOf(err)}`, { terminal: true, failure: 'human', ...(turns !== undefined ? { turns } : {}) });
           return;
         }
         if (unexpected.length) {
           const where = env.source === 'step' ? `the declared changes of step ${step.id}` : 'the accepted change-path envelope';
-          await this.failStep(i, plan, step, `changed paths outside ${where}: ${describeUnexpected(unexpected)}`, { unexpected });
+          await this.failStep(i, plan, step, `changed paths outside ${where}: ${describeUnexpected(unexpected)}`, { unexpected, ...(turns !== undefined ? { turns } : {}) });
           return;
         }
       }
@@ -3036,7 +3063,7 @@ export class Loop {
     const closeOut = await this.ask('closeOut', { state: { ...(closeOutState(step, result, { expectsChange, ...(changed !== undefined ? { changed } : {}) }) as JsonObject), ...evidence } });
     if (!closeOut.answer.achieved) {
       const noChange = result.kind === 'worker' && result.outcome.kind === 'returned' && expectsChange && changed === false && !reportsError(result.outcome.value);
-      await this.failStep(i, plan, step, refusalReason(result, expectsChange, changed), noChange ? { noChange: true } : {});
+      await this.failStep(i, plan, step, refusalReason(result, expectsChange, changed), { ...(noChange ? { noChange: true } : {}), ...(turns !== undefined ? { turns } : {}) });
       return;
     }
     await this.completeStep(intentionId, plan, step, result, checkpoint);
@@ -3453,7 +3480,7 @@ export class Loop {
    * most 2 × maxAttempts times; each run is one worker execution under its own maxIterations / maxDepth /
    * timeout limits, and the run deadline and budgets bound them all.
    */
-  private async failStep(stale: Intention, plan: Plan, step: Step, reason: string, opts: { blocked?: boolean; terminal?: boolean; failure?: TerminalFailure; recorded?: boolean; noChange?: boolean; unexpected?: PathChange[] }): Promise<void> {
+  private async failStep(stale: Intention, plan: Plan, step: Step, reason: string, opts: { blocked?: boolean; terminal?: boolean; failure?: TerminalFailure; recorded?: boolean; noChange?: boolean; unexpected?: PathChange[]; turns?: number }): Promise<void> {
     let i = this.intentions.get(stale.id)!;
     const blocked = opts.blocked === true;
     const terminal = opts.terminal === true || opts.failure !== undefined;
@@ -3467,10 +3494,13 @@ export class Loop {
     this.held.delete(heldKey(i.id, step.id));
     this.intentions.update(i);
     const failedAttempt = i.attempt;
-    if (!opts.recorded) await this.emit('step.failed', { step: step.id, reason, blocked, terminal, ...failure, ...(opts.noChange ? { noChange: true } : {}), ...(opts.unexpected?.length ? { unexpected: opts.unexpected.slice(0, MAX_FAILURE_ITEMS).map((c) => ({ path: c.path, op: c.op })) } : {}) }, this.traceFor(i.id, step.id));
+    if (!opts.recorded) await this.emit('step.failed', { step: step.id, reason, blocked, terminal, ...failure, ...(opts.noChange ? { noChange: true } : {}), ...(opts.turns !== undefined ? { turns: opts.turns } : {}), ...(opts.unexpected?.length ? { unexpected: opts.unexpected.slice(0, MAX_FAILURE_ITEMS).map((c) => ({ path: c.path, op: c.op })) } : {}) }, this.traceFor(i.id, step.id));
+    // A rejection's findings are read from the ledger before the state is refreshed below: every await is
+    // over by then, so what is decided from the refreshed state is written without another interleaving.
+    const paths = step.kind === 'gate.review' && !blocked && !terminal ? await this.reviewFindingPaths(i.id, step) : null;
     // Continue from the latest state: a sibling step may have completed, failed or been held while the event
-    // was appended, and writing the snapshot read before it would undo that. An intention that ended
-    // meanwhile stays ended (the step.failed above is its record).
+    // was appended or the evidence read, and writing the snapshot read before it would undo that. An
+    // intention that ended meanwhile stays ended (the step.failed above is its record).
     i = this.intentions.get(i.id)!;
     if (!this.isActive(i)) return;
     const sameAttemptKey = `${heldKey(i.id, step.id)}#${failedAttempt}`;
@@ -3486,7 +3516,13 @@ export class Loop {
     // would only return its recorded verdict for that candidate), and progressCheck compares worker
     // executions (ADV-8). A review with no file-editing worker upstream has nothing that could rework it:
     // re-running it (or only read-only workers) would hand it the same candidate and its recorded verdict.
-    const rerun = step.kind === 'gate.verify' || step.kind === 'gate.review' ? retrySet(plan, step) : [step.id];
+    // A rejection whose findings all name paths narrows the rework to the writers that declared them
+    // (narrowRework), chosen among every editing writer upstream of the review (repairSet: the owner of a
+    // named file may lie behind the closest writer), so a writer with nothing of its own to fix is never
+    // re-run only to be refused as a no-change return. Where nothing is retained the usual set stands.
+    const whole = step.kind === 'gate.verify' || step.kind === 'gate.review' ? retrySet(plan, step) : [step.id];
+    const narrowed = paths ? narrowRework(plan, i, repairSet(plan, step), paths) : { rerun: whole, retained: [] };
+    const rerun = narrowed.retained.length ? narrowed.rerun : whole;
     const reworkable = step.kind !== 'gate.review' || rerun.some((id) => {
       const s = plan.steps.find((x) => x.id === id);
       return !!s && editsFiles(plan, s);
@@ -3501,7 +3537,7 @@ export class Loop {
       for (const id of rerun) stepStatus[id] = 'pending';
       i = clearHold({ ...i, status: i.status === 'held' || i.status === 'committed' ? 'running' : i.status, attempt: joins ? i.attempt : i.attempt + 1, stepStatus });
       this.intentions.update(i);
-      await this.emit('intention.advanced', { intention: i as unknown as Json, retry: step.id, attempt: i.attempt, ...(rerun.length > 1 ? { rerun } : {}) }, this.traceFor(i.id));
+      await this.emit('intention.advanced', { intention: i as unknown as Json, retry: step.id, attempt: i.attempt, ...(rerun.length > 1 ? { rerun } : {}), ...(narrowed.retained.length ? { retained: narrowed.retained } : {}) }, this.traceFor(i.id));
       return;
     }
     if (i.status === 'committed') i = transitionIntention(i, 'running');
@@ -3516,6 +3552,36 @@ export class Loop {
       await this.emit('goal.dropped', { goal: dropped as unknown as Json, reason, terminal, ...failure }, { goalId: goal.id });
     }
     void plan;
+  }
+
+  /**
+   * The repository paths the findings of a review step's recorded rejection name (its evidence, this run),
+   * normalized; null when there is no evidence, no finding, a finding without a path, or a path that is not a
+   * plain repository path. Untrusted data: it can only narrow a rework (narrowRework), never widen it.
+   */
+  private async reviewFindingPaths(intentionId: string, step: Step): Promise<string[] | null> {
+    const r = this.reviewResults.get(heldKey(intentionId, step.id));
+    const key = r?.kind === 'gate.review' ? r.evidenceKey : '';
+    if (!key) return null;
+    let rec: Awaited<ReturnType<Ledger['getEvidence']>>;
+    try {
+      rec = await this.p.ledger.getEvidence(key);
+    } catch {
+      return null;
+    }
+    const body = rec && rec.runId === this.p.runId && rec.body && typeof rec.body === 'object' && !Array.isArray(rec.body) ? (rec.body as JsonObject) : null;
+    const raw = body && Array.isArray(body.findings) ? body.findings : null;
+    if (!raw || !raw.length) return null;
+    const out = new Set<string>();
+    for (const f of raw) {
+      if (!f || typeof f !== 'object' || Array.isArray(f)) return null;
+      const o = f as JsonObject;
+      const p = typeof o.path === 'string' ? o.path : typeof o.file === 'string' ? o.file : null;
+      const n = p === null ? null : repoPath(p);
+      if (n === null) return null;
+      out.add(n);
+    }
+    return [...out];
   }
 
   // ---------- helpers ----------
@@ -3709,6 +3775,59 @@ function retrySet(plan: Plan, gate: Step): string[] {
 }
 
 /**
+ * Every repair owner of a gate's candidate: each file-editing worker upstream of the gate, however far (a
+ * writer behind another writer included), with every step between it and the gate. What narrowRework
+ * chooses the review's rework from; never used whole (retrySet is what re-runs without narrowing).
+ */
+function repairSet(plan: Plan, gate: Step): string[] {
+  const byId = new Map(plan.steps.map((s) => [s.id, s]));
+  const upstream = new Set<string>();
+  const walk = [...gate.dependsOn];
+  while (walk.length) {
+    const id = walk.pop()!;
+    if (upstream.has(id)) continue;
+    upstream.add(id);
+    walk.push(...(byId.get(id)?.dependsOn ?? []));
+  }
+  const out = new Set<string>([gate.id]);
+  for (const id of upstream) {
+    const s = byId.get(id);
+    if (s && editsFiles(plan, s)) for (const x of stepsBetween(plan, s, gate)) out.add(x);
+  }
+  return plan.steps.filter((s) => out.has(s.id)).map((s) => s.id);
+}
+
+/**
+ * A finding's path as a plain repository path (no leading ./, no doubled slashes), or null when it is not
+ * one: empty, absolute, a drive letter, a backslash, NUL, a `..` segment, or longer than a path should be.
+ */
+function repoPath(p: string): string | null {
+  const n = p.replace(/^\.\//, '').replace(/\/+/g, '/');
+  if (!n || n.length > 300 || n.startsWith('/') || /^[A-Za-z]:/.test(n) || n.includes('\\') || n.includes('\0')) return null;
+  if (n.split('/').some((s) => s === '..' || s === '')) return null;
+  return n;
+}
+
+/**
+ * A review rework narrowed by the findings' paths: of the writers `rerun` holds, only those whose declared
+ * `changes` cover a named path (and those that declared none: they may change any envelope path) run
+ * again; a done writer the findings do not name is retained as it is, a dependent of a re-run writer
+ * included (stepsBetween pulls it in, and re-running it with nothing to fix would be refused as a
+ * no-change return). The set only ever shrinks: a path no declaring writer covers, fewer than two
+ * writers, or nothing to drop keeps `rerun` whole.
+ */
+function narrowRework(plan: Plan, i: Intention, rerun: readonly string[], paths: readonly string[]): { rerun: string[]; retained: string[] } {
+  const whole = { rerun: [...rerun], retained: [] };
+  const writers = rerun.map((id) => plan.steps.find((s) => s.id === id)).filter((s): s is Step => !!s && editsFiles(plan, s));
+  if (!paths.length || writers.length < 2) return whole;
+  const covers = (w: Step, p: string): boolean => (w.changes ?? []).some((c) => envelopePathMatches(c.path, p));
+  for (const p of paths) if (!writers.some((w) => w.changes !== undefined && covers(w, p))) return whole;
+  const drop = writers.filter((w) => w.changes !== undefined && !paths.some((p) => covers(w, p)) && i.stepStatus[w.id] === 'done').map((w) => w.id);
+  if (!drop.length) return whole;
+  return { rerun: rerun.filter((id) => !drop.includes(id)), retained: drop };
+}
+
+/**
  * Tools that run or read but are not meant to edit. runVerify runs repository code in the worktree, so it
  * keeps a step's risk class 'write' (riskOf, fail closed: baseline, checkpoints, the gate reflex); it does
  * not make the step one that must change files. A step whose tools are all here may return no change.
@@ -3718,6 +3837,81 @@ const NON_EDITING_TOOLS: ReadonlySet<string> = new Set([...READ_ONLY_TOOLS, 'run
 /** A worker step meant to change files: an effective tool that can edit (the planner's notion too). */
 function editsFiles(plan: Plan, step: Step): boolean {
   return step.kind === 'worker' && effectiveStepTools(plan, step).some((t) => !NON_EDITING_TOOLS.has(t));
+}
+
+/**
+ * Whether `step` is the last writer before its verify gate: a file-editing worker step with runVerify whose
+ * nearest downstream gate.verify has every other editing worker upstream of it already done. Only such a
+ * step can see the check pass before it returns; an earlier writer of a multi-writer plan cannot, and is
+ * not held to it. A writer with no verify downstream is never held to it.
+ */
+function lastWriterBeforeVerify(plan: Plan, i: Intention, step: Step): boolean {
+  if (!editsFiles(plan, step) || !effectiveStepTools(plan, step).includes('runVerify')) return false;
+  const byId = new Map(plan.steps.map((s) => [s.id, s]));
+  const verify = nearestVerify(plan, step);
+  if (!verify) return false;
+  const upstream = new Set<string>();
+  const walk = [...verify.dependsOn];
+  while (walk.length) {
+    const id = walk.pop()!;
+    if (upstream.has(id)) continue;
+    upstream.add(id);
+    walk.push(...(byId.get(id)?.dependsOn ?? []));
+  }
+  return plan.steps.every((s) => s.id === step.id || !upstream.has(s.id) || !editsFiles(plan, s) || i.stepStatus[s.id] === 'done');
+}
+
+/** Every step upstream of `step` (its dependencies, transitively) is done. */
+function upstreamDone(plan: Plan, i: Intention, step: Step): boolean {
+  const byId = new Map(plan.steps.map((s) => [s.id, s]));
+  const seen = new Set<string>();
+  const walk = [...step.dependsOn];
+  while (walk.length) {
+    const id = walk.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (i.stepStatus[id] !== 'done') return false;
+    walk.push(...(byId.get(id)?.dependsOn ?? []));
+  }
+  return true;
+}
+
+/** The nearest gate.verify downstream of `step` (breadth first), if any. */
+function nearestVerify(plan: Plan, step: Step): Step | undefined {
+  const seen = new Set<string>([step.id]);
+  let frontier = plan.steps.filter((s) => s.dependsOn.includes(step.id));
+  while (frontier.length) {
+    const next: Step[] = [];
+    for (const s of frontier) {
+      if (seen.has(s.id)) continue;
+      seen.add(s.id);
+      if (s.kind === 'gate.verify') return s;
+      next.push(...plan.steps.filter((d) => d.dependsOn.includes(s.id)));
+    }
+    frontier = next;
+  }
+  return undefined;
+}
+
+/**
+ * The verify gate `step` is a terminal writer of: a file-editing worker with runVerify, a verify downstream
+ * and no other editing worker between them. The terminal writers of one gate run one at a time, in plan
+ * order (Loop.dispatchable), so the last of them to be dispatched is the last writer before the gate
+ * (lastWriterBeforeVerify) whatever the order they became ready in: two writers dispatched side by side
+ * would each see the other not done, and neither would be held to the verify precondition. A writer
+ * without runVerify can never be held to it, so it is not ordered either.
+ */
+function terminalWriterGate(plan: Plan, step: Step): Step | undefined {
+  if (!editsFiles(plan, step) || !effectiveStepTools(plan, step).includes('runVerify')) return undefined;
+  const verify = nearestVerify(plan, step);
+  if (!verify) return undefined;
+  const between = stepsBetween(plan, step, verify).filter((id) => id !== step.id && id !== verify.id);
+  return between.some((id) => {
+    const s = plan.steps.find((x) => x.id === id);
+    return !!s && editsFiles(plan, s);
+  })
+    ? undefined
+    : verify;
 }
 
 /** A non-budget accounting failure anywhere in the error chain (the loop's or the planner's own). */
@@ -3856,7 +4050,15 @@ function describeFailure(r: StepResult): string {
 }
 
 function summarize(r: StepResult): Json {
-  return r.kind === 'worker' ? { outcome: r.outcome.kind } : (normalizeJson({ ...r } as unknown as JsonObject) as Json);
+  if (r.kind !== 'worker') return normalizeJson({ ...r } as unknown as JsonObject) as Json;
+  const turns = turnsOf(r.outcome);
+  return { outcome: r.outcome.kind, ...(turns !== undefined ? { turns } : {}) };
+}
+
+/** The model turns a worker outcome reports (the worker counts them; absent from a fake or an older worker). */
+function turnsOf(o: Outcome): number | undefined {
+  const t = (o as { turns?: unknown }).turns;
+  return typeof t === 'number' && Number.isInteger(t) && t >= 0 ? t : undefined;
 }
 
 function capabilitiesFor(m: Manifest, plan: Plan, step: Step): CapabilitySet {

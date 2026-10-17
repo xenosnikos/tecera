@@ -2,7 +2,7 @@
   "worker": [
     {
       "expect": "Fix the root cause",
-      "text": "```js\nawait writeFile('src/greet.js', \"// Greetings.\\nexport function greet(name) {\\n  return 'Hello, ' + name;\\n}\\n\\nexport function farewell(name) {\\n  return 'Goodbye, ' + name;\\n}\\n\");\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/greet.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "text": "```js\nawait readFile('src/greet.js');\nawait writeFile('src/greet.js', \"// Greetings.\\nexport function greet(name) {\\n  return 'Hello, ' + name;\\n}\\n\\nexport function farewell(name) {\\n  return 'Goodbye, ' + name;\\n}\\n\");\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/greet.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
       "usage": {
         "input": 2400,
         "output": 200

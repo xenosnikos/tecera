@@ -57,6 +57,17 @@ export function canAuthorize(t: Tool): t is AuthorizingTool {
 export interface WorkerToolContext extends ToolContext {
   redactor?: Redactor;
   signal?: AbortSignal;
+  /**
+   * The digest the step last read or wrote for a worktree path (the broker's record); undefined = never
+   * seen. A context without the record has seen nothing: the edit tool then refuses every existing file.
+   */
+  knownDigest?: (rel: string) => string | undefined;
+}
+
+/** The digest the step last saw for `rel`; undefined when it never did, or the context carries no record. */
+export function knownDigestOf(ctx: ToolContext, rel: string): string | undefined {
+  const f = (ctx as WorkerToolContext).knownDigest;
+  return typeof f === 'function' ? f(rel) : undefined;
 }
 
 /**

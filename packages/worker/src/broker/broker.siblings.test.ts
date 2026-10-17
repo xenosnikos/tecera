@@ -8,6 +8,7 @@ import { FakeLedger, FakeWriteGuard } from '../invoke/fakes.js';
 import { History } from '../invoke/history.js';
 import { SpanRunner } from '../invoke/span.js';
 import { createEditTool } from '../tools/edit.js';
+import { createReadTool } from '../tools/read.js';
 import { Broker, type ExecSession } from './broker.js';
 
 /**
@@ -19,7 +20,7 @@ import { Broker, type ExecSession } from './broker.js';
  */
 
 const caps = (): CapabilitySet => ({
-  tools: ['edit', 'slow', 'custom', 'polite'],
+  tools: ['read', 'edit', 'slow', 'custom', 'polite'],
   paths: { read: ['**'], write: ['src/**'], protected: ['test/**'] },
   network: 'none',
   limits: { usd: 1, tokens: 1000, calls: 20, wallMs: 1000, depth: 3, iterations: 5 },
@@ -163,10 +164,11 @@ describe('tree-wide quarantine of already-open brokers', () => {
         await goOn.p;
       },
     });
-    const { parent, session } = tree([stubborn(release.p, started.resolve), edit]);
+    const { parent, session } = tree([stubborn(release.p, started.resolve), createReadTool(), edit]);
     const child = parent.child(caps());
     const pb = parent.beginExec(session(1, 'inv_s'));
     const cb = child.beginExec(session(2, 'inv_s/e1c1'));
+    await call(child.bridge, cb.readFile, ['src/a.ts']);
     const writing = call(child.bridge, cb.writeFile, ['src/a.ts', '// written after the quarantine']);
     await atData.p; // the temp file exists; the data write is next
     await quarantineParent(parent, pb, started.p);

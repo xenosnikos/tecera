@@ -137,6 +137,8 @@ interface StepExtra {
   intentionId: string;
   attempt: number;
   mocks?: MockToolDeclaration[];
+  /** The request's verify precondition on returns (resume applies the same one). */
+  verifyBeforeReturn?: boolean;
 }
 
 export class StepWorker implements Worker {
@@ -268,7 +270,8 @@ export class StepWorker implements Worker {
     const check = { command: req.goal.check.command, timeoutSec: req.goal.check.timeoutSec };
     const worktree = typeof req.worktree === 'string' ? req.worktree : '';
     const mocks = Array.isArray(req.mocks) && req.mocks.length ? structuredClone([...req.mocks]) : undefined;
-    const extra: StepExtra = { seatId: req.seatId, capabilities, runId: req.runId, worktree, check, stepId: req.step.id, planId: req.plan.id, intentionId: req.intention.id, attempt: req.intention.attempt, ...(mocks ? { mocks } : {}) };
+    const verifyBeforeReturn = req.verifyBeforeReturn === true;
+    const extra: StepExtra = { seatId: req.seatId, capabilities, runId: req.runId, worktree, check, stepId: req.step.id, planId: req.plan.id, intentionId: req.intention.id, attempt: req.intention.attempt, ...(mocks ? { mocks } : {}), ...(verifyBeforeReturn ? { verifyBeforeReturn } : {}) };
     const broker = await this.brokerOrRefusal(run, { runId: req.runId, capabilities, worktree, fencingToken: req.fencingToken, check, guard: req.guard }, mocks);
     if (!(broker instanceof Broker)) return sanitizeOutcome(broker, red);
     const out = await invoke(inputs, {
@@ -288,6 +291,7 @@ export class StepWorker implements Worker {
       ...(this.o.trace ? { trace: this.o.trace } : {}),
       config: { ...(this.o.config ?? {}), seatId: req.seatId },
       checkpointExtra: extra as unknown as JsonObject,
+      ...(verifyBeforeReturn ? { verifyBeforeReturn } : {}),
     });
     return withSimulation(sanitizeOutcome(out, red), broker);
   }
@@ -341,6 +345,7 @@ export class StepWorker implements Worker {
       ...(this.o.now ? { now: this.o.now } : {}),
       ...(this.o.trace ? { trace: this.o.trace } : {}),
       consume: this.o.consumeGrants !== false,
+      ...(extra.verifyBeforeReturn === true ? { verifyBeforeReturn: true } : {}),
     });
     return withSimulation(sanitizeOutcome(out, red), broker);
   }

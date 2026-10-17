@@ -3489,6 +3489,352 @@ describe('retry context: read-only analysis, review rework, failure context for 
     expect(inputs).toContain('[RE');
     expect(inputs).not.toContain('tecera-');
   });
+
+  /** The live csv-export shape: two writers with declared changes, the second depending on the first, one verify over both. */
+  const twoWriters = (opts: { binChanges?: boolean; id?: string } = {}): Plan => {
+    const p = fivePlan(opts.id ?? 'p_two');
+    return {
+      ...p,
+      permissions: { ...p.permissions, tools: ['read', 'listFiles', 'edit', 'runVerify'], write: ['src/**', 'bin/**'] },
+      steps: [
+        { id: 'analyze', kind: 'worker', dependsOn: [], inputs: {}, instruction: 'read both files', tools: ['read', 'listFiles'] },
+        { id: 'update_src', kind: 'worker', dependsOn: ['analyze'], inputs: {}, instruction: 'add formatCsv to src/report.js', changes: [{ path: 'src/report.js', ops: ['modify'] }] },
+        { id: 'update_bin', kind: 'worker', dependsOn: ['update_src'], inputs: {}, instruction: 'add --format csv to bin/report.js', ...(opts.binChanges === false ? {} : { changes: [{ path: 'bin/report.js', ops: ['modify'] }] }) },
+        { id: 'verify1', kind: 'gate.verify', dependsOn: ['analyze', 'update_src', 'update_bin'], inputs: {} },
+        ...p.steps.filter((s) => s.kind !== 'worker' && s.id !== 'verify1'),
+      ],
+      allowedModels: { analyze: ['cheap'], update_src: ['strong'], update_bin: ['strong'] },
+    };
+  };
+
+  /** Workers that change the tree once per writing step (update_bin only the first time: on a rework its file is already right). */
+  const twoWriterRun = (gates: ReviewingGates, plan: () => Plan = twoWriters) => {
+    const disk = { v: 0 };
+    let binRuns = 0;
+    const worker = (req: WorkerStepRequest): Outcome => {
+      if (req.step.id === 'update_src' || (req.step.id === 'update_bin' && ++binRuns === 1)) disk.v++;
+      return okOutcome();
+    };
+    // each writer's declared file is what the host finds changed when its checkpoints differ
+    const declared: Record<string, string> = { update_src: 'src/report.js', update_bin: 'bin/report.js' };
+    return build({ plan, gates, worker, extra: { worktreeCheckpoint: async () => `tree-${disk.v}`, stepChanges: async (a) => (a.from === a.to || !declared[a.stepId] ? [] : [{ path: declared[a.stepId]!, op: 'modify' }]) } });
+  };
+
+  it('a rejection whose findings name one writer\'s file reworks only that writer: the other is retained, never refused as no-change, and the goal is delivered', async () => {
+    const gates = new ReviewingGates();
+    gates.findings = [{ title: 'CSV escaping omits carriage returns', detail: 'escapeField checks \\n but not \\r', path: 'src/report.js' }];
+    const b = twoWriterRun(gates);
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    const st = await b.loop.runUntilQuiescent();
+    expect(b.worker.calls.map((c) => c.step.id)).toEqual(['analyze', 'update_src', 'update_bin', 'update_src']);
+    expect(gates.log).toEqual(['verify', 'review', 'verify', 'review', 'verify', 'commit']);
+    expect((await evs(b.ledger, 'intention.advanced')).find((e) => e.payload.retry === 'review')!.payload).toMatchObject({ attempt: 2, rerun: ['update_src', 'verify1', 'review'], retained: ['update_bin'] });
+    // the only failed step is the rejected review: no writer was refused
+    expect((await evs(b.ledger, 'step.failed')).map((e) => e.payload.step)).toEqual(['review']);
+    expect(st.held.map((h) => h.stepId)).toEqual(['pr']);
+    // the retried writer still gets the finding, and the review passed on a new candidate
+    expect(b.worker.calls[3]!.inputs.failureContext).toMatchObject({ value: { kind: 'review', findings: [{ file: 'src/report.js' }] } });
+    expect((await evs(b.ledger, 'review.passed'))[0]!.payload.d1).not.toEqual((await evs(b.ledger, 'review.rejected'))[0]!.payload.d1);
+  });
+
+  it('the same plan without narrowing re-runs both writers, and the retained one\'s no-change return is refused (what the narrowing avoids)', async () => {
+    for (const findings of [[{ title: 'no path given' }], [{ title: 'x', path: 'test/report.test.js' }], [{ title: 'x', path: '../src/report.js' }], [{ title: 'x', path: 'src/report.js' }, { title: 'y' }]]) {
+      const gates = new ReviewingGates();
+      gates.findings = findings;
+      const b = twoWriterRun(gates);
+      await b.loop.addBelief('verify.baseline', 'failing');
+      await b.loop.adoptGoal(goalInput);
+      await b.loop.runUntilQuiescent();
+      const retry = (await evs(b.ledger, 'intention.advanced')).find((e) => e.payload.retry === 'review')!.payload;
+      expect(retry, JSON.stringify(findings)).toMatchObject({ rerun: ['update_src', 'update_bin', 'verify1', 'review'] });
+      expect(retry).not.toHaveProperty('retained');
+      expect((await evs(b.ledger, 'step.failed')).map((e) => e.payload)).toContainEqual(expect.objectContaining({ step: 'update_bin', noChange: true }));
+    }
+  });
+
+  it('a writer that declared no changes may have touched the named file: it is kept; a finding naming both files keeps both', async () => {
+    const undeclared = new ReviewingGates();
+    undeclared.findings = [{ title: 'x', path: 'src/report.js' }];
+    const b = twoWriterRun(undeclared, () => twoWriters({ binChanges: false }));
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    await b.loop.runUntilQuiescent();
+    expect((await evs(b.ledger, 'intention.advanced')).find((e) => e.payload.retry === 'review')!.payload).toMatchObject({ rerun: ['update_src', 'update_bin', 'verify1', 'review'] });
+
+    const both = new ReviewingGates();
+    both.findings = [{ title: 'x', path: './src/report.js' }, { title: 'y', file: 'bin//report.js' }];
+    const c = twoWriterRun(both);
+    await c.loop.addBelief('verify.baseline', 'failing');
+    await c.loop.adoptGoal(goalInput);
+    await c.loop.runUntilQuiescent();
+    const retry = (await evs(c.ledger, 'intention.advanced')).find((e) => e.payload.retry === 'review')!.payload;
+    expect(retry).toMatchObject({ rerun: ['update_src', 'update_bin', 'verify1', 'review'] });
+    expect(retry).not.toHaveProperty('retained');
+  });
+
+  it('a verify failure never narrows: both writers re-run', async () => {
+    const gates = new ReviewingGates();
+    gates.verifyCodes = [1, 0, 0];
+    const b = twoWriterRun(gates);
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    await b.loop.runUntilQuiescent();
+    expect((await evs(b.ledger, 'intention.advanced')).find((e) => e.payload.retry === 'verify1')!.payload).toMatchObject({ rerun: ['update_src', 'update_bin', 'verify1'] });
+  });
+
+  it('the last writer before the verify gate is asked to see its own check pass before it returns; an earlier writer and a read step are not', async () => {
+    const gates = new ReviewingGates();
+    gates.findings = [{ title: 'x', path: 'src/report.js' }];
+    const b = twoWriterRun(gates);
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    await b.loop.runUntilQuiescent();
+    expect(b.worker.calls.map((c) => `${c.step.id}:${c.verifyBeforeReturn === true}`)).toEqual(['analyze:false', 'update_src:false', 'update_bin:true', 'update_src:true']);
+    expect((await evs(b.ledger, 'step.requested')).map((e) => `${e.payload.step}:${e.payload.verifyBeforeReturn === true}`)).toEqual(['analyze:false', 'update_src:false', 'update_bin:true', 'verify1:false', 'review:false', 'update_src:true', 'verify1:false', 'review:false', 'verify2:false', 'commit:false']);
+    // the single-writer plan: its one editing step is the last writer
+    const c = build({ gates: new ReviewingGates() });
+    await c.loop.addBelief('verify.baseline', 'failing');
+    await c.loop.adoptGoal(goalInput);
+    await c.loop.runUntilQuiescent();
+    expect(c.worker.calls.map((x) => `${x.step.id}:${x.verifyBeforeReturn === true}`)).toEqual(['analyze:false', 'edit:true', 'edit:true']);
+    // without runVerify among the step's tools the worker cannot satisfy it: not asked
+    const noVerify = (): Plan => ({ ...fivePlan('p_nv'), permissions: { ...fivePlan().permissions, tools: ['read', 'edit'] } });
+    const d = build({ plan: noVerify });
+    await d.loop.addBelief('verify.baseline', 'failing');
+    await d.loop.adoptGoal(goalInput);
+    await d.loop.runUntilQuiescent();
+    expect(d.worker.calls.map((x) => x.verifyBeforeReturn)).toEqual([undefined, undefined]);
+  });
+
+  it('step.completed and step.failed carry the worker turns the outcome reports', async () => {
+    const turned = (req: WorkerStepRequest): Outcome => ({ ...okOutcome(), turns: req.step.id === 'edit' ? 3 : 1 }) as Outcome;
+    const b = build({ plan: readOnlyAnalyze, worker: turned, extra: { worktreeCheckpoint: async () => 'tree-same' } });
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    await b.loop.runUntilQuiescent();
+    expect((await evs(b.ledger, 'step.completed')).map((e) => e.payload)).toContainEqual(expect.objectContaining({ step: 'analyze', result: { outcome: 'returned', turns: 1 } }));
+    expect((await evs(b.ledger, 'step.failed')).map((e) => e.payload)).toContainEqual(expect.objectContaining({ step: 'edit', noChange: true, turns: 3 }));
+  });
+
+  it('a step parked on a worker suspension and one failed on its change-path envelope record their turns too', async () => {
+    let l: Ledger;
+    const parked = async (req: WorkerStepRequest): Promise<Outcome> => {
+      if (req.step.id !== 'edit') return okOutcome();
+      await l.requestApproval({ requestId: 'ap_t', runId: 'r', sessionId: 's', actionHash: 'edit-hash', requester: { kind: 'agent', id: 'worker' }, reason: 'write', expiresAt: 1e12 });
+      return { kind: 'suspended', request: { requestId: 'ap_t', action: 'edit', actionHash: 'edit-hash', reason: 'write', requester: 'worker' }, resumeToken: 'tok-t', run: { runId: 'r', invokeId: 'i', depth: 0 }, turns: 5 } as Outcome;
+    };
+    const b = build({ worker: parked });
+    l = b.ledger;
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    await b.loop.runUntilQuiescent();
+    expect((await evs(b.ledger, 'step.held')).map((e) => e.payload)).toContainEqual(expect.objectContaining({ requestId: 'ap_t', turns: 5 }));
+    // an edit outside the step's declared changes: the envelope failure carries the turns as well
+    const outside = (): Plan => ({ ...twoWriters({ id: 'p_env' }), permissions: { ...twoWriters().permissions, write: ['src/**', 'bin/**'] } });
+    const disk = { v: 0 };
+    const c = build({ plan: outside, worker: (req) => (req.step.id === 'update_src' ? (disk.v++, { ...okOutcome(), turns: 4 } as Outcome) : okOutcome()), extra: { worktreeCheckpoint: async () => `tree-${disk.v}`, stepChanges: async (a) => (a.from === a.to ? [] : [{ path: 'bin/other.js', op: 'add' }]) } });
+    await c.loop.addBelief('verify.baseline', 'failing');
+    await c.loop.adoptGoal(goalInput);
+    await c.loop.runUntilQuiescent();
+    expect((await evs(c.ledger, 'step.failed')).map((e) => e.payload)).toContainEqual(expect.objectContaining({ step: 'update_src', unexpected: [{ path: 'bin/other.js', op: 'add' }], turns: 4 }));
+  });
+
+  it('a finding on the upstream writer of a chain (update_src → update_bin → verify → review) reworks update_src, not the writer in between; a restart midway through the repair keeps that set', async () => {
+    const chain = (): Plan => {
+      const p = twoWriters({ id: 'p_chain' });
+      return { ...p, steps: p.steps.map((s) => (s.id === 'verify1' ? { ...s, dependsOn: ['update_bin'] } : s)) };
+    };
+    const gates = new ReviewingGates();
+    gates.findings = [{ title: 'CSV escaping omits carriage returns', path: 'src/report.js' }];
+    const b = twoWriterRun(gates, chain);
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    const st = await b.loop.runUntilQuiescent();
+    expect(b.worker.calls.map((c) => c.step.id)).toEqual(['analyze', 'update_src', 'update_bin', 'update_src']);
+    expect((await evs(b.ledger, 'intention.advanced')).find((e) => e.payload.retry === 'review')!.payload).toMatchObject({ attempt: 2, rerun: ['update_src', 'verify1', 'review'], retained: ['update_bin'] });
+    expect((await evs(b.ledger, 'step.failed')).map((e) => e.payload.step)).toEqual(['review']);
+    expect(st.held.map((h) => h.stepId)).toEqual(['pr']);
+    // the gate waited for the rework although its direct dependency (update_bin, retained) was done
+    const order = (await evs(b.ledger)).filter((e) => e.kind === 'step.completed' || e.kind === 'verify.started').map((e) => `${e.kind}:${e.payload.step}`);
+    expect(order.indexOf('verify.started:verify1', order.indexOf('verify.started:verify1') + 1)).toBeGreaterThan(order.lastIndexOf('step.completed:update_src'));
+    // a finding on the closest writer's file reworks only that writer, as before (the writer upstream is retained)
+    const disk = { v: 0 };
+    const declared: Record<string, string> = { update_src: 'src/report.js', update_bin: 'bin/report.js' };
+    const ports = { worktreeCheckpoint: async () => `tree-${disk.v}`, stepChanges: async (a: { from: string; to: string; stepId: string }) => (a.from === a.to || !declared[a.stepId] ? [] : [{ path: declared[a.stepId]!, op: 'modify' as const }]) };
+    const near = new ReviewingGates();
+    near.findings = [{ title: 'x', path: 'bin/report.js' }];
+    const n = build({ plan: chain, gates: near, worker: (req) => (req.step.id.startsWith('update_') ? (disk.v++, okOutcome()) : okOutcome()), extra: ports });
+    await n.loop.addBelief('verify.baseline', 'failing');
+    await n.loop.adoptGoal(goalInput);
+    await n.loop.runUntilQuiescent();
+    expect(n.worker.calls.map((c) => c.step.id)).toEqual(['analyze', 'update_src', 'update_bin', 'update_bin']);
+    expect((await evs(n.ledger, 'intention.advanced')).find((e) => e.payload.retry === 'review')!.payload).toMatchObject({ rerun: ['update_bin', 'verify1', 'review'], retained: ['update_src'] });
+
+    // the process dies while update_src is being reworked: the restarted loop re-runs it (and only it) and delivers
+    const reached = deferred();
+    const g2 = new ReviewingGates();
+    g2.findings = [{ title: 'CSV escaping omits carriage returns', path: 'src/report.js' }];
+    disk.v = 0;
+    let srcRuns = 0;
+    let binRuns = 0;
+    const worker = (req: WorkerStepRequest): Outcome | Promise<Outcome> => {
+      if (req.step.id === 'update_src' && ++srcRuns === 2) {
+        reached.resolve();
+        return never<Outcome>();
+      }
+      if (req.step.id === 'update_src' || (req.step.id === 'update_bin' && ++binRuns === 1)) disk.v++;
+      return okOutcome();
+    };
+    // attempt 3 is needed: the repair runs at attempt 2 and the interrupted step restarts with attempt + 1
+    const m3 = manifest({ budgets: { usd: 2, tokens: 100000, wallClockSec: 600, maxDepth: 3, maxIterations: 10, maxAttempts: 3, maxChangedFiles: 5 } });
+    const a = build({ plan: chain, gates: g2, worker, extra: ports, manifest: m3 });
+    await a.loop.start('h');
+    await a.loop.addBelief('verify.baseline', 'failing', { src: 'preflight', trust: 'trusted' });
+    await a.loop.adoptGoal(goalInput);
+    void a.loop.runUntilQuiescent();
+    await reached.promise;
+    const g3 = new ReviewingGates();
+    g3.findings = g2.findings;
+    g3.verdicts = ['approve']; // the reviewer of the new process sees the reworked candidate
+    const c = build({ plan: chain, gates: g3, worker, extra: ports, ledger: a.ledger, manifest: m3 });
+    const rs = await c.loop.restore();
+    const iid = rs.intentions[0]!.id;
+    expect(rs.recovered).toEqual([expect.objectContaining({ stepId: 'update_src', action: 'restart' })]);
+    // the retained writer's effects are in the restore target: it is not reset with the interrupted one
+    expect(rs.requiredWorktreeState![iid]).toMatchObject({ checkpointId: 'tree-2', reset: ['update_src'] });
+    await c.loop.confirmWorktreeRestored(iid, rs.requiredWorktreeState![iid]!.checkpointId);
+    const done = await c.loop.runUntilQuiescent();
+    expect(c.worker.calls.map((x) => `${x.step.id}@${x.intention.attempt}`)).toEqual(['update_src@3']);
+    expect(done.held.map((h) => h.stepId)).toEqual(['pr']);
+    expect((await evs(a.ledger, 'step.completed')).filter((e) => e.payload.step === 'update_bin')).toHaveLength(1);
+  });
+
+  it('two writers side by side before one verify run one at a time, in plan order: the second is the last writer and the only one held to its check', async () => {
+    const parallel = (): Plan => {
+      const p = twoWriters({ id: 'p_par' });
+      return { ...p, steps: p.steps.map((s) => (s.id === 'update_bin' ? { ...s, dependsOn: ['analyze'] } : s)) };
+    };
+    const disk = { v: 0 };
+    let running = 0;
+    let peak = 0;
+    const order: string[] = [];
+    const worker = async (req: WorkerStepRequest): Promise<Outcome> => {
+      if (req.step.id.startsWith('update_')) {
+        order.push(`${req.step.id}:${req.verifyBeforeReturn === true}`);
+        running++;
+        peak = Math.max(peak, running);
+        await new Promise((r) => setTimeout(r, 5));
+        running--;
+        disk.v++;
+      }
+      return okOutcome();
+    };
+    const declared: Record<string, string> = { update_src: 'src/report.js', update_bin: 'bin/report.js' };
+    const gates = new ReviewingGates();
+    gates.findings = [{ title: 'x', path: 'src/report.js' }];
+    const b = build({ plan: parallel, gates, worker, extra: { worktreeCheckpoint: async () => `tree-${disk.v}`, stepChanges: async (a) => (a.from === a.to || !declared[a.stepId] ? [] : [{ path: declared[a.stepId]!, op: 'modify' }]) } });
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    const st = await b.loop.runUntilQuiescent();
+    expect(peak).toBe(1);
+    // the rework after the rejection (findings name src/report.js) re-runs update_src alone: then it is the last writer
+    expect(order).toEqual(['update_src:false', 'update_bin:true', 'update_src:true']);
+    expect(st.held.map((h) => h.stepId)).toEqual(['pr']);
+    // a step that only reads is not serialized with a writer
+    const withReader = (): Plan => {
+      const p = parallel();
+      return { ...p, steps: [...p.steps.slice(0, 1), { id: 'docs', kind: 'worker', dependsOn: ['analyze'], inputs: {}, instruction: 'read', tools: ['read'] }, ...p.steps.slice(1).map((s) => (s.id === 'verify1' ? { ...s, dependsOn: [...s.dependsOn, 'docs'] } : s))], allowedModels: { ...p.allowedModels, docs: ['cheap'] } };
+    };
+    let both = 0;
+    let readerRunning = false;
+    const c = build({ plan: withReader, gates: new ReviewingGates(), worker: async (req) => {
+      if (req.step.id === 'docs') {
+        readerRunning = true;
+        await new Promise((r) => setTimeout(r, 10));
+        readerRunning = false;
+      } else if (req.step.id.startsWith('update_')) {
+        if (readerRunning) both++;
+        disk.v++;
+      }
+      return okOutcome();
+    }, extra: { worktreeCheckpoint: async () => `tree-${disk.v}`, stepChanges: async (a) => (a.from === a.to || !declared[a.stepId] ? [] : [{ path: declared[a.stepId]!, op: 'modify' }]) } });
+    await c.loop.addBelief('verify.baseline', 'failing');
+    await c.loop.adoptGoal(goalInput);
+    await c.loop.runUntilQuiescent();
+    expect(both).toBeGreaterThan(0);
+  });
+
+  /** fivePlan plus a read-only `docs` step that runs beside the review and that the commit waits for. */
+  const besideReview = (): Plan => {
+    const p = fivePlan('p_beside');
+    return {
+      ...p,
+      steps: [...p.steps.map((s) => (s.id === 'commit' ? { ...s, dependsOn: ['verify2', 'docs'] } : s)), { id: 'docs', kind: 'worker', dependsOn: ['verify1'], inputs: {}, instruction: 'read the docs', tools: ['read'] }],
+      allowedModels: { ...p.allowedModels, docs: ['cheap'] },
+    };
+  };
+  /** The review's findings are read while `docs` runs; the read completes only after `until` saw its event. */
+  const barrier = (b: ReturnType<typeof build>, reached: Deferred, until: (e: TeceraEvent) => boolean) => {
+    const released = deferred();
+    let armed = true;
+    const realGet = b.ledger.getEvidence.bind(b.ledger);
+    b.ledger.getEvidence = async (key: string) => {
+      if (armed && key.startsWith('review-')) {
+        armed = false;
+        reached.resolve();
+        await released.promise;
+      }
+      return realGet(key);
+    };
+    const realAppend = b.ledger.append.bind(b.ledger);
+    b.ledger.append = async (e: TeceraEvent) => {
+      const r = await realAppend(e);
+      if (until(e)) released.resolve();
+      return r;
+    };
+  };
+
+  it('a sibling that completes while the rejection reads its findings is not undone: the rework starts from the refreshed state', async () => {
+    const reached = deferred();
+    const gates = new ReviewingGates();
+    const b = build({ plan: besideReview, gates, worker: async (req) => {
+      if (req.step.id === 'docs') await reached.promise;
+      return okOutcome();
+    } });
+    barrier(b, reached, (e) => e.kind === 'step.completed' && e.trace.stepId === 'docs');
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    const st = await b.loop.runUntilQuiescent();
+    const retry = (await evs(b.ledger, 'intention.advanced')).find((e) => e.payload.retry === 'review')!.payload;
+    expect((retry.intention as { stepStatus: Record<string, string> }).stepStatus).toMatchObject({ docs: 'done', edit: 'pending', verify1: 'pending', review: 'pending' });
+    expect(b.worker.calls.filter((c) => c.step.id === 'docs')).toHaveLength(1);
+    expect(b.worker.calls.map((c) => c.step.id)).toEqual(['analyze', 'edit', 'docs', 'edit']);
+    expect(st.held.map((h) => h.stepId)).toEqual(['pr']);
+  });
+
+  it('an intention that ended while the rejection read its findings stays ended: no retry resurrects it', async () => {
+    const reached = deferred();
+    const gates = new ReviewingGates();
+    const b = build({ plan: besideReview, gates, worker: async (req) => {
+      if (req.step.id === 'docs') {
+        await reached.promise;
+        throw Object.assign(new Error('docs exploded'), { code: 'budget' }); // a terminal failure of the sibling
+      }
+      return okOutcome();
+    } });
+    barrier(b, reached, (e) => e.kind === 'goal.dropped');
+    await b.loop.addBelief('verify.baseline', 'failing');
+    await b.loop.adoptGoal(goalInput);
+    const st = await b.loop.runUntilQuiescent();
+    expect(b.loop.goal('g_fix')!.status).toBe('dropped');
+    expect((await evs(b.ledger, 'intention.advanced')).filter((e) => e.payload.retry === 'review')).toEqual([]);
+    expect(b.worker.calls.map((c) => c.step.id)).toEqual(['analyze', 'edit', 'docs']);
+    expect(st.held).toEqual([]);
+    const ks = await kinds(b.ledger);
+    expect(ks.filter((k) => k === 'intention.failed')).toHaveLength(1);
+    expect(ks.filter((k) => k === 'goal.dropped')).toHaveLength(1);
+  });
 });
 
 // ---------- loop-safety: bounded re-deliberation, belief trust, sibling steps ----------
@@ -3598,9 +3944,12 @@ describe('belief trust decides the trust of what a worker receives', () => {
 });
 
 describe('sibling worker steps of one intention', () => {
+  // Writers without runVerify: two writers that could run the check before one verify gate run one at a
+  // time (the last is held to the verify precondition); these tests need both in flight at once.
   const siblings = (): Plan => ({
     ...fivePlan('p_sib'),
     context: [],
+    permissions: { ...fivePlan().permissions, tools: ['read', 'edit'] },
     steps: [
       { id: 'a', kind: 'worker', dependsOn: [], inputs: {}, instruction: 'one half' },
       { id: 'b', kind: 'worker', dependsOn: [], inputs: {}, instruction: 'the other half' },
@@ -3665,9 +4014,12 @@ describe('sibling worker steps of one intention', () => {
 });
 
 describe('sibling worker steps of one intention: holds', () => {
+  // Writers without runVerify: two writers that could run the check before one verify gate run one at a
+  // time (the last is held to the verify precondition); these tests need both in flight at once.
   const siblings = (): Plan => ({
     ...fivePlan('p_sib'),
     context: [],
+    permissions: { ...fivePlan().permissions, tools: ['read', 'edit'] },
     steps: [
       { id: 'a', kind: 'worker', dependsOn: [], inputs: {}, instruction: 'one half' },
       { id: 'b', kind: 'worker', dependsOn: [], inputs: {}, instruction: 'the other half' },

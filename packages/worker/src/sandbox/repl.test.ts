@@ -133,7 +133,10 @@ describe('escape', () => {
       expect(environ).not.toContain(value);
       expect(environ).not.toContain('NODE_OPTIONS');
       // TECERA_SANDBOX is the supervisor's own marker (env.ts), set for every process the sandbox starts.
-      expect(environ.split('\0').filter(Boolean).map((kv) => kv.split('=')[0]).sort()).toEqual(['HOME', 'LANG', 'PATH', 'TECERA_SANDBOX', 'TMPDIR']);
+      // Under the cgroup control the child is started by systemd-run, which adds the scope unit's own
+      // INVOCATION_ID (a unit id, nothing from the supervisor's env) between the scrubbed env and node.
+      const scopeOwn = (await import('./profile.js')).detectIsolation().systemdRun ? ['INVOCATION_ID'] : [];
+      expect(environ.split('\0').filter(Boolean).map((kv) => kv.split('=')[0]).sort()).toEqual(['HOME', 'LANG', 'PATH', 'TECERA_SANDBOX', 'TMPDIR', ...scopeOwn].sort());
       expect(environ.split('\0')).toContain('TECERA_SANDBOX=repl');
       // The dropped name is reported, but it is itself canary-shaped, so the trace carries it redacted.
       expect(r.trace.envDropped).toHaveLength(1);

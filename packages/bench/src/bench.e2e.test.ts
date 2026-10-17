@@ -201,8 +201,10 @@ describe('a deliberately broken run', () => {
     const dir = join(root, '10-audit');
     cpSync(join(FIXTURES_DIR, '10-audit'), dir, { recursive: true });
     const replies = JSON.parse(readFileSync(join(dir, SCRIPTED_DIR, 'replies.json'), 'utf8')) as { worker: Array<{ expect: string; text: string }>; reviewer: unknown[] };
-    const noop = { expect: 'Fix the root cause', text: "```js\nawait writeFile({ path: 'src/split.js', oldText: '// Split a bill', newText: '// Split a bill (looked at it)' });\nreturn { facts: [{ key: 'changedFiles', value: ['src/split.js'] }] };\n```" };
-    writeFileSync(join(dir, SCRIPTED_DIR, 'replies.json'), JSON.stringify({ worker: [replies.worker[0], noop, replies.worker[0], { ...noop, text: noop.text.replace('(looked at it)', '(looked again)') }], reviewer: [] }));
+    const noop = { expect: 'Fix the root cause', text: "```js\nawait readFile('src/split.js');\nawait writeFile({ path: 'src/split.js', oldText: '// Split a bill', newText: '// Split a bill (looked at it)' });\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/split.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```" };
+    // the check fails on the no-op: the return is refused three times (each a turn with the same reply), then goes to the gate
+    const again = { expect: 'Fix the root cause', text: "```js\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/split.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```" };
+    writeFileSync(join(dir, SCRIPTED_DIR, 'replies.json'), JSON.stringify({ worker: [replies.worker[0], noop, again, again, again, replies.worker[0], { ...noop, text: noop.text.replace('(looked at it)', '(looked again)') }, again, again, again], reviewer: [] }));
     const s = loadScenario(dir);
     expect(MEASURABLE, NEEDS).toBe(true);
     const run = await runScenario(s, { mode: 'scripted', env: ENV, keep: true });

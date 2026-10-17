@@ -33,10 +33,20 @@ export interface StubDoc {
  */
 export const EDIT_DESCRIPTION = [
   'replace exactly one occurrence of oldText with newText (preferred: include enough surrounding lines to be unique), or write a whole file.',
-  'Prefer targeted {path, oldText, newText} edits; write a whole existing file only when most of it changes, and then keep every function and export you are not asked to remove.',
+  'Prefer targeted {path, oldText, newText} edits; write a whole existing file only when most of it changes, and then keep every top-level binding, function, class and export you are not asked to remove (and the behaviour behind them).',
   'Every edit of a .js/.mjs/.cjs/.ts/.mts/.cts file is checked before it is written: content that does not parse is refused with the parser message and line,',
-  'and an edit that removes an exported name of an existing module is refused unless you list that name in removeExports (writeFile({path, content, removeExports: ["name"]}) or writeFile(path, content, {removeExports})).',
+  'and an edit that removes a top-level name of an existing module (an export, or a module-level const/let/var, function or class) is refused unless you list that name in removeNames (writeFile({path, content, removeNames: ["name"]}) or writeFile(path, content, {removeNames}); removeExports is accepted as the same).',
   'A refused edit writes nothing: fix it and call writeFile again',
+].join(' ');
+
+/**
+ * What the worker is told about runVerify. `passed` is the tool's own verdict (exit 0, complete output, no
+ * timeout); the return precondition it describes is enforced by the invoke loop (invoke.ts verifyHold).
+ */
+export const VERIFY_DESCRIPTION = [
+  "run the goal's check command in the worktree. `passed` is true only when it exited 0 with complete output; otherwise `why`, `exitCode`, `stdout` and `stderr` say what failed.",
+  'A step that changed files returns only after runVerify passed since its last edit: read `passed`, fix the code while it is false, run it again, and never return on a failing result.',
+  'On the last writing step before the verify gate the host refuses such a return and gives you the reason and another turn',
 ].join(' ');
 
 /** Program-facing names of the standard tools (binding name → tool name). */
@@ -45,7 +55,7 @@ export const STANDARD_STUBS: Record<string, StubDoc> = {
   edit: {
     binding: 'writeFile',
     tool: 'edit',
-    signature: 'await writeFile({path, oldText, newText}) | await writeFile(path, content) | await writeFile({path, content, removeExports?}) → {path, bytes, digest, mode, syntax}',
+    signature: 'await writeFile({path, oldText, newText, removeNames?}) | await writeFile(path, content) | await writeFile({path, content, removeNames?}) → {path, bytes, digest, mode, syntax}',
     description: EDIT_DESCRIPTION,
   },
   delete: {
@@ -55,7 +65,7 @@ export const STANDARD_STUBS: Record<string, StubDoc> = {
     description: 'delete one file you have read: pass the digest readFile returned (or the exact content); the file is removed only while it still holds that. No directories, nothing recursive',
   },
   listFiles: { binding: 'listFiles', tool: 'listFiles', signature: 'await listFiles(prefixOrGlob?) → {files, truncated}', description: 'list worktree files (node_modules, .git and .tecera are skipped)' },
-  runVerify: { binding: 'runVerify', tool: 'runVerify', signature: 'await runVerify() → {exitCode, timedOut, stdout, stderr}', description: "run the goal's check command in the worktree" },
+  runVerify: { binding: 'runVerify', tool: 'runVerify', signature: 'await runVerify() → {passed, why?, exitCode, timedOut, stdout, stderr, …}', description: VERIFY_DESCRIPTION },
 };
 
 export interface SystemPromptOptions {
@@ -77,6 +87,7 @@ export function workerSystemPrompt(o: SystemPromptOptions): string {
     '- `return value` ends the step. The value must match the output schema below; if it does not, you get the error and another turn.',
     '- Finishing without `return` continues: everything printed with console.log/warn/error is shown to you next turn.',
     '- A thrown error is shown to you next turn. Fix it and try again.',
+    '- step.inputs.keep (when present) lists what must stay exactly as it is in the files you change: exports, call shapes, asserted values, documented interfaces. Change those files with targeted {path, oldText, newText} edits that keep every entry; never rewrite a file.',
     '- Use `await` for every tool call. Tool calls that are refused throw an error whose message says why.',
     '- There is no require, import, eval, Function, process, globalThis, network or filesystem access except through the tools below.',
     `- Do not assign to __history__, __depth__ or __capabilities__; they are reserved.${o.maxIterations ? ` You have at most ${o.maxIterations} turns.` : ''}`,

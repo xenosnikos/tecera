@@ -30,7 +30,7 @@ index b7304b6..ea8dc14 100755
    return summary.map((s) => `${s.region.padEnd(16)} ${s.total.toFixed(2).padStart(10)}`).join('\n') + '\n';
  }
 +
-+const csvField = (v) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
++const csvField = (v) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
 +
 +export function formatCsv(summary) {
 +  return ['region,total', ...summary.map((s) => `${csvField(s.region)},${s.total.toFixed(2)}`)].join('\n') + '\n';

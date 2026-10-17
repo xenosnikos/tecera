@@ -40,7 +40,8 @@ import { applyPatches, isFatalCode, type AbortReason, type SpanRunner } from '..
 import { CHECKPOINT_KEY_RE, STANDARD_STUBS } from '../protocol/prompts.js';
 import { toSafeJson } from '../protocol/serializer.js';
 import { canAuthorize, type WorkerToolContext } from '../tools/common.js';
-import { markWorktreeTainted, worktreeTaint } from '../tools/paths.js';
+import { markWorktreeTainted, withWorktreeLock, worktreeTaint } from '../tools/paths.js';
+import { digestTree } from '../tools/treeDigest.js';
 import { MockRegistrationError, standInProblems, type StandIn } from '../mocks/admit.js';
 import { HandleError, HandleTable } from './handles.js';
 import { hostGateActionOf } from './hostGates.js';
@@ -249,6 +250,23 @@ export interface SimulatedUse {
   mockIds: string[];
 }
 
+/**
+ * The tree's record of what its tools did to the worktree and what its check said: completed calls of a
+ * write-class tool that reported a worktree path (edit, delete: a tool that changes a file names it in its
+ * provenance; runVerify, a stand-in or a resource tool does not), how many since runVerify last passed, and
+ * the last runVerify result as the tool reported it, with the fingerprint of the tree it passed on (its
+ * `candidate`). A runVerify that starts invalidates the record until the tool reports; one that fails or
+ * never reports leaves it invalid. Host-owned: a program cannot set it, and a checkpoint carries it across
+ * a resume (the replayed calls are not counted again; the pass is re-checked against the tree, verifyPassed).
+ */
+export interface VerifyState {
+  edits: number;
+  editsSinceVerify: number;
+  lastVerify: { passed: boolean; why: string | null; execNo: number; candidate: string | null } | null;
+}
+
+const freshVerifyState = (): VerifyState => ({ edits: 0, editsSinceVerify: 0, lastVerify: null });
+
 type Entry = { kind: 'tool'; tool: Tool } | { kind: 'history' };
 
 interface Shared {
@@ -268,6 +286,10 @@ interface Shared {
   mocked: Set<string>;
   /** Announcements in progress (concurrent first calls share one). */
   announcing: Map<string, Promise<AbortReason | null>>;
+  /** Edits and runVerify results of the tree (the return precondition reads it). */
+  verify: VerifyState;
+  /** Worktree path → the content digest the tree last read or wrote there (the edit tool's stale-read check). */
+  known: Map<string, string>;
 }
 
 /** Apply `a` then `b` (both secret lists are honoured). */
@@ -365,7 +387,7 @@ export class Broker {
     if (refused.length) throw new MockRegistrationError(refused);
     this.standIns = new Map((o.standIns ?? []).map((s) => [s.declaration.tool, s.declaration]));
     this.tools = new Map([...o.tools.map((t): [string, Tool] => [t.name, t]), ...(o.standIns ?? []).map((s): [string, Tool] => [s.declaration.tool, { ...s.tool, standsIn: s.declaration.capability }])]);
-    this.shared = shared ?? { key: o.key ?? randomBytes(32), grants: new Map(), journal: new Map(), execSeq: { n: 0 }, red: { r: o.redactor ?? makeRedactor([]) }, taint: null, effects: new Map(), qgen: { n: 0 }, execs: new Set(), mocked: new Set(), announcing: new Map() };
+    this.shared = shared ?? { key: o.key ?? randomBytes(32), grants: new Map(), journal: new Map(), execSeq: { n: 0 }, red: { r: o.redactor ?? makeRedactor([]) }, taint: null, effects: new Map(), qgen: { n: 0 }, execs: new Set(), mocked: new Set(), announcing: new Map(), verify: freshVerifyState(), known: new Map() };
     this.handles = new HandleTable<Entry>(o.runId, this.shared.key);
   }
 
@@ -422,6 +444,89 @@ export class Broker {
     return { capabilities: [...new Set(list.map((d) => d.capability))].sort(), mockIds: list.map((d) => d.mockId).sort() };
   }
 
+  /** The tree's verify state (a copy). */
+  verifyState(): VerifyState {
+    const v = this.shared.verify;
+    return { edits: v.edits, editsSinceVerify: v.editsSinceVerify, lastVerify: v.lastVerify ? { ...v.lastVerify } : null };
+  }
+
+  /**
+   * Whether the tree's last runVerify pass still stands for the candidate as it is now: it passed, nothing
+   * was edited since, and the worktree (fingerprinted under its lock) is the tree it passed on. Fails
+   * closed on anything else, a tree changed behind the tools' back or while the step was suspended included.
+   */
+  async verifyPassed(): Promise<{ ok: boolean; why: string | null; state: VerifyState }> {
+    const state = this.verifyState();
+    const v = state.lastVerify;
+    const no = (why: string) => ({ ok: false, why, state });
+    if (v === null) return no('runVerify was not run');
+    if (!v.passed || v.candidate === null) return no(`the last runVerify did not pass (${v.why ?? 'no result'})`);
+    if (state.editsSinceVerify > 0) return no(`${state.editsSinceVerify} edit(s) were made after runVerify last passed`);
+    let now: string;
+    try {
+      now = (await withWorktreeLock(this.o.worktree, () => digestTree(this.o.worktree))).digest;
+    } catch (e) {
+      return no(`the tree cannot be fingerprinted: ${(e as Error).message}`);
+    }
+    if (now !== v.candidate) return no('the tree changed since runVerify passed on it');
+    return { ok: true, why: null, state };
+  }
+
+  /**
+   * Restore the verify state a checkpoint carried. A missing or malformed record is an unknown state and is
+   * restored as one edit that no check has passed since (fail closed: a pass is never assumed).
+   */
+  preloadVerifyState(v: unknown): void {
+    const o = v as Partial<VerifyState> | null;
+    const n = (x: unknown): number | null => (typeof x === 'number' && Number.isInteger(x) && x >= 0 ? x : null);
+    const edits = o && typeof o === 'object' ? n(o.edits) : null;
+    const since = o && typeof o === 'object' ? n(o.editsSinceVerify) : null;
+    const l = o && typeof o === 'object' ? o.lastVerify : undefined;
+    const candidate = l && typeof l === 'object' && typeof l.candidate === 'string' && l.candidate ? l.candidate : null;
+    // A pass without the fingerprint it was established against cannot be re-checked: it is no pass.
+    const last = l === null ? null : l && typeof l === 'object' && typeof l.passed === 'boolean' && n(l.execNo) !== null ? { passed: l.passed && candidate !== null, why: typeof l.why === 'string' ? l.why : l.passed && candidate === null ? 'the recorded pass names no candidate' : null, execNo: n(l.execNo)!, candidate: l.passed ? candidate : null } : undefined;
+    if (edits === null || since === null || last === undefined || since > edits) {
+      this.shared.verify = { edits: 1, editsSinceVerify: 1, lastVerify: null };
+      return;
+    }
+    this.shared.verify = { edits, editsSinceVerify: since, lastVerify: last };
+  }
+
+  /** A runVerify is about to run: whatever passed before is invalid until the tool reports (a failure or a throw leaves it so). */
+  private noteVerifyStart(tool: Tool, execNo: number): void {
+    if (tool.name !== 'runVerify' || this.standIns.has(tool.name)) return;
+    this.shared.verify.lastVerify = { passed: false, why: 'the last runVerify did not complete', execNo, candidate: null };
+  }
+
+  /**
+   * Record a completed effect in the verify state: a runVerify result as the tool reported it (a pass
+   * binds to the tree fingerprint the tool took, its `candidate`), or one more edit (`own` is the tool's
+   * own result: a file tool names the path it changed in its provenance).
+   */
+  private noteEffect(tool: Tool, own: ToolResult, execNo: number): void {
+    const v = this.shared.verify;
+    if (tool.name === 'runVerify') {
+      const r = own.value && typeof own.value === 'object' && !Array.isArray(own.value) ? (own.value as JsonObject) : null;
+      const candidate = typeof r?.candidate === 'string' && r.candidate ? r.candidate : null;
+      const passed = r?.passed === true && candidate !== null;
+      v.lastVerify = { passed, why: typeof r?.why === 'string' ? r.why : passed ? null : r?.passed === true ? 'the pass names no candidate' : 'no result', execNo, candidate: passed ? candidate : null };
+      if (passed) v.editsSinceVerify = 0;
+    } else if (!this.standIns.has(tool.name) && typeof own.provenance?.path === 'string') {
+      v.edits++;
+      v.editsSinceVerify++;
+    }
+  }
+
+  /** Remember the content a read or edit left at a path (a delete forgets it), for the stale-read check. */
+  private noteContent(tool: Tool, out: ToolResult): void {
+    if (tool.name !== 'read' && tool.name !== 'edit' && tool.name !== 'delete') return;
+    const v = out.value && typeof out.value === 'object' && !Array.isArray(out.value) ? (out.value as JsonObject) : null;
+    const path = typeof v?.path === 'string' ? v.path : undefined;
+    if (!path) return;
+    if (tool.name === 'delete') this.shared.known.delete(path);
+    else if (typeof v?.digest === 'string' && !(tool.name === 'read' && v.binary === true)) this.shared.known.set(path, v.digest);
+  }
+
   /** Completed non-read effects of an invoke and its descendants. */
   effectsOf(invokeId: string): EffectRecord[] {
     return [...this.shared.effects.values()].filter((e) => e.invokeId === invokeId || e.invokeId.startsWith(`${invokeId}/`));
@@ -429,6 +534,22 @@ export class Broker {
 
   exportEffects(): EffectRecord[] {
     return [...this.shared.effects.values()];
+  }
+
+  /** The tree's record of what it last saw at each worktree path (the edit tool's stale-read check), for a checkpoint. */
+  exportKnown(): Array<[string, string]> {
+    return [...this.shared.known.entries()];
+  }
+
+  /**
+   * Restore the record a checkpoint carried. Nothing is trusted beyond "the step saw this content": an
+   * edit still compares the digest with the file as it is now, so a file changed while the step was
+   * suspended is refused until it is read again. A missing or malformed record means fresh reads.
+   */
+  preloadKnown(list: unknown): void {
+    this.shared.known.clear();
+    if (!Array.isArray(list)) return;
+    for (const e of list) if (Array.isArray(e) && typeof e[0] === 'string' && typeof e[1] === 'string' && e[0] && e[1]) this.shared.known.set(e[0], e[1]);
   }
 
   preloadEffects(list: unknown): void {
@@ -855,6 +976,7 @@ export class Broker {
       fence: L ? fenceOf(L.guard) : () => false,
       redactor: this.red,
       ...(L ? { signal: L.ac.signal } : {}),
+      knownDigest: (rel) => this.shared.known.get(rel),
     };
     return ctx;
   }
@@ -1016,6 +1138,7 @@ export class Broker {
     } else {
       executed = true;
       L.running.set(callSeq, tool.name);
+      this.noteVerifyStart(tool, s.execNo);
       try {
         result = await tool.call(call, this.ctxFor(caps, L), L.guard);
         if (!result || typeof result !== 'object') throw new Error('tool returned no result');
@@ -1047,6 +1170,8 @@ export class Broker {
     const journalled = effect && !taintedNow && !this.shared.taint;
     if (journalled) this.shared.journal.set(idemKey, out);
     if (effect) this.shared.effects.set(idemKey, { invokeId: s.invokeId, tool: tool.name, method: req.method, args: this.red.redactJson(args) as Json[], idemKey });
+    if (effect) this.noteEffect(tool, result, s.execNo);
+    if (executed && out.ok) this.noteContent(tool, out);
     // A read that returned data is a dependency: a completed child is replayed only while it is still readable.
     if (executed && out.ok && tool.risk === 'read') this.shared.effects.set(idemKey, { invokeId: s.invokeId, tool: tool.name, method: req.method, args: this.red.redactJson(args) as Json[], idemKey, read: true, readScope: [...caps.paths.read] });
 

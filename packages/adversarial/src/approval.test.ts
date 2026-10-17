@@ -360,7 +360,8 @@ describe('approval (security.md §6; D1 local principal, D6 PR gate)', () => {
     const SRC = 'src/slugify.js';
     const twoWrites = {
       expect: 'Fix the root cause',
-      text: js(`await writeFile({ path: '${SRC}', oldText: '// Turn free text into a URL slug: lower-case words joined by single dashes.', newText: '// Runs of separators collapse to one dash.' });
+      text: js(`await readFile('${SRC}');
+await writeFile({ path: '${SRC}', oldText: '// Turn free text into a URL slug: lower-case words joined by single dashes.', newText: '// Runs of separators collapse to one dash.' });
 await writeFile({ path: '${SRC}', oldText: "(m) => '-'.repeat(m.length)", newText: "'-'" });
 const v = await runVerify();
 return { facts: [{ key: 'changedFiles', value: ['${SRC}'] }, { key: 'verifyExit', value: v.exitCode }] };`),

@@ -394,7 +394,10 @@ describe('recover (security.md §6, §4 recovery matrix)', () => {
     // each exec writes the SAME non-fixing content (the unfixed implementation plus one comment line): the first
     // is a change that fails verify, the second leaves the candidate digest unchanged
     const same = { text: js("const s = await readFile('src/slugify.js');\nawait writeFile('src/slugify.js', '// attempt: no real change\\n' + String(s.content).replace(/^\\/\\/ attempt: no real change\\n/, ''));\nconsole.log('nothing fixed');\nreturn { facts: [{ key: 'changedFiles', value: [] }] };") };
-    r.worker = [r.worker[0]!, same, same, same, same, same, same];
+    // the edit step is the last writer before the verify gate: a return without a passing check is refused
+    // three times (each refusal is a turn with the same reply) and the fourth goes to the gate, so every
+    // execution of the step takes four turns
+    r.worker = [r.worker[0]!, ...Array.from({ length: 12 }, () => same)];
     const flow = new Flow(dir, wt, r);
     const res = await flow.drive();
     const evs = await flow.events();
@@ -405,7 +408,7 @@ describe('recover (security.md §6, §4 recovery matrix)', () => {
     // changed nothing, was refused, and re-ran once in the same attempt (its only same-attempt retry), unchanged again
     const started = evs.filter((e) => e.kind === 'step.started' && e.trace.stepId === 'edit');
     expect(started.length, `worker executions of edit\n${await dump(dir)}`).toBe(3);
-    expect(flow.segments.reduce((n, x) => n + (x.asked.worker ?? 0), 0), 'the worker seat was asked once per exec (plus analyze)').toBe(4);
+    expect(flow.segments.reduce((n, x) => n + (x.asked.worker ?? 0), 0), 'the worker seat was asked four times per exec (three refused returns, then the gate), plus analyze').toBe(13);
     const sameAttempt = evs.filter((e) => e.kind === 'intention.advanced' && (e.payload as { sameAttempt?: boolean }).sameAttempt === true);
     expect(sameAttempt.length, 'one same-attempt retry, in attempt 2').toBe(1);
     const verifies = evs.filter((e) => (e.kind === 'verify.failed' || e.kind === 'verify.passed') && e.trace.stepId === 'verify');

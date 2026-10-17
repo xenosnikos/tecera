@@ -6,7 +6,7 @@ import { FakeBeliefs, FakeLLM, adopted, goal, goodDoc, sampleManifest, samplePer
 import { settlePlanDocument } from './scope.js';
 import { parsePlanOutput } from './parse.js';
 import { LLMPlanner } from './llmPlanner.js';
-import { buildContractPrompt } from './prompt.js';
+import { buildContractPrompt, buildPlannerPrompt } from './prompt.js';
 import { contractQualityIssues, type QualityContext } from './quality.js';
 import { assertionsOf, entryPointsOf, spawnedByTests, testedApiOf, type RepoFacts } from './repoFacts.js';
 
@@ -191,5 +191,77 @@ describe('a step that edits files may run the tests', () => {
     const raw = { ...goodDoc(), steps: goodDoc().steps.map((x) => (x.id === 'edit' ? { ...x, tools: ['read', 'edit'] } : x)) };
     const p = await new LLMPlanner({ llm: new FakeLLM([JSON.stringify(raw)]), manifest: sampleManifest(), permissions: samplePermissions(), nonce: () => 'n5n5n5' }).write(adopted, new FakeBeliefs([]), goal);
     expect(p.steps.find((x) => x.id === 'edit')!.tools).toEqual(['read', 'edit', 'runVerify']);
+  });
+});
+
+describe('every writing step carries a keep-list, and the plan prompt renders the asserted values and documented interfaces', () => {
+  const doc = (over: Partial<{ inputs: Record<string, unknown>; changes: ChangePath[] }> = {}) => {
+    const r = parsePlanOutput(JSON.stringify({ ...goodDoc(), steps: goodDoc().steps.map((x) => (x.id === 'edit' ? { ...x, tools: ['read', 'edit'], ...over } : x)), permissions: { ...goodDoc().permissions, tools: ['read', 'listFiles', 'edit'], write: ['src/**', 'bin/**'] } }));
+    if (!r.ok) throw new Error(r.issues.join('; '));
+    return r.plan;
+  };
+
+  it('the host builds the keep-list from the tested modules the step may change: exports, call shapes, asserted values, documented lines; a read step gets none', () => {
+    const out = settlePlanDocument(doc(), { manifest: manifestOf('03-csv-export'), repo: factsOf('03-csv-export') });
+    const keep = out.steps.find((x) => x.id === 'edit')!.inputs['keep'] as string[];
+    expect(keep).toContain('src/report.js exports `formatText`, `summarize` (used by test/report.test.js)');
+    expect(keep).toEqual(expect.arrayContaining([expect.stringMatching(/^src\/report\.js: `summarize` .*called as `summarize\(\[…\]\)`/), expect.stringMatching(/^`formatText\(\[\{region:'a',total:2\}\]\)` is `'a {22}2\.00\\n'` \(test\/report\.test\.js\)$/)]));
+    expect(out.steps.find((x) => x.id === 'analyze')!.inputs).not.toHaveProperty('keep');
+    // s5: the documented send({ to, subject, text }) is kept
+    const mail = settlePlanDocument(doc(), { manifest: manifestOf('05-needs-mail'), repo: factsOf('05-needs-mail') });
+    expect((mail.steps.find((x) => x.id === 'edit')!.inputs['keep'] as string[]).join('\n')).toMatch(/src\/signup\.js documents: .*send\(\{ to, subject, text \}\)/);
+  });
+
+  it("the model's own entries come first; declared changes narrow the host's entries to the modules they cover; without facts the model's list stands alone", () => {
+    const own = settlePlanDocument(doc({ inputs: { keep: ['the text report format'], other: 1 } }), { manifest: manifestOf('03-csv-export'), repo: factsOf('03-csv-export') });
+    const keep = own.steps.find((x) => x.id === 'edit')!.inputs['keep'] as string[];
+    expect(keep[0]).toBe('the text report format');
+    expect(keep.length).toBeGreaterThan(1);
+    expect(own.steps.find((x) => x.id === 'edit')!.inputs['other']).toBe(1);
+    const bin = settlePlanDocument(doc({ changes: [{ path: 'bin/report.js', ops: ['modify'] }] }), { manifest: manifestOf('03-csv-export'), repo: factsOf('03-csv-export') });
+    expect((bin.steps.find((x) => x.id === 'edit')!.inputs['keep'] as string[]).filter((k) => k.includes('src/report.js'))).toEqual([]);
+    const none = settlePlanDocument(doc({ inputs: { keep: ['x', 3, ''] } }), { manifest: manifestOf('03-csv-export') });
+    expect(none.steps.find((x) => x.id === 'edit')!.inputs['keep']).toEqual(['x']);
+    expect(settlePlanDocument(doc(), { manifest: manifestOf('03-csv-export') }).steps.find((x) => x.id === 'edit')!.inputs['keep']).toEqual([]);
+  });
+
+  it("the model's entries cannot crowd the repository's facts out: own entries are capped, room is kept for the asserted values, and what was dropped is reported", () => {
+    const verbose = Array.from({ length: 40 }, (_, i) => `item ${i}`);
+    const out = settlePlanDocument(doc({ inputs: { keep: verbose } }), { manifest: manifestOf('03-csv-export'), repo: factsOf('03-csv-export') });
+    const step = out.steps.find((x) => x.id === 'edit')!;
+    const keep = step.inputs['keep'] as string[];
+    expect(keep.length).toBeLessThanOrEqual(40);
+    expect(keep.slice(0, 12)).toEqual(verbose.slice(0, 12));
+    expect(keep.filter((k) => k.startsWith('item '))).toHaveLength(12);
+    expect(keep).toContain('src/report.js exports `formatText`, `summarize` (used by test/report.test.js)');
+    expect(keep.some((k) => /^`formatText\(.*\)` is `.*` \(test\/report\.test\.js\)$/.test(k))).toBe(true);
+    expect(step.inputs['keepDropped']).toMatchObject({ own: 28 });
+    // a long entry is clipped; a step within the bounds reports nothing dropped
+    const long = settlePlanDocument(doc({ inputs: { keep: ['x'.repeat(400)] } }), { manifest: manifestOf('03-csv-export') });
+    expect((long.steps.find((x) => x.id === 'edit')!.inputs['keep'] as string[])[0]).toHaveLength(300);
+    expect(long.steps.find((x) => x.id === 'edit')!.inputs).not.toHaveProperty('keepDropped');
+    expect(settlePlanDocument(doc(), { manifest: manifestOf('03-csv-export'), repo: factsOf('03-csv-export') }).steps.find((x) => x.id === 'edit')!.inputs).not.toHaveProperty('keepDropped');
+  });
+
+  it('a generated plan reaches the loop with the keep-list on its writing step', async () => {
+    const raw = { ...goodDoc(), steps: goodDoc().steps.map((x) => (x.id === 'edit' ? { ...x, tools: ['read', 'edit'] } : x)) };
+    const p = await new LLMPlanner({ llm: new FakeLLM([JSON.stringify(raw)]), manifest: sampleManifest(), permissions: samplePermissions(), nonce: () => 'n5n5n5', repoFacts: factsOf('03-csv-export') }).write(adopted, new FakeBeliefs([]), goal);
+    const keep = p.steps.find((x) => x.id === 'edit')!.inputs['keep'] as string[];
+    expect(keep.some((k) => k.startsWith('src/report.js exports'))).toBe(true);
+  });
+
+  it('the plan prompt states the asserted values as facts, the documented interfaces as untrusted data, and the keep-list rule', () => {
+    const text = (id: string) => buildPlannerPrompt({ manifest: manifestOf(id), goal: g('change it'), event: adopted, beliefs: [], permissions: samplePermissions(), nonce: 'n5n5n5', repo: factsOf(id) })[0]!.content;
+    expect(text('04-needs-db')).toContain("`s.get('a')` is `undefined` (test/sessions.test.js)");
+    expect(text('04-needs-db')).toMatch(/Exact values the existing tests assert \(they stay true after the change/);
+    expect(text('05-needs-mail')).toMatch(/<untrusted src="comments:src\/signup\.js"[^>]*nonce="n5n5n5">\n[^<]*send\(\{ to, subject, text \}\)/);
+    expect(text('03-csv-export')).toMatch(/Every writing step carries a keep-list: its `inputsJson` holds `"keep": \["…", …\]`/);
+  });
+
+  it("the drafting prompt says a name the request leaves open takes the repository's spelling, case included", () => {
+    const id = '03-csv-export';
+    const statement = 'add CSV export to the report command';
+    const text = buildContractPrompt({ manifest: manifestOf(id), goal: g(statement), statement, inventory: [], nonce: 'n5n5n5', repo: factsOf(id) })[0]!.content;
+    expect(text).toContain("A name the request leaves open (a column header, a label, a key) takes the repository's own spelling, case included: fields the code returns as `region` and `total` make the CSV header `region,total`, never `Region,Total`.");
   });
 });

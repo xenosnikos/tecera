@@ -429,6 +429,12 @@ export interface WorkerStepRequest {
   guard?: WriteGuard;
   /** Stand-ins the broker serves for this step (mockRegistrationProblem accepted each); their results are simulated. */
   mocks?: readonly MockToolDeclaration[];
+  /**
+   * The step is the last writer before its verify gate: the worker refuses a return while the step has
+   * changed files and its runVerify has not passed since the last change (the host's record of the tool,
+   * never the program's word), a bounded number of times, then the gate decides. Absent = not required.
+   */
+  verifyBeforeReturn?: boolean;
 }
 
 export interface Worker {

@@ -608,6 +608,7 @@ describe('change-path envelope and the delete tool (scripted models, real sandbo
       edit([
         'let refused = null;',
         "try { await writeFile('src/config.js', 'export default { planted: true };\\n'); } catch (e) { refused = String((e && e.message) || e); }",
+        "await readFile('src/slugify.js');",
         "await writeFile({ path: 'src/slugify.js', oldText: \"(m) => '-'.repeat(m.length)\", newText: \"'-'\" });",
         'const v = await runVerify();',
         "return { facts: [{ key: 'changedFiles', value: ['src/slugify.js'] }, { key: 'configRefused', value: refused }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };",
@@ -640,10 +641,12 @@ describe('change-path envelope and the delete tool (scripted models, real sandbo
     const planted = "import { writeFileSync } from 'node:fs';\n" + FIXED + "writeFileSync(new URL('./config.js', import.meta.url), 'export default { planted: true };\\n');\n";
     const worker = [
       fixtureReplies().worker[0]!,
-      edit([`await writeFile('src/slugify.js', ${JSON.stringify(planted)});`, 'const v = await runVerify();', "return { facts: [{ key: 'changedFiles', value: ['src/slugify.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };"].join('\n')),
+      // the first run of the check creates src/config.js, so it is no pass (the tree changed under it); the second runs on the tree as it now is
+      edit([`await readFile('src/slugify.js');\nawait writeFile('src/slugify.js', ${JSON.stringify(planted)});`, 'let v = await runVerify();', 'if (!v.passed) v = await runVerify();', "return { facts: [{ key: 'changedFiles', value: ['src/slugify.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };"].join('\n')),
       edit([
         "const extra = await readFile('src/config.js');",
         "const gone = await deleteFile('src/config.js', extra.digest);",
+        "await readFile('src/slugify.js');",
         `await writeFile('src/slugify.js', ${JSON.stringify(FIXED)});`,
         'const v = await runVerify();',
         "return { facts: [{ key: 'changedFiles', value: ['src/slugify.js'] }, { key: 'deleted', value: gone.deleted }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };",

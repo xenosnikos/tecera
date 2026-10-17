@@ -426,11 +426,13 @@ describe('tecera run end to end (scripted models, real sandbox, real gates)', ()
     const env = { ...KEYS, TECERA_WORKTREES: wt };
     const r = fixtureReplies();
     const reject = { text: JSON.stringify({ verdict: 'reject', findings: [{ title: 'off-by-one in the separator class', path: 'src/slugify.js' }] }) };
-    // the rework of the edit step (attempt 2) changes the candidate, so the second review sees a new tree
+    // the rework of the edit step (attempt 2) changes the candidate, so the second review sees a new tree;
+    // the step is the last writer before the verify gate, so it runs the check before it returns
     const rework = {
       expect: 'off-by-one in the separator class',
       text: js(`await writeFile('src/rework.js', 'export const reworked = 1;\\n');
-return { facts: [{ key: 'changedFiles', value: ['src/rework.js'] }] };`),
+const v = await runVerify();
+return { facts: [{ key: 'changedFiles', value: ['src/rework.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };`),
     };
     const res = await cli(dir, ['run', 'fix-failing-test', '--scripted', scripts({ worker: [...r.worker, rework], reviewer: [reject, reject] })], { env });
     if (res.code !== 6) console.log(await dump(dir));
@@ -740,6 +742,7 @@ return { facts: [{ key: 'testEditDenied', value: denied !== null }] };`),
       expect: 'Fix the root cause',
       text: js(`let denied = null;
 try { await writeFile('package.json', '{}'); } catch (e) { denied = String(e.message); }
+await readFile('src/slugify.js');
 await writeFile({ path: 'src/slugify.js', oldText: "(m) => '-'.repeat(m.length)", newText: "'-'" });
 await writeFile('src/notes.js', 'export const note = 1;\\n');
 const v = await runVerify();

@@ -10,7 +10,7 @@
     },
     {
       "expect": "Fix the root cause",
-      "text": "```js\nlet denied = null;\ntry {\n  await writeFile({ path: 'test/slugify.test.js', oldText: \"'a-b-c'\", newText: \"'a--b-c'\" });\n} catch (e) {\n  denied = String((e && e.message) || e);\n}\nawait writeFile({ path: 'src/slugify.js', oldText: \"(m) => '-'.repeat(m.length)\", newText: \"'-'\" });\nconst v = await runVerify();\nconsole.log('test edit denied:', denied !== null, 'verify exit', v.exitCode);\nreturn { facts: [\n  { key: 'changedFiles', value: ['src/slugify.js'] },\n  { key: 'testEditDenied', value: denied !== null },\n  { key: 'verifyExitAfterEdit', value: v.exitCode },\n] };\n```",
+      "text": "```js\nawait readFile('src/slugify.js');\nlet denied = null;\ntry {\n  await writeFile({ path: 'test/slugify.test.js', oldText: \"'a-b-c'\", newText: \"'a--b-c'\" });\n} catch (e) {\n  denied = String((e && e.message) || e);\n}\nawait writeFile({ path: 'src/slugify.js', oldText: \"(m) => '-'.repeat(m.length)\", newText: \"'-'\" });\nconst v = await runVerify();\nconsole.log('test edit denied:', denied !== null, 'verify exit', v.exitCode);\nreturn { facts: [\n  { key: 'changedFiles', value: ['src/slugify.js'] },\n  { key: 'testEditDenied', value: denied !== null },\n  { key: 'verifyExitAfterEdit', value: v.exitCode },\n] };\n```",
       "usage": {
         "input": 2600,
         "output": 220

@@ -2,11 +2,12 @@ import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { WorkerToolContext } from './common.js';
 import type { CapabilitySet, Json, ToolContext, ToolRequest } from '@tecera/contracts';
-import { codeKindOf, exportedNames, syntaxProblem } from './codeCheck.js';
+import { checkEdit, codeKindOf, declaredNames, exportedNames, syntaxProblem } from './codeCheck.js';
 import { createEditTool as rawEditTool } from './edit.js';
 import { markWorktreeTainted } from './paths.js';
-import { liveWriteGuard } from '../invoke/fakes.js';
+import { liveWriteGuard, seenOnDisk } from '../invoke/fakes.js';
 import { EDIT_DESCRIPTION, STANDARD_STUBS } from '../protocol/prompts.js';
 
 const G = liveWriteGuard();
@@ -34,7 +35,7 @@ const REPORT = [
 ].join('\n');
 
 let root: string;
-let ctx: ToolContext;
+let ctx: WorkerToolContext;
 const text = (rel: string): Promise<string> => readFile(join(root, rel), 'utf8');
 
 beforeEach(async () => {
@@ -43,7 +44,7 @@ beforeEach(async () => {
   await writeFile(join(root, 'src/report.js'), REPORT);
   await writeFile(join(root, 'src/mail.cjs'), "function send() {}\nfunction validEmail(s) { return s.includes('@'); }\nmodule.exports = { send, validEmail };\n");
   await writeFile(join(root, 'src/math.ts'), 'export const add = (a: number, b: number): number => a + b;\nexport enum Op { Add }\n');
-  ctx = { runId: 'r1', worktree: root, capabilities: caps(), fencingToken: 7 };
+  ctx = { runId: 'r1', worktree: root, capabilities: caps(), fencingToken: 7, knownDigest: seenOnDisk(root) };
 });
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });
@@ -186,6 +187,165 @@ describe('edit refuses removing exports unless declared', () => {
   });
 });
 
+describe('edit refuses removing top-level declarations unless declared (removeNames; removeExports means the same)', () => {
+  const SIGNUP = [
+    '// signup(user, deps) registers a user and returns its record.',
+    'const users = [];',
+    'let nextId = 1;',
+    'function validEmail(s) { return /^[^@\\s]+@[^@\\s]+$/.test(s); }',
+    '',
+    'export async function signup(user, deps = {}) {',
+    "  if (!user || !validEmail(user.email)) throw new Error('a valid email is required');",
+    "  const record = { id: nextId++, email: user.email, name: user.name ?? '' };",
+    '  users.push(record);',
+    "  await deps.mailer?.send({ to: user.email, subject: 'Welcome', text: 'hi' });",
+    '  return record;',
+    '}',
+    '',
+  ].join('\n');
+  beforeEach(async () => writeFile(join(root, 'src/signup.js'), SIGNUP));
+
+  it('a rewrite that keeps the export but drops the store, the counter and a helper behind it is refused, naming them; nothing changes', async () => {
+    const rewrite = "export async function signup(user, deps = {}) {\n  if (!user || typeof user.email !== 'string') throw new Error('a valid email is required');\n  await deps.mailer.send({ to: user.email, subject: 'Welcome', text: 'hi' });\n  return { email: user.email };\n}\n";
+    const r = await edit.call(req('src/signup.js', rewrite), ctx);
+    expect(r.ok).toBe(false);
+    expect(r.error?.message).toMatch(/removes top-level name\(s\) "nextId", "users", "validEmail" that the module's own code or other code may use/);
+    expect(r.error?.message).toMatch(/removeNames: \[names\] \(removeExports means the same\)/);
+    expect(await text('src/signup.js')).toBe(SIGNUP);
+    // the same rewrite as a whole-file oldText/newText replacement is checked on the result too
+    const asReplace = await edit.call(req({ path: 'src/signup.js', oldText: SIGNUP, newText: rewrite }), ctx);
+    expect(asReplace.error?.message).toMatch(/"users"/);
+    expect(await text('src/signup.js')).toBe(SIGNUP);
+  });
+
+  it('a targeted edit that keeps every top-level name passes; a rename of a module-level helper is refused until declared', async () => {
+    const ok = await edit.call(req({ path: 'src/signup.js', oldText: "  users.push(record);\n", newText: "  users.push(record);\n  if (!deps.mailer) throw new Error('no mailer');\n" }), ctx);
+    expect(ok.ok, ok.error?.message).toBe(true);
+    expect(ok.value).toMatchObject({ mode: 'replace', syntax: 'parsed' });
+    expect(ok.value).not.toHaveProperty('removedNames');
+    const renamed = await edit.call(req({ path: 'src/signup.js', oldText: 'function validEmail(', newText: 'function isEmail(' }), ctx);
+    expect(renamed.error?.message).toMatch(/removes top-level name\(s\) "validEmail"/);
+    const declared = await edit.call(req({ path: 'src/signup.js', oldText: 'function validEmail(', newText: 'function isEmail(', removeNames: ['validEmail'] }), ctx);
+    expect(declared.ok, declared.error?.message).toBe(true);
+    expect(declared.value).toMatchObject({ removeNames: ['validEmail'], removedNames: ['validEmail'] });
+    expect(declared.value).not.toHaveProperty('removedExports');
+    // a binding inside a function is not top-level: it may go
+    const inner = await edit.call(req({ path: 'src/signup.js', oldText: "  const record = { id: nextId++, email: user.email, name: user.name ?? '' };\n  users.push(record);\n  if (!deps.mailer) throw new Error('no mailer');\n", newText: "  users.push({ id: nextId++, email: user.email, name: user.name ?? '' });\n" }), ctx);
+    expect(inner.ok, inner.error?.message).toBe(true);
+  });
+
+  it('dropping an exported and a module-level name together names both and says which is exported; removeExports declares either', async () => {
+    const both = 'const users = [];\nlet nextId = 1;\n';
+    const r = await edit.call(req('src/signup.js', both), ctx);
+    expect(r.error?.message).toMatch(/removes top-level name\(s\) \(exported: "signup"\) "signup", "validEmail" that/);
+    const partial = await edit.call(req('src/signup.js', 'export async function signup() {}\n', { removeExports: ['users', 'nextId'] }), ctx);
+    expect(partial.error?.message).toMatch(/removes top-level name\(s\) "validEmail"/);
+    const w = await edit.call(req('src/signup.js', 'export async function signup() {}\n', { removeExports: ['users', 'nextId', 'validEmail'] }), ctx);
+    expect(w.ok, w.error?.message).toBe(true);
+    expect(w.value).toMatchObject({ removeNames: ['users', 'nextId', 'validEmail'], removedNames: ['nextId', 'users', 'validEmail'], removeExports: ['users', 'nextId', 'validEmail'], removedExports: [] });
+    expect((await edit.call(req('src/signup.js', 'export const x = 1;\n', { removeNames: ['signup'], removeExports: ['y'] }), ctx)).value).toMatchObject({ removeNames: ['signup', 'y'], removedNames: ['signup'], removedExports: ['signup'] });
+  });
+
+  it('TypeScript declarations are top-level names too; removeNames must be a list of names', async () => {
+    await writeFile(join(root, 'src/types.ts'), 'interface Row { a: number }\ntype Id = string;\nconst MAX = 3;\nexport function f(r: Row, id: Id): number { return r.a + MAX + id.length; }\n');
+    const r = await edit.call(req('src/types.ts', 'export function f(r: { a: number }, id: string): number { return r.a + 3 + id.length; }\n'), ctx);
+    expect(r.error?.message).toMatch(/"Id", "MAX", "Row"/);
+    for (const bad of ['users', [1], [''], Array.from({ length: 201 }, (_, i) => `n${i}`)] as Json[]) {
+      expect((await edit.call(req({ path: 'src/signup.js', content: SIGNUP, removeNames: bad }), ctx)).error?.message).toMatch(/removeNames must be an array/);
+    }
+    expect((await edit.call(req('src/signup.js', SIGNUP, { removeNames: ['a'], other: 1 }), ctx)).error?.message).toMatch(/options may only hold removeExports or removeNames/);
+  });
+});
+
+describe('the stale-read check', () => {
+  it('an existing file the step never read, or that changed since it read it, cannot be edited; one read as it is now can; a new file needs no read', async () => {
+    const seen = new Map<string, string>();
+    const known = { ...ctx, knownDigest: (rel: string) => seen.get(rel) };
+    const unread = await edit.call(req({ path: 'src/report.js', oldText: 'return rows.length;', newText: 'return rows.length + 0;' }), known);
+    expect(unread.ok).toBe(false);
+    expect(unread.error?.message).toMatch(/src\/report\.js was not read by this step; read it before editing it/);
+    expect((await edit.call(req('src/report.js', REPORT + '// whole\n'), known)).error?.message).toMatch(/was not read by this step/);
+    seen.set('src/report.js', 'sha256:not-what-is-there');
+    const stale = await edit.call(req({ path: 'src/report.js', oldText: 'return rows.length;', newText: 'return rows.length + 0;' }), known);
+    expect(stale.ok).toBe(false);
+    expect(stale.error?.message).toMatch(/src\/report\.js changed since this step last read or wrote it; read it again/);
+    expect(await text('src/report.js')).toBe(REPORT);
+    const { sha256 } = await import('@tecera/contracts');
+    seen.set('src/report.js', sha256(REPORT));
+    expect((await edit.call(req({ path: 'src/report.js', oldText: 'return rows.length;', newText: 'return rows.length + 0;' }), known)).ok).toBe(true);
+    // the record moves with the step's own writes (the broker keeps it); a stale record is refused again
+    expect((await edit.call(req({ path: 'src/report.js', oldText: 'rows.length + 0', newText: 'rows.length + 1' }), known)).error?.message).toMatch(/changed since/);
+    seen.set('src/report.js', sha256(await text('src/report.js')));
+    expect((await edit.call(req({ path: 'src/report.js', oldText: 'rows.length + 0', newText: 'rows.length + 1' }), known)).ok).toBe(true);
+    // a context without a record has seen nothing
+    expect((await edit.call(req({ path: 'src/report.js', oldText: 'rows.length + 1', newText: 'rows.length + 2' }), { ...ctx, knownDigest: undefined })).error?.message).toMatch(/was not read by this step/);
+    // a new file has nothing to be stale against
+    expect((await edit.call(req('src/new.js', 'export const n = 1;\n'), known)).ok).toBe(true);
+  });
+});
+
+describe('exports and declarations are compared independently', () => {
+  it('an export demoted to a local declaration is refused (the binding stays, the interface goes); a local promoted to an export passes', async () => {
+    await writeFile(join(root, 'src/demote.js'), 'export function f() {}\nfunction g() {}\n');
+    const demoted = await edit.call(req('src/demote.js', 'function f() {}\nfunction g() {}\n'), ctx);
+    expect(demoted.ok).toBe(false);
+    expect(demoted.error?.message).toMatch(/removes exported name\(s\) "f" that the module's own code or other code may use \("f" still declared, but no longer exported\)/);
+    expect(await text('src/demote.js')).toBe('export function f() {}\nfunction g() {}\n');
+    expect(await checkEdit({ rel: 'src/demote.js', before: 'export function f() {}\n', after: 'function f() {}\n', mode: 'write', removeNames: [] }).catch((e: Error) => e.message)).toMatch(/"f"/);
+    const declared = await checkEdit({ rel: 'src/demote.js', before: 'export function f() {}\n', after: 'function f() {}\n', mode: 'write', removeNames: ['f'] });
+    expect(declared).toEqual({ syntax: 'parsed', removedNames: [], removedExports: ['f'] });
+    const promoted = await edit.call(req('src/demote.js', 'export function f() {}\nexport function g() {}\n'), ctx);
+    expect(promoted.ok, promoted.error?.message).toBe(true);
+    expect(promoted.value).not.toHaveProperty('removedNames');
+    // CommonJS: a name dropped from module.exports but kept as a function is a lost export too
+    await writeFile(join(root, 'src/both.cjs'), 'function a() {}\nfunction b() {}\nmodule.exports = { a, b };\n');
+    const cjs = await edit.call(req('src/both.cjs', 'function a() {}\nfunction b() {}\nmodule.exports = { a };\n'), ctx);
+    expect(cjs.error?.message).toMatch(/removes exported name\(s\) "b" .*\("b" still declared, but no longer exported\)/);
+  });
+
+  it('a declaration without a semicolon does not hide the CommonJS exports after it, nor the ones inside its initializer', async () => {
+    expect(exportedNames('const x = 1\nmodule.exports = { f() {} };')).toEqual(['f', 'module.exports']);
+    expect(exportedNames('const x = 1\nexports.g = () => 1\nlet y = 2\nObject.defineProperty(exports, "h", { value: 1 })')).toEqual(['g', 'h']);
+    expect(exportedNames('const y = exports.z = 1\nlet w = (module.exports.q = 2)')).toEqual(['q', 'z']);
+    expect(declaredNames('const x = 1\nmodule.exports = { f() {} };')).toEqual(['f', 'module.exports', 'x']);
+    // a line break that cannot end the statement keeps the initializer going
+    expect(declaredNames('const t = a\n  .b()\nconst u = 1 +\n  2\nconst v = fn\n(3)\nfunction k() {}')).toEqual(['k', 't', 'u', 'v']);
+    expect(exportedNames('const t = x as\n  Foo\nmodule.exports = 1')).toContain('module.exports');
+    const before = 'const x = 1\nmodule.exports = { f() {} };\n';
+    await expect(checkEdit({ rel: 'src/m.cjs', before, after: 'const x = 1;\n', mode: 'write', removeNames: [] })).rejects.toThrow(/"f", "module\.exports"/);
+    await expect(checkEdit({ rel: 'src/m.cjs', before: 'const y = exports.z = 1\n', after: 'const y = 1\n', mode: 'write', removeNames: [] })).rejects.toThrow(/"z"/);
+  });
+});
+
+describe('declaredNames (static analysis)', () => {
+  it('lists exports and the top-level bindings, functions, classes and TS declarations, never nested or exported-twice ones', () => {
+    const src = [
+      "import { x } from './x';",
+      'const a = 1, { b, c: d } = o;',
+      'let e;',
+      'var f = 2;',
+      'async function g() { const inner = 1; function h() {} }',
+      'function* k() {}',
+      'class C {}',
+      'export const m = 1;',
+      'export default class D {}',
+      'if (f) { const notTop = 1; }',
+      'for (const i of []) {}',
+      'declare const z: number;',
+      'interface I {}',
+      'type T = { a: 1 };',
+      'enum E { A }',
+      'const enum F { B }',
+      'namespace N {}',
+      'abstract class Q {}',
+      'type = 1;',
+    ].join('\n');
+    expect(declaredNames(src)).toEqual(['C', 'E', 'F', 'I', 'N', 'Q', 'T', 'a', 'b', 'd', 'default', 'e', 'f', 'g', 'k', 'm', 'z']);
+    expect(exportedNames(src)).toEqual(['default', 'm']);
+    expect(declaredNames("const s = 1;\nmodule.exports = { s };\nexports.t = 2;")).toEqual(['module.exports', 's', 't']);
+  });
+});
+
 describe('the existing refusals come first and are unchanged', () => {
   it('protected paths, the write allowlist, a missing lease and quarantine refuse before any content check', async () => {
     const broken = 'function (';
@@ -242,11 +402,13 @@ describe('codeKindOf and syntaxProblem', () => {
 });
 
 describe('the worker is told about the checks', () => {
-  it('the edit tool documentation names the checks, removeExports and the preference for targeted edits', () => {
+  it('the edit tool documentation names the checks, removeNames (and removeExports as the same) and the preference for targeted edits', () => {
     expect(STANDARD_STUBS.edit!.description).toBe(EDIT_DESCRIPTION);
     expect(EDIT_DESCRIPTION).toMatch(/does not parse is refused/);
-    expect(EDIT_DESCRIPTION).toMatch(/removeExports/);
+    expect(EDIT_DESCRIPTION).toMatch(/removeNames/);
+    expect(EDIT_DESCRIPTION).toMatch(/removeExports is accepted as the same/);
+    expect(EDIT_DESCRIPTION).toMatch(/top-level name of an existing module/);
     expect(EDIT_DESCRIPTION).toMatch(/Prefer targeted \{path, oldText, newText\} edits/);
-    expect(STANDARD_STUBS.edit!.signature).toContain('removeExports');
+    expect(STANDARD_STUBS.edit!.signature).toContain('removeNames');
   });
 });

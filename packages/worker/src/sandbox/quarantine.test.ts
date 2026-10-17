@@ -6,9 +6,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import type { WorkerToolContext } from '../tools/common.js';
 import type { CapabilitySet, ExecRequest, ExecResult, Inputs, Json, Repl, ToolBridge, ToolContext, ToolRequest, ToolResult, VerifyRunner } from '@tecera/contracts';
 import { Broker } from '../broker/broker.js';
-import { FakeLedger, FakeLLM, liveWriteGuard } from '../invoke/fakes.js';
+import { FakeLedger, FakeLLM, liveWriteGuard, seenOnDisk } from '../invoke/fakes.js';
 import { invoke, isTainted } from '../invoke/invoke.js';
 import { createEditTool } from '../tools/edit.js';
 import { markWorktreeTainted, worktreeTaint } from '../tools/paths.js';
@@ -208,13 +209,13 @@ describe('one quarantine registry: a taint recorded by either side is honoured b
   const ident = isRoot ? { allowRoot: true } : {};
   const runner = () => new ProcessVerifyRunner({ ...ident, containment: { cgroupBase: null, pidns: null }, allowWeakContainment: true });
   let dir: string;
-  let ctx: ToolContext;
+  let ctx: WorkerToolContext;
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'tecera-q-one-'));
     chmodSync(dir, 0o777);
     await mkdir(join(dir, 'src'));
     await writeFile(join(dir, 'src/x.ts'), 'ORIGINAL');
-    ctx = { runId: 'r1', worktree: dir, capabilities, fencingToken: 1 };
+    ctx = { runId: 'r1', worktree: dir, capabilities, fencingToken: 1, knownDigest: seenOnDisk(dir) };
   });
   afterEach(async () => {
     releaseWorktreeQuarantine(dir, { by: 'test', reason: 'cleanup' });

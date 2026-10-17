@@ -19,7 +19,7 @@ import type { ScenarioScore } from './scorer.js';
  */
 
 /** What a score without a ledger (a baseline agent's) cannot be measured on: reported as null, never as zero. */
-export const LEDGER_ONLY_METRICS = ['achieved', 'provisional', 'goalDelivered', 'humanTouches', 'cost', 'falseAchieved', 'unverifiedAchieved', 'refused', 'giveUp', 'trace', 'replay', 'tamper', 'fidelity', 'coverage', 'audit'] as const;
+export const LEDGER_ONLY_METRICS = ['achieved', 'provisional', 'goalDelivered', 'humanTouches', 'cost', 'falseAchieved', 'unverifiedAchieved', 'refused', 'giveUp', 'trace', 'replay', 'tamper', 'fidelity', 'coverage', 'audit', 'telemetry'] as const;
 export type LedgerOnlyMetric = (typeof LEDGER_ONLY_METRICS)[number];
 
 /** A score taken without a ledger: the ledger-only metrics are null, the repository metrics are measured. */
@@ -241,6 +241,15 @@ export function scorecardMarkdown(card: Scorecard): string {
     `Passed its scenario rules: ${t.passed}/${t.scenarios}${t.notMeasured ? ` (${t.notMeasured} not measured, counted as not passed)` : ''}. Goals achieved with a delivered PR: ${t.goalsDelivered}/${t.scenarios}. ${t.humanTouchesPerJob === null ? '—' : Math.round(t.humanTouchesPerJob * 100) / 100} human touches per job; ${usd(t.usd)}; ${secs(t.wallClockMs)} wall clock; fidelity correct ${t.measured ? pct(t.fidelityShare) : NM}.`,
   );
   lines.push('', '`rules`: every pass rule of the scenario held. `goal delivered`: the goal is proven achieved, a PR a human approved delivered it, and every hidden reference check passes on that commit. `n/m`: not measured. Coverage and refused attempts are reported, they are not pass rules.');
+  // Where the work went, per measured run (attribution only): worker turns, refused returns, candidate attempts, reviewer calls.
+  const measured = card.rows.filter((r) => r.tecera.status !== 'not-measured' && r.tecera.telemetry);
+  if (measured.length) {
+    lines.push('', '## Worker telemetry', '', '| scenario | worker turns | refused returns | fallback returns | candidate attempts | review cycles |', '|---|---:|---:|---:|---:|---:|');
+    for (const r of measured) {
+      const t = r.tecera.telemetry;
+      lines.push(`| ${cell(r.scenario)} | ${t.workerTurns} | ${t.refusedReturns} | ${t.fallbackReturns} | ${t.candidateAttempts} | ${t.reviewCycles} |`);
+    }
+  }
   const failures = card.rows.flatMap((r) => failureLines(r.scenario, r.tecera));
   if (failures.length) lines.push('', '## Failed rules', '', ...failures);
   const baseFailures = card.rows.flatMap((r) => (r.baseline ? failureLines(r.scenario, r.baseline) : []));

@@ -10,7 +10,7 @@
     },
     {
       "expect": "Fix the root cause",
-      "text": "```js\nawait writeFile({ path: 'src/split.js', oldText: '  return Array.from({ length: people }, () => share);', newText: '  const extra = totalCents - share * people;\\n  return Array.from({ length: people }, (_, i) => share + (i < extra ? 1 : 0));' });\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/split.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "text": "```js\nawait readFile('src/split.js');\nawait writeFile({ path: 'src/split.js', oldText: '  return Array.from({ length: people }, () => share);', newText: '  const extra = totalCents - share * people;\\n  return Array.from({ length: people }, (_, i) => share + (i < extra ? 1 : 0));' });\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/split.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
       "usage": {
         "input": 2400,
         "output": 200

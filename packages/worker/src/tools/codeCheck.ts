@@ -12,10 +12,12 @@ import { ToolInputError } from './common.js';
  *   .js passes when it parses under either goal; .ts/.mts/.cts go through node's own TypeScript parser
  *   (module.stripTypeScriptTypes; its output is discarded). .jsx/.tsx are not checked: there is no JSX
  *   parser without a new dependency.
- * - exports: the top-level exported names (export declarations and lists, export default, export * from,
- *   TS export =, module.exports / exports.x assignments, Object.defineProperty(exports, ...)) are found by a
- *   small lexer (static analysis only). An edit of an existing module whose result drops a name it exported
- *   is refused unless the request declares that name in removeExports.
+ * - names: the top-level exported names (export declarations and lists, export default, export * from,
+ *   TS export =, module.exports / exports.x assignments, Object.defineProperty(exports, ...)) and the
+ *   top-level declarations that are not exported (const/let/var bindings, functions, classes, TS
+ *   declarations) are found by a small lexer (static analysis only). An edit of an existing module whose
+ *   result drops a declared name, or stops exporting an exported one, is refused unless the request
+ *   declares that name in removeNames (removeExports is the same list under its older name).
  */
 
 export type CodeKind = 'js' | 'esm' | 'cjs' | 'ts' | 'cts';
@@ -334,10 +336,14 @@ function tokenize(src: string): Tok[] {
 }
 
 const DECL_KEYWORDS = new Set(['interface', 'type', 'enum', 'namespace', 'module']);
-const STATEMENT_START = new Set(['export', 'import', 'const', 'let', 'var', 'function', 'class', 'if', 'for', 'while', 'do', 'switch', 'try', 'return', 'throw']);
+/** Identifier tokens that continue an expression across a line break (ASI never ends a statement before them). */
+const OPERATOR_KEYWORDS = new Set(['in', 'instanceof', 'of', 'as', 'satisfies', 'extends', 'implements']);
 
 interface Scan {
+  /** The exported names (ESM declarations and lists, CommonJS assignments). */
   names: Set<string>;
+  /** Top-level declarations that are not exported: const/let/var bindings, functions, classes, TS declarations. */
+  decls: Set<string>;
   /** Top-level import/export syntax was seen (the file is written as an ES module). */
   esm: boolean;
 }
@@ -345,6 +351,7 @@ interface Scan {
 function scan(src: string): Scan {
   const t = tokenize(src);
   const names = new Set<string>();
+  const decls = new Set<string>();
   let esm = false;
   const at = (i: number): Tok | undefined => t[i];
   const isId = (i: number, v?: string): boolean => t[i]?.k === 'id' && (v === undefined || t[i]!.v === v);
@@ -397,12 +404,18 @@ function scan(src: string): Scan {
     return i + 1;
   };
 
-  /** export const|let|var a = ..., {b, c: d} = ...; returns the index after the declaration. */
-  const declarators = (i: number): number => {
+  /**
+   * [export] const|let|var a = ..., {b, c: d} = ...; returns the index after the declaration. The statement
+   * ends at `;`, at a lower depth, or where a line break would end it under ASI: before a token that cannot
+   * continue the expression (an identifier that is not an operator keyword, a number, a string, a regex)
+   * when the token before the break completed one. A CommonJS assignment inside an initializer still defines
+   * the module's surface (cjs).
+   */
+  const declarators = (i: number, into: Set<string>): number => {
     const d = t[i - 1]!.d;
     let j = i;
     for (;;) {
-      j = pattern(j, names);
+      j = pattern(j, into);
       // Type annotation and initializer, up to the next declarator or the end of the statement.
       let angle = 0;
       while (j < t.length) {
@@ -415,13 +428,24 @@ function scan(src: string): Scan {
           else if (tk.k === 'p' && tk.v === '>>') angle = Math.max(0, angle - 2);
           else if (tk.k === 'p' && tk.v === '=') angle = 0;
           else if (tk.k === 'p' && tk.v === ',' && angle === 0) break;
-          else if (tk.nl && tk.k === 'id' && STATEMENT_START.has(tk.v) && j > i) return j;
+          else if (tk.nl && j > i && statementEnds(j)) return j;
         }
+        if (tk.k === 'id' && !afterDot(j)) cjs(j);
         j++;
       }
       if (j >= t.length) return j;
       j++; // the ','
     }
+  };
+
+  /** Whether a line break before token j ends the statement (ASI): the previous token completed an expression and j cannot continue one. */
+  const statementEnds = (j: number): boolean => {
+    const prev = t[j - 1]!;
+    const tk = t[j]!;
+    const complete = prev.k !== 'p' || prev.v === ')' || prev.v === ']' || prev.v === '}' || prev.v === '++' || prev.v === '--';
+    if (!complete) return false;
+    if (tk.k === 'id') return !OPERATOR_KEYWORDS.has(tk.v);
+    return tk.k === 'n' || tk.k === 's' || tk.k === 'x';
   };
 
   /** export { a, b as c, type d } [from '...'] */
@@ -445,6 +469,28 @@ function scan(src: string): Scan {
       while (j < end - 1 && !isP(j, ',')) j++;
     }
     return end;
+  };
+
+  /** A CommonJS export assignment starting at the id token i: exports.a =, module.exports[.a] =, Object.defineProperty(exports, 'a', …). */
+  const cjs = (i: number): void => {
+    const tk = t[i]!;
+    const assign = (j: number): boolean => isP(j, '=');
+    if (tk.v === 'exports') {
+      if (isP(i + 1, '.') && isId(i + 2) && assign(i + 3)) names.add(at(i + 2)!.v);
+      else if (isP(i + 1, '[') && at(i + 2)?.k === 's' && isP(i + 3, ']') && assign(i + 4)) names.add(at(i + 2)!.v);
+    } else if (tk.v === 'module' && isP(i + 1, '.') && isId(i + 2, 'exports')) {
+      if (assign(i + 3)) {
+        names.add('module.exports');
+        if (isP(i + 4, '{')) objectKeys(i + 4);
+      } else if (isP(i + 3, '.') && isId(i + 4) && assign(i + 5)) names.add(at(i + 4)!.v);
+      else if (isP(i + 3, '[') && at(i + 4)?.k === 's' && isP(i + 5, ']') && assign(i + 6)) names.add(at(i + 4)!.v);
+    } else if (tk.v === 'Object' && isP(i + 1, '.') && isId(i + 2, 'defineProperty') && isP(i + 3, '(')) {
+      let j = i + 4;
+      if (isId(j, 'module') && isP(j + 1, '.') && isId(j + 2, 'exports')) j += 3;
+      else if (isId(j, 'exports')) j += 1;
+      else return;
+      if (isP(j, ',') && at(j + 1)?.k === 's') names.add(at(j + 1)!.v);
+    }
   };
 
   /** module.exports = { a, b: 1, c() {}, 'd': 2, ...e } */
@@ -487,7 +533,7 @@ function scan(src: string): Scan {
       else if (nx.k === 'p' && nx.v === '=') names.add('export=');
       else if (nx.k === 'id') {
         if (nx.v === 'const' && isId(j + 1, 'enum') && isId(j + 2)) names.add(at(j + 2)!.v);
-        else if (nx.v === 'const' || nx.v === 'let' || nx.v === 'var') i = declarators(j + 1) - 1;
+        else if (nx.v === 'const' || nx.v === 'let' || nx.v === 'var') i = declarators(j + 1, names) - 1;
         else if (nx.v === 'type' && isP(j + 1, '{')) i = exportList(j + 1) - 1;
         else if (nx.v === 'import' && isId(j + 1)) names.add(at(j + 1)!.v);
         else {
@@ -503,26 +549,40 @@ function scan(src: string): Scan {
       }
       continue;
     }
-    // CommonJS, at any depth (assignments under a condition still define the module's surface).
-    const assign = (j: number): boolean => isP(j, '=');
-    if (tk.v === 'exports') {
-      if (isP(i + 1, '.') && isId(i + 2) && assign(i + 3)) names.add(at(i + 2)!.v);
-      else if (isP(i + 1, '[') && at(i + 2)?.k === 's' && isP(i + 3, ']') && assign(i + 4)) names.add(at(i + 2)!.v);
-    } else if (tk.v === 'module' && isP(i + 1, '.') && isId(i + 2, 'exports')) {
-      if (assign(i + 3)) {
-        names.add('module.exports');
-        if (isP(i + 4, '{')) objectKeys(i + 4);
-      } else if (isP(i + 3, '.') && isId(i + 4) && assign(i + 5)) names.add(at(i + 4)!.v);
-      else if (isP(i + 3, '[') && at(i + 4)?.k === 's' && isP(i + 5, ']') && assign(i + 6)) names.add(at(i + 4)!.v);
-    } else if (tk.v === 'Object' && isP(i + 1, '.') && isId(i + 2, 'defineProperty') && isP(i + 3, '(')) {
-      let j = i + 4;
-      if (isId(j, 'module') && isP(j + 1, '.') && isId(j + 2, 'exports')) j += 3;
-      else if (isId(j, 'exports')) j += 1;
-      else continue;
-      if (isP(j, ',') && at(j + 1)?.k === 's') names.add(at(j + 1)!.v);
+    // Top-level declarations that are not exported (a `declare` keyword is skipped like an export's).
+    if (tk.d === 0 && !isId(i - 1, 'export') && !isId(i - 1, 'default')) {
+      let k = i;
+      if (isId(k, 'declare') && at(k + 1)?.k === 'id') k++;
+      const kw = at(k);
+      if (kw && (kw.v === 'const' || kw.v === 'let' || kw.v === 'var') && !(kw.v === 'const' && isId(k + 1, 'enum'))) {
+        if (at(k + 1) && (at(k + 1)!.k === 'id' || isP(k + 1, '{') || isP(k + 1, '['))) i = declarators(k + 1, decls) - 1;
+        continue;
+      }
+      let f = k;
+      while (isId(f, 'async') || isId(f, 'abstract')) f++;
+      if (isId(f, 'function')) {
+        f++;
+        if (isP(f, '*')) f++;
+        if (isId(f)) decls.add(at(f)!.v);
+        continue;
+      }
+      if (isId(f, 'class') && isId(f + 1) && !isId(f + 1, 'extends') && !isId(f + 1, 'implements')) {
+        decls.add(at(f + 1)!.v);
+        continue;
+      }
+      if (kw && kw.v === 'const' && isId(k + 1, 'enum') && isId(k + 2)) {
+        decls.add(at(k + 2)!.v);
+        continue;
+      }
+      if (kw && DECL_KEYWORDS.has(kw.v) && isId(k + 1) && (kw.v !== 'type' || isP(k + 2, '=') || isP(k + 2, '<'))) {
+        decls.add(at(k + 1)!.v);
+        continue;
+      }
     }
+    // CommonJS, at any depth (assignments under a condition still define the module's surface).
+    cjs(i);
   }
-  return { names, esm };
+  return { names, decls, esm };
 }
 
 /** The module's exported names (static analysis; see scan). Exported for tests. */
@@ -530,12 +590,20 @@ export function exportedNames(src: string): string[] {
   return [...scan(src).names].sort();
 }
 
+/** The module's exported names and its top-level declarations (what an edit must keep or declare removed). */
+export function declaredNames(src: string): string[] {
+  const r = scan(src);
+  return [...new Set([...r.names, ...r.decls])].sort();
+}
+
 // ---------------------------------------------------------------- the edit check
 
 export interface EditCheck {
   /** 'parsed' when the result was syntax-checked; 'not-checked' for a file outside the checked kinds. */
   syntax: 'parsed' | 'not-checked' | 'already-broken';
-  /** Exported names the edit removed (all declared in removeExports). */
+  /** Top-level names (exported or not) the edit removed (all declared in removeNames). */
+  removedNames: string[];
+  /** Exported names the result no longer exports: removed, or demoted to a local (all declared in removeNames). */
   removedExports: string[];
 }
 
@@ -546,8 +614,8 @@ export interface EditCheckInput {
   after: string;
   /** 'replace' = an oldText/newText edit; 'write' = a whole-file write. */
   mode: 'replace' | 'write';
-  /** Exported names the request declares it removes. */
-  removeExports: readonly string[];
+  /** Top-level names the request declares it removes (removeNames, and removeExports as its alias). */
+  removeNames: readonly string[];
 }
 
 function located(rel: string, p: SyntaxProblem): string {
@@ -556,13 +624,15 @@ function located(rel: string, p: SyntaxProblem): string {
 
 /**
  * Throws ToolInputError (nothing is written) when the resulting content of a JS/TS-family file does not
- * parse, or when it drops an exported name of the existing file that removeExports does not declare.
- * A partial edit of a file that already did not parse is not refused for that breakage alone (it was not
- * introduced by this edit, and fixing it may take several edits); a whole-file write must always parse.
+ * parse, or when it drops a top-level name of the existing file (an exported name, or a module-level
+ * binding, function, class or TS declaration) that removeNames does not declare. A rewrite that keeps the
+ * exports but drops the state or helpers behind them is what this refuses. A partial edit of a file that
+ * already did not parse is not refused for that breakage alone (it was not introduced by this edit, and
+ * fixing it may take several edits); a whole-file write must always parse.
  */
 export async function checkEdit(i: EditCheckInput): Promise<EditCheck> {
   const kind = codeKindOf(i.rel);
-  if (kind === null) return { syntax: 'not-checked', removedExports: [] };
+  if (kind === null) return { syntax: 'not-checked', removedNames: [], removedExports: [] };
   let syntax: EditCheck['syntax'] = 'parsed';
   const problem = await syntaxProblem(kind, i.after, i.rel);
   if (problem) {
@@ -570,15 +640,24 @@ export async function checkEdit(i: EditCheckInput): Promise<EditCheck> {
     if (!preexisting) throw new ToolInputError(`refused: the new content of ${located(i.rel, problem)}. Nothing was written; fix the code and write it again`);
     syntax = 'already-broken';
   }
-  if (i.before === null) return { syntax, removedExports: [] };
-  const kept = new Set(exportedNames(i.after));
-  const removed = exportedNames(i.before).filter((n) => !kept.has(n));
-  const undeclared = removed.filter((n) => !i.removeExports.includes(n));
+  if (i.before === null) return { syntax, removedNames: [], removedExports: [] };
+  // Two independent comparisons: a declared name must still be declared (exported or not: a local promoted
+  // to an export is kept), and an exported name must still be exported (demoting it to a local loses the
+  // module's interface, whatever the binding still does).
+  const kept = new Set(declaredNames(i.after));
+  const removed = declaredNames(i.before).filter((n) => !kept.has(n));
+  const stillExported = new Set(exportedNames(i.after));
+  const removedExports = exportedNames(i.before).filter((n) => !stillExported.has(n));
+  const undeclared = [...new Set([...removed, ...removedExports])].filter((n) => !i.removeNames.includes(n)).sort();
   if (undeclared.length) {
+    const demoted = undeclared.filter((n) => !removed.includes(n));
+    const ex = undeclared.filter((n) => removedExports.includes(n));
+    const what = ex.length === undeclared.length ? 'exported name(s)' : ex.length ? `top-level name(s) (exported: ${ex.map((n) => JSON.stringify(n)).join(', ')})` : 'top-level name(s)';
     throw new ToolInputError(
-      `refused: this edit of ${i.rel} removes exported name(s) ${undeclared.map((n) => JSON.stringify(n)).join(', ')} that other code may use. ` +
-        'Nothing was written. Keep them (prefer a targeted {path, oldText, newText} edit over rewriting the file), or, if the removal is intended, declare it with removeExports: [names]',
+      `refused: this edit of ${i.rel} removes ${what} ${undeclared.map((n) => JSON.stringify(n)).join(', ')} that the module's own code or other code may use` +
+        `${demoted.length ? ` (${demoted.map((n) => JSON.stringify(n)).join(', ')} still declared, but no longer exported)` : ''}. ` +
+        'Nothing was written. Keep them (prefer a targeted {path, oldText, newText} edit over rewriting the file), or, if the removal is intended, declare it with removeNames: [names] (removeExports means the same)',
     );
   }
-  return { syntax, removedExports: removed };
+  return { syntax, removedNames: removed, removedExports };
 }

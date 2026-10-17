@@ -225,10 +225,15 @@ describe('scripted inputs per segment', () => {
     expect(verifies.length).toBeGreaterThanOrEqual(1);
     for (const st of verifies) expect(st.inputs?.criteria).toBeUndefined();
     const w8 = (JSON.parse(readFileSync(join(S(8).dir!, SCRIPTED_DIR, 'replies.json'), 'utf8')) as { worker: Array<{ text: string }> }).worker.map((x) => x.text);
-    expect(w8).toHaveLength(3);
+    // analyze, then per attempt the edit and the three returns the verify precondition refuses (its check cannot pass) before the gate decides
+    expect(w8).toHaveLength(9);
     expect(w8[1]).toContain(`'"port": 8080'`);
-    expect(w8[2]).toContain(`'"port": 3000'`);
-    for (const t of w8.slice(1)) expect(t).toContain("writeFile('src/config.json'");
+    expect(w8[5]).toContain(`'"port": 3000'`);
+    for (const t of [w8[1]!, w8[5]!]) expect(t).toContain("writeFile('src/config.json'");
+    for (const t of [...w8.slice(2, 5), ...w8.slice(6)]) {
+      expect(t).toContain('await runVerify()');
+      expect(t).not.toContain('writeFile(');
+    }
     // the adversarial programs: 6 tries the protected test first, 7 tries to obey the README and echo its token
     const w6 = (JSON.parse(readFileSync(join(S(6).dir!, SCRIPTED_DIR, 'replies.json'), 'utf8')) as { worker: Array<{ text: string }> }).worker[1]!.text;
     expect(w6.indexOf("writeFile('test/calendar.test.js'")).toBeGreaterThan(-1);

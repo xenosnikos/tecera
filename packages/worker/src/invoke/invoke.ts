@@ -102,6 +102,13 @@ import { applyPatches, SpanRunner, type AbortReason, type TraceEntry } from './s
 /** An aborted outcome of a quarantined invoke tree (contracts Outcome plus the `tainted` field). */
 export type TaintedOutcome = Extract<Outcome, { kind: 'aborted' }> & { tainted: TaintInfo };
 
+/**
+ * An invoke's outcome carries the model turns it took, those of every nested invoke that completed under
+ * it included (telemetry; the loop records the root's total on the step's events). A resumed invoke counts
+ * on from its checkpoint, so a step that was held reports a cumulative count when it completes.
+ */
+export type TurnedOutcome = Outcome & { turns?: number };
+
 export const isTainted = (o: Outcome): o is TaintedOutcome => o.kind === 'aborted' && !!(o as Partial<TaintedOutcome>).tainted;
 
 /** A nested invoke that completed: replayed (never re-run) when its parent re-runs after a resume. */
@@ -159,7 +166,18 @@ export interface InvokeOptions {
   dispatcher?: Dispatcher;
   /** Opaque caller data stored (redacted) in the suspension checkpoint (StepWorker uses it to rebuild deps). */
   checkpointExtra?: JsonObject;
+  /**
+   * The verify precondition on returns (the loop sets it for the last writer before a verify gate): a
+   * program of the root invoke that changed files may return only after runVerify passed since the last
+   * change, as the broker recorded the tools (never as the program says). A return before that is refused
+   * and the model gets the reason and another turn, at most RETURN_REFUSALS times; the next one is accepted
+   * and the gate decides. Every decision is recorded as `worker.return` evidence.
+   */
+  verifyBeforeReturn?: boolean;
 }
+
+/** Refused returns per invoke before the verify precondition falls back to the gate. */
+export const RETURN_REFUSALS = 3;
 
 export interface ResumeDeps extends Omit<InvokeOptions, 'output' | 'run'> {
   /** Consume the grant in the ledger (default true: the worker owns consumption of its requests). */
@@ -200,6 +218,8 @@ interface State {
   generation: number;
   /** Completed nested invokes of this invoke, by child invokeId. */
   children: Map<string, ChildRecord>;
+  /** Returns refused under the verify precondition so far (carried across a resume). */
+  refusedReturns: number;
 }
 
 export interface InvokeCheckpoint extends JsonObject {
@@ -222,6 +242,12 @@ export interface InvokeCheckpoint extends JsonObject {
   children: Json;
   /** Completed non-read effects of the tree (EffectRecord[]); absent in older checkpoints. */
   effects: Json;
+  /** The broker's verify state (VerifyState); absent at runtime in older checkpoints (restored as unknown: no pass assumed). */
+  verify: Json;
+  /** The broker's record of what the tree last saw at each path ([path, digest][]); absent at runtime in older checkpoints (fresh reads). */
+  known: Json;
+  /** Returns refused under the verify precondition before the suspension; absent at runtime in older checkpoints. */
+  refusedReturns: number;
 }
 
 interface Internal extends InvokeOptions {
@@ -302,7 +328,7 @@ export async function invoke(inputs: Inputs, opts: InvokeOptions): Promise<Outco
   // One redactor for invoke, broker, tools and descendants: the broker adopts this secret list.
   opts.broker.adoptRedactor(own);
   const red = opts.broker.redactor;
-  const st: State = { inputs, history: new History([], red), turn: 0, checkpoints: new Map(), generation: 1, children: new Map() };
+  const st: State = { inputs, history: new History([], red), turn: 0, checkpoints: new Map(), generation: 1, children: new Map(), refusedReturns: 0 };
   return strip(await runInvoke(st, { ...opts, red }));
 }
 
@@ -416,6 +442,8 @@ async function resumeFromCheckpoint(cp: InvokeCheckpoint, token: string, opts: I
   if (token.startsWith('mem:')) memoryCheckpoints.delete(token);
   opts.broker.preloadJournal(cp.journal as unknown as Array<[string, ToolResult]>);
   opts.broker.preloadEffects(cp.effects);
+  opts.broker.preloadVerifyState(cp.verify);
+  opts.broker.preloadKnown(cp.known);
   opts.broker.restoreExecSeq(cp.execSeq);
   const st: State = {
     inputs: cp.inputs as unknown as Inputs,
@@ -424,6 +452,7 @@ async function resumeFromCheckpoint(cp: InvokeCheckpoint, token: string, opts: I
     checkpoints: new Map(Object.entries((cp.checkpoints as JsonObject) ?? {})),
     generation: cp.generation + 1,
     children: new Map(childRecords(cp.children).map((c) => [c.invokeId, c] as const)),
+    refusedReturns: typeof cp.refusedReturns === 'number' && Number.isInteger(cp.refusedReturns) && cp.refusedReturns > 0 ? cp.refusedReturns : 0,
   };
   const children = new Map((pending.children ?? []).map((c) => [c.invokeId, c.token] as const));
   const o: Internal = { ...opts, ...(cp.config ? { config: cp.config as unknown as ConfigOverride } : {}), ...(cp.extra ? { checkpointExtra: cp.extra as JsonObject } : {}), resumeChildren: children };
@@ -510,8 +539,38 @@ async function runInvoke(st: State, opts: Internal, rerun?: { code: string; exec
       out = { kind: 'aborted', reasons: dedupe([{ code: 'cancelled', reason: `tainted: ${taint.reason}`, hookId: 'quarantine' }, ...prior]), run, tainted: { ...taint, unresolved: [...taint.unresolved] } } as TaintedOutcome;
     }
     const clean = sanitizeOutcome(out, red) as SubInvokeResult;
+    // Model turns, this invoke's own plus its completed children's (each child's outcome carries its total).
+    let nested = 0;
+    for (const c of st.children.values()) {
+      const t = c.outcome && typeof c.outcome === 'object' && !Array.isArray(c.outcome) ? (c.outcome as { turns?: unknown }).turns : undefined;
+      if (typeof t === 'number' && Number.isInteger(t) && t > 0) nested += t;
+    }
+    (clean as TurnedOutcome).turns = st.turn + nested;
     if (clean.kind === 'suspended') return { ...clean, pendingRequests: (pendingRequests ?? [clean.request]).map((r) => sanitizeRequest(r, red)), childInvokeId: run.invokeId };
     return clean;
+  };
+
+  /**
+   * The verify precondition on a return (InvokeOptions.verifyBeforeReturn): null when the return may
+   * proceed, else why it is refused. Every decision is recorded as evidence; a record that cannot be
+   * written refuses the return as a ledger failure (the SpanRunner keeps it fatal).
+   */
+  const verifyHold = async (route: 'return' | 'replaceOutput'): Promise<{ hold: string | null } | { abort: AbortReason[] }> => {
+    if (!opts.verifyBeforeReturn || run.depth !== 0 || !caps.tools.includes('runVerify')) return { hold: null };
+    if (opts.broker.verifyState().edits === 0) return { hold: null };
+    // The broker's verdict: the pass must still stand for the tree as it is now (fingerprinted), never the program's word.
+    const passed = await opts.broker.verifyPassed();
+    const v = passed.state;
+    const decision = passed.ok ? 'accepted' : st.refusedReturns >= RETURN_REFUSALS ? 'fallback' : 'refused';
+    if (decision === 'refused') st.refusedReturns++;
+    const reason = passed.ok ? null : `this step changed files (${v.edits} edit(s)) and ${passed.why}`;
+    try {
+      await spans.evidence(`return:${run.runId}:${run.invokeId}:t${st.turn}:g${st.generation}:${route}`, 'worker.return', { decision, route, turn: st.turn, edits: v.edits, editsSinceVerify: v.editsSinceVerify, lastVerify: v.lastVerify as unknown as Json, refusals: st.refusedReturns, ...(reason ? { reason } : {}) });
+    } catch (e) {
+      return { abort: [{ code: 'ledger', reason: `return decision not recorded: ${(e as Error).message}`, hookId: 'invoke' }] };
+    }
+    if (decision !== 'refused') return { hold: null };
+    return { hold: `VerifyRequired: ${reason}. Run \`await runVerify()\` after your last edit, read its \`passed\`, fix the code while it is false, and return only once it is true (refused return ${st.refusedReturns} of ${RETURN_REFUSALS}; after that the host's verify gate decides)` };
   };
 
   // ---- suspension: checkpoint + one approval request per own request, then Outcome suspended
@@ -547,6 +606,9 @@ async function runInvoke(st: State, opts: Internal, rerun?: { code: string; exec
       extra: red.redactJson(opts.checkpointExtra ?? null),
       children: red.redactJson([...st.children.values()]),
       effects: red.redactJson(opts.broker.exportEffects()),
+      verify: red.redactJson(opts.broker.verifyState() as unknown as Json),
+      known: red.redactJson(opts.broker.exportKnown() as unknown as Json),
+      refusedReturns: st.refusedReturns,
     };
     let token: string;
     try {
@@ -623,6 +685,10 @@ async function runInvoke(st: State, opts: Internal, rerun?: { code: string; exec
   if (c.replaceOutput !== undefined) {
     const errs = validateSchema(c.replaceOutput, opts.output);
     if (errs.length) return finish(aborted([{ code: 'schema', reason: `ReplaceOutput violates the schema: ${errs.join('; ')}`, hookId: 'invoke' }]));
+    // A hook cannot take another turn: an output replaced while the precondition is unmet ends the step.
+    const held = await verifyHold('replaceOutput');
+    if ('abort' in held) return finish(aborted(held.abort));
+    if (held.hold) return finish(aborted([{ code: 'policy', reason: `ReplaceOutput refused: ${held.hold}`, hookId: 'invoke' }]));
     return finishReturned(c.replaceOutput);
   }
 
@@ -783,6 +849,12 @@ async function runInvoke(st: State, opts: Internal, rerun?: { code: string; exec
           st.history.push({ turn: st.turn, code, output: `${printed}${printed ? '\n' : ''}ReturnSchemaError: the return value does not match the output schema: ${errs.join('; ')}`, result: 'raise' });
           return null;
         }
+        const held = await verifyHold('return');
+        if ('abort' in held) return finish(aborted(held.abort));
+        if (held.hold) {
+          st.history.push({ turn: st.turn, code, output: `${printed}${printed ? '\n' : ''}${held.hold}`, result: 'raise' });
+          return null;
+        }
         st.history.push({ turn: st.turn, code, output: printed, result: 'return' });
         return finishReturned(value);
       }
@@ -840,6 +912,7 @@ async function runInvoke(st: State, opts: Internal, rerun?: { code: string; exec
       else delete childOpts.deadlineAt;
       delete childOpts.checkpointExtra;
       delete childOpts.resumeChildren;
+      delete childOpts.verifyBeforeReturn;
       const token = opts.resumeChildren?.get(childId);
       if (token) {
         opts.resumeChildren!.delete(childId);
@@ -847,7 +920,7 @@ async function runInvoke(st: State, opts: Internal, rerun?: { code: string; exec
         if (!cp || (cp.run as unknown as RunRef)?.invokeId !== childId) return sanitizeOutcome({ kind: 'failed', error: { name: 'ResumeError', message: `no checkpoint for suspended sub-invoke ${childId}` }, run: childRun }, red);
         return record(await scope({ capabilities: childCaps }, () => resumeFromCheckpoint(cp, token, childOpts)));
       }
-      return record(await scope({ capabilities: childCaps }, () => runInvoke({ inputs: childInputs, history: new History([], red), turn: 0, checkpoints: new Map(), generation: 1, children: new Map() }, childOpts)));
+      return record(await scope({ capabilities: childCaps }, () => runInvoke({ inputs: childInputs, history: new History([], red), turn: 0, checkpoints: new Map(), generation: 1, children: new Map(), refusedReturns: 0 }, childOpts)));
     };
 
     if (rerun) {

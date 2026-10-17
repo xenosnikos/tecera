@@ -3,8 +3,9 @@ import { link, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { WorkerToolContext } from './common.js';
 import { sha256, type CapabilitySet, type Json, type ToolContext, type ToolRequest } from '@tecera/contracts';
-import { FakeWriteGuard } from '../invoke/fakes.js';
+import { FakeWriteGuard, seenOnDisk } from '../invoke/fakes.js';
 import { createDeleteTool } from './delete.js';
 import { createEditTool } from './edit.js';
 import { createReadTool } from './read.js';
@@ -27,7 +28,7 @@ const D = sha256(EXTRA);
 
 let root: string;
 let outside: string;
-let ctx: ToolContext;
+let ctx: WorkerToolContext;
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'tecera-del-'));
   outside = await mkdtemp(join(tmpdir(), 'tecera-del-out-'));
@@ -40,7 +41,7 @@ beforeEach(async () => {
   await writeFile(join(root, 'test/a.test.ts'), EXTRA);
   await writeFile(join(root, '.git/HEAD'), EXTRA);
   await writeFile(join(outside, 'secret.txt'), EXTRA);
-  ctx = { runId: 'r1', worktree: root, capabilities: caps(), fencingToken: 7 };
+  ctx = { runId: 'r1', worktree: root, capabilities: caps(), fencingToken: 7, knownDigest: seenOnDisk(root) };
 });
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });

@@ -225,9 +225,16 @@ Tecera is research-grade. What follows is the state of the code, not a roadmap.
   test, and persisting sessions in a provisioned SQLite database); the mocked-mail scenario ended
   provisional as its rules require. The rate-limiting and CSV-export scenarios did not reach their goal in
   two attempts. In six live runs no goal was falsely reported achieved and no policy violation landed.
-  The remaining failures: a worker can call the test runner, ignore a failing result and return anyway;
-  whole-file rewrites that keep a module's exports but change its behaviour are caught only by review;
-  and a review rework re-runs every writing step, including ones with nothing left to change.
+  The failures of that run and what changed since: a worker could call the test runner, ignore a failing
+  result and return anyway (now the last writing step before the verify gate cannot return until its own
+  check has passed, on the tree as it still is, after its last edit; after three refused returns the gate
+  decides); whole-file rewrites that kept a module's exports but changed its behaviour were caught only by
+  review (an edit that drops any top-level name, or edits a file the step has not read, is now refused, and
+  every writing step carries a keep-list of what must stay; a rewrite that keeps every name can still change
+  behaviour, and review remains the check for that);
+  and a review rework re-ran every writing step, including ones with nothing left to change (a rejection
+  whose findings name paths now re-runs only the writers that declared them). These changes have not yet
+  been measured in a live run.
 - **In the default single-user mode the ledger is not a trust anchor against its own user.** An internal
   review found ways for a host assistant to reach a human decision command, for forged ledger events to make
   the stop hook allow, and for repository git configuration to influence the pull-request push. Those

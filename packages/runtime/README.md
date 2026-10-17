@@ -262,7 +262,17 @@ undispatched until a later resume completes the preparation.
    - the fourteen mandatory hooks (`assertMandatory`);
    - the tools read/edit/delete/listFiles, and runVerify bound to the goal check. Under a change-path
      envelope the edit and delete tools get the step's declared subset (from the accepted contract and the
-     step's `changes`) and refuse any other path, naming it;
+     step's `changes`) and refuse any other path, naming it. The edit tool refuses an edit that drops a
+     top-level name of an existing module, or stops exporting one, unless `removeNames` declares it
+     (`removeExports` means the same), and an edit of an existing file the step has not read (or that
+     changed since it read it);
+   - the verify precondition on returns: the Loop marks the last writing step before a verify gate
+     (`WorkerStepRequest.verifyBeforeReturn`, recorded on `step.requested`; the writers that could be last
+     before one gate are dispatched one at a time), and the worker refuses that step's return until its
+     runVerify passed after its last edit on the tree as it still is (the pass is bound to a fingerprint of
+     the tree), three times at most, each decision recorded as `worker.return` evidence; the step's model
+     turns (nested invokes included) are recorded on `step.held`, `step.completed`, `step.failed` and
+     `step.cancelled` (`turns`);
    - every known secret, for redaction and the canary;
    - Brain context (graduated lessons, episodes) added to each step's inputs as untrusted data.
      Episodes and candidate lessons come from src/learning.ts (below); a lesson reaches a worker only after

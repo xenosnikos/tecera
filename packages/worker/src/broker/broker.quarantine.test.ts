@@ -123,6 +123,7 @@ describe('quarantine: an unresolved writer at drain timeout (wave 3 item 5)', ()
     const edit = createEditTool({ beforeCommit: () => renameSync(join(root, 'src/d'), join(root, 'test/d')) });
     const { broker, session } = setup({ tools: [createReadTool(), edit] });
     const b = broker.beginExec(session(1));
+    await call(broker.bridge, b.readFile, ['src/d/f.ts']);
     const r = await call(broker.bridge, b.writeFile, ['src/d/f.ts', 'x']);
     expect(r.ok).toBe(false);
     const rep = await broker.endExec();

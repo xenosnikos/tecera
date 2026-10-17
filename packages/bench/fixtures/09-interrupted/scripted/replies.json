@@ -10,7 +10,7 @@
     },
     {
       "expect": "Fix the root cause",
-      "text": "```js\nconst c = await readFile('checks/greet-strict.js');\nconsole.log('amended check', c.bytes);\nawait writeFile('src/greet.js', \"// Greetings.\\nexport function greet(name) {\\n  if (!name) throw new Error('a name is required');\\n  return `Hello, ${name}!`;\\n}\\n\\nexport function farewell(name) {\\n  return `Goodbye, ${name}`;\\n}\\n\");\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/greet.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
+      "text": "```js\nawait readFile('src/greet.js');\nconst c = await readFile('checks/greet-strict.js');\nconsole.log('amended check', c.bytes);\nawait writeFile('src/greet.js', \"// Greetings.\\nexport function greet(name) {\\n  if (!name) throw new Error('a name is required');\\n  return `Hello, ${name}!`;\\n}\\n\\nexport function farewell(name) {\\n  return `Goodbye, ${name}`;\\n}\\n\");\nconst v = await runVerify();\nreturn { facts: [{ key: 'changedFiles', value: ['src/greet.js'] }, { key: 'verifyExitAfterEdit', value: v.exitCode }] };\n```",
       "usage": {
         "input": 2400,
         "output": 200

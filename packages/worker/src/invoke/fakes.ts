@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import { readdirSync, readFileSync, type Dirent } from 'node:fs';
+import { join } from 'node:path';
+import { LIST_IGNORES } from '../tools/listFiles.js';
 import {
   approvalAuditProblem,
   approvalGrantedEvent,
   digest,
   FencedWriteGuard,
+  sha256,
   HOST_FUNCTIONS,
   LedgerError,
   type AppendResult,
@@ -324,6 +328,45 @@ export class FakeWriteGuard {
 
 /** A guard that is always live and allows every write. */
 export const liveWriteGuard = (): FencedWriteGuard => new FakeWriteGuard().guard;
+
+/**
+ * A tool context's `knownDigest` (WorkerToolContext) for tests of other concerns than the stale-read check:
+ * the step is taken to have read every file as it is on disk now, so an edit of an existing file is never
+ * refused as unread. A test of the check itself supplies its own record.
+ */
+export const seenOnDisk = (root: string): ((rel: string) => string | undefined) => {
+  // What was on disk when the context was made, refreshed by every lookup that can read the file: a file
+  // moved away mid-write (the race tests) keeps the digest the step "saw" before the race.
+  const seen = new Map<string, string>();
+  const walk = (dir: string, rel: string): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory() && !LIST_IGNORES.has(e.name)) walk(join(dir, e.name), r);
+      else if (e.isFile()) {
+        try {
+          seen.set(r, sha256(readFileSync(join(dir, e.name), 'utf8')));
+        } catch {
+          /* unreadable: never seen */
+        }
+      }
+    }
+  };
+  walk(root, '');
+  return (rel) => {
+    try {
+      seen.set(rel, sha256(readFileSync(join(root, rel), 'utf8')));
+    } catch {
+      /* gone or unreadable now: what was seen before stands */
+    }
+    return seen.get(rel);
+  };
+};
 
 /**
  * `t` re-declared with risk 'irreversible', for tests of the approval machinery (grants, checkpoints,

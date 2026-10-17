@@ -44,7 +44,7 @@ let root: string;
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'tecera-wave4-'));
   await mkdir(join(root, 'src'), { recursive: true });
-  await writeFile(join(root, 'src/a.ts'), 'const a = 1;\n');
+  await writeFile(join(root, 'src/a.ts'), '// a\n');
   await writeFile(join(root, 'src/private.txt'), PRIVATE);
 });
 afterEach(async () => rm(root, { recursive: true, force: true }));
@@ -159,7 +159,7 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
     const ledger = new FakeLedger();
     const trace: TraceEntry[] = [];
     const guard = new FakeWriteGuard();
-    const llm = new FakeLLM([js(`await writeFile('src/a.ts', 'A2');\nawait writeFile('src/new/b.ts', 'B2');\nreturn { summary: 'both' };`)]);
+    const llm = new FakeLLM([js(`await readFile('src/a.ts');\nawait writeFile('src/a.ts', 'A2');\nawait writeFile('src/new/b.ts', 'B2');\nreturn { summary: 'both' };`)]);
     const out = await mk(ledger, llm, trace).run(request(guard));
     expect(out).toMatchObject({ kind: 'returned', value: { summary: 'both' } });
     expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('A2');
@@ -172,9 +172,9 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
     ]);
     // fenced: check() ran before every mutation of both writes, not once
     expect(guard.checks).toBeGreaterThanOrEqual(10);
-    // logged: both edits are completed ToolCall spans; nothing was suspended
+    // logged: the read and both edits are completed ToolCall spans; nothing was suspended
     const exits = trace.filter((e) => e.type === 'span' && e.span === 'ToolCall' && e.stage === 'Exit');
-    expect(exits.map((e) => (e as { outcome?: string }).outcome)).toEqual(['Completed', 'Completed']);
+    expect(exits.map((e) => (e as { outcome?: string }).outcome)).toEqual(['Completed', 'Completed', 'Completed']);
     expect(trace.some((e) => e.type === 'span' && e.suspended === true)).toBe(false);
     expect(llm.requests).toHaveLength(1);
   });
@@ -191,6 +191,7 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
         "for (const p of ['test/a.test.ts', '.git/config', 'src/../test/b.test.ts', 'README.md']) {",
         "  try { await writeFile(p, 'pwned'); out.push(p + ':written'); } catch (e) { out.push(p + ':refused'); }",
         "}",
+        "await readFile('src/a.ts');",
         "await writeFile('src/a.ts', 'ok');",
         "return { summary: out.join(',') };",
       ].join('\n'),
@@ -213,23 +214,23 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
     const llm = new FakeLLM([js(`let m = ''; try { await writeFile('src/a.ts', 'late'); } catch (e) { m = e.message; }\nreturn { summary: m };`)]);
     const out = await mk(ledger, llm).run(request(guard));
     expect(out.kind).not.toBe('suspended');
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('// a\n');
     expect(ledger.approvals.size).toBe(0);
   });
 
   it('a guard that still answers needs-approval (an older loop) refuses the write instead of suspending: no approval request, nothing written', async () => {
     const ledger = new FakeLedger();
     const guard = new FakeWriteGuard({ answer: (w) => ({ kind: 'needs-approval', actionHash: hashOf(w.path, 'A2') }) });
-    const llm = new FakeLLM([js(`let m = ''; try { await writeFile('src/a.ts', 'A2'); } catch (e) { m = e.message; }\nreturn { summary: m };`)]);
+    const llm = new FakeLLM([js(`let m = ''; await readFile('src/a.ts'); try { await writeFile('src/a.ts', 'A2'); } catch (e) { m = e.message; }\nreturn { summary: m };`)]);
     const out = await mk(ledger, llm).run(request(guard));
     expect(out).toMatchObject({ kind: 'returned', value: { summary: expect.stringMatching(/per-write approvals were removed/) } });
     expect(ledger.approvals.size).toBe(0);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('// a\n');
   });
 
   it('a held step whose checkpoint names a write (an older per-write hold) is never resumed and its grant is not consumed', async () => {
     const ledger = new FakeLedger();
-    const llm = new FakeLLM([js(`await notify('deploy');\nawait writeFile('src/a.ts', 'A2');\nreturn { summary: 'done' };`)]);
+    const llm = new FakeLLM([js(`await readFile('src/a.ts');\nawait notify('deploy');\nawait writeFile('src/a.ts', 'A2');\nreturn { summary: 'done' };`)]);
     const capsN = caps({ tools: ['read', 'edit', 'notify'] });
     const broker = new Broker({ tools: [createReadTool(), createEditTool(), notifyTool()], runId: 'run_4', worktree: root, capabilities: capsN, fencingToken: 2, guard: liveWriteGuard() });
     const first = await invoke(goal, opts(llm, { hooks: [notifyGate], ledger, broker, capabilities: capsN }));
@@ -241,7 +242,7 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
     const out = await resume(first.resumeToken, grant, deps(ledger, { llm, hooks: [notifyGate], broker: new Broker({ tools: [createReadTool(), createEditTool(), notifyTool()], runId: 'run_4', worktree: root, capabilities: capsN, fencingToken: 2, guard: liveWriteGuard() }), capabilities: capsN }));
     expect(out).toMatchObject({ kind: 'aborted', reasons: [{ code: 'policy', reason: expect.stringMatching(/per-write approvals were removed/) }] });
     expect(ledger.consumed).toEqual([]);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('// a\n');
   });
 
   it('a turn-level Suspend that names a write is never recorded: aborted (policy), no checkpoint, no approval request', async () => {
@@ -255,13 +256,13 @@ describe('D6: under degraded isolation writes inside paths.write proceed without
 
   it('control: an approval on a non-write requiresApproval action still holds and resumes (the approval machinery is unchanged)', async () => {
     const ledger = new FakeLedger();
-    const llm = new FakeLLM([js(`await notify('deploy');\nawait writeFile('src/a.ts', 'A2');\nreturn { summary: 'done' };`)]);
+    const llm = new FakeLLM([js(`await readFile('src/a.ts');\nawait notify('deploy');\nawait writeFile('src/a.ts', 'A2');\nreturn { summary: 'done' };`)]);
     const capsN = caps({ tools: ['read', 'edit', 'notify'] });
     const t1 = notifyTool();
     const first = await invoke(goal, opts(llm, { hooks: [notifyGate], ledger, broker: mkBroker(capsN, [createReadTool(), createEditTool(), t1]), capabilities: capsN }));
     if (first.kind !== 'suspended') throw new Error('expected suspended');
     expect(t1.ran).toBe(0);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('// a\n');
     const grant = await ledger.grantAudited(first.request.requestId, human, 'local', Date.now());
     const t2 = notifyTool();
     const done = await resume(first.resumeToken, grant, deps(ledger, { llm, hooks: [notifyGate], broker: mkBroker(capsN, [createReadTool(), createEditTool(), t2]), capabilities: capsN }));
@@ -289,7 +290,7 @@ describe('durable quarantine: a worktree quarantined by an earlier process is re
 
   it('resume() of a held step on a worktree quarantined since the suspension is refused', async () => {
     const ledger = new FakeLedger();
-    const llm = new FakeLLM([js(`await notify('deploy');\nawait writeFile('src/a.ts', 'A2');\nreturn { summary: 'done' };`)]);
+    const llm = new FakeLLM([js(`await readFile('src/a.ts');\nawait notify('deploy');\nawait writeFile('src/a.ts', 'A2');\nreturn { summary: 'done' };`)]);
     const capsN = caps({ tools: ['read', 'edit', 'notify'] });
     const held = new StepWorker({ seats: { cheap: llm }, repl: new FakeRepl(), tools: [createReadTool(), createEditTool(), notifyTool()], hooks: [notifyGate], ledger, sessionId: 'sess', resumeLease: () => ({ worktree: root, fencingToken: 5 }) });
     const planN: Plan = { ...plan, permissions: { ...plan.permissions, tools: ['read', 'edit', 'notify'] } };
@@ -299,7 +300,7 @@ describe('durable quarantine: a worktree quarantined by an earlier process is re
     const grant = await ledger.grantAudited(first.request.requestId, human, 'sess', Date.now());
     const out = await held.resume(first.resumeToken, grant, undefined, new FakeWriteGuard().guard);
     expect(isTainted(out)).toBe(true);
-    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('const a = 1;\n');
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe('// a\n');
     expect(ledger.consumed).toEqual([]); // refused before the grant was touched
   });
 
